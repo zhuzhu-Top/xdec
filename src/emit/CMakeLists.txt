@@ -1,0 +1,14 @@
+xdec_add_library(xdec_emit
+  SOURCES
+    structure.cpp
+    structure_dispatch.cpp
+    c_context.cpp
+    c_expr.cpp
+    c_flags.cpp
+    c_stmt.cpp
+    c_helpers.cpp
+    c_printer.cpp
+  DEPS
+    xdec_analysis
+    xdec_il
+    xdec_types)

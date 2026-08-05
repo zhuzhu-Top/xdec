@@ -1,0 +1,78 @@
+// AArch64 instruction semantics: the architecture, and where the rest of it is.
+//
+// Organised the way the architecture manual is, by encoding group, because that
+// is the order in which the decoder discriminates and the order in which gaps
+// are easiest to spot. Rules are written per encoding class rather than per
+// mnemonic: `mov x0, x1` is `orr x0, xzr, x1` and modelling it twice would mean
+// two chances to model it differently. Where a mnemonic is an alias of an
+// encoding already modelled, the alias shares the other rule's semantics through
+// a helper rather than restating it.
+//
+// Coverage is measured, not estimated: `xdec coverage <binary>` decodes every
+// word in the executable sections and reports what is left. Operands are checked
+// too, against capstone, by `tools/diff_operands.py`.
+//
+// Three differences from capstone are deliberate and will show up in that run:
+//
+//   - `movn` prints the value it produces, `mov w0, #0xffffffff`, rather than the
+//     negative it was written as. The value is what the semantics use.
+//   - a shifted add immediate prints the folded immediate, `sub sp, sp, #0x1000`,
+//     rather than `#1, lsl #12`. Again, the value is the operand.
+//   - `mrs` and `msr` print the encoded `s3_0_c0_c4_1` form rather than a
+//     register name, because the name table is long, versioned, and buys nothing
+//     that a later pass reads. The thread pointer is the one exception, since a
+//     later pass does read it.
+
+arch arm64 {
+  endian little
+  insnwidth 32
+  pointer 64
+
+  regfile gpr : bits(64) [32] {
+    prefix "x"
+    zero 31 as "xzr"
+    view w : bits(32) = low 0 zeroext prefix "w" zero "wzr"
+  }
+
+  // The V registers. Only the load/store forms are modelled for now and the
+  // arithmetic goes through intrinsics, but the registers themselves have to be
+  // real: an intrinsic that reads and writes a named register still tells the
+  // later passes which values it touched, while one that names nothing does not.
+  //
+  // Every view zero-extends, which is the AArch64 rule for writing any part of a
+  // V register: an `ldr s0` clears bits 32 and above of v0.
+  regfile vec : bits(128) [32] {
+    prefix "q"
+    role vector
+    view d : bits(64) = low 0 zeroext prefix "d"
+    view s : bits(32) = low 0 zeroext prefix "s"
+    view h : bits(16) = low 0 zeroext prefix "h"
+    view b : bits(8)  = low 0 zeroext prefix "b"
+  }
+
+  reg sp   : bits(64) role stack
+  reg nzcv : flags     role flags
+}
+
+// One file per top-level encoding group, in the manual's order. The split is by
+// encoding rather than by mnemonic so that a reviewer reading one file sees every
+// rule that competes for the same bits, which is where the mistakes are: an
+// encoding that overlaps another, a `require` that leaves a hole, an alias that
+// forgot its priority.
+//
+// Declaration order across files does not matter. Functions are resolved after
+// all files are read, and instructions are ordered by the priority they declare
+// rather than by where they appear.
+
+include "arm64/common.xspec"
+include "arm64/dp-immediate.xspec"
+include "arm64/dp-register.xspec"
+include "arm64/branch.xspec"
+include "arm64/loadstore.xspec"
+include "arm64/loadstore-fp.xspec"
+include "arm64/system.xspec"
+
+// Last, because it is the floor everything else stands on: negative-priority
+// rules that turn an unmodelled word into a known intrinsic rather than an
+// undecodable one.
+include "arm64/simd.xspec"

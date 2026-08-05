@@ -1,0 +1,688 @@
+// Loads and stores of general-purpose registers.
+//
+// Every addressing mode the architecture offers, which is the point: the offset
+// scaling differs per mode and per access width, and a scale that is wrong by a
+// factor of the access size still disassembles plausibly. The forms are grouped
+// by mode so that the scaling of neighbouring rules can be compared.
+// ---------------------------------------------------------------------------
+// Loads and stores: register, unsigned immediate offset
+// ---------------------------------------------------------------------------
+
+insn strb_imm_unsigned {
+  encoding "0011100100" imm12:12 Rn:5 Rt:5
+  asm "strb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12:hex}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(imm12, 64), trunc(read_gpr(Rt, 0), 8));
+  }
+}
+
+insn ldrb_imm_unsigned {
+  encoding "0011100101" imm12:12 Rn:5 Rt:5
+  asm "ldrb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12:hex}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + imm(imm12, 64), 8), 32));
+  }
+}
+
+// The sign-extending loads split into two rules per size rather than deriving
+// the destination width from a field, because opc<0> runs the other way round
+// from every other width bit in the architecture: 0 means 64-bit here. Writing
+// `1 - sf` would be correct and would also be the sort of thing a reader has to
+// stop and check.
+insn ldrsb64_imm_unsigned {
+  encoding "0011100110" imm12:12 Rn:5 Rt:5
+  asm "ldrsb {Rt:reg(1)}, \[{Rn:regsp(1)}, #{imm12:hex}\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + imm(imm12, 64), 8), 64));
+  }
+}
+
+insn ldrsb32_imm_unsigned {
+  encoding "0011100111" imm12:12 Rn:5 Rt:5
+  asm "ldrsb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12:hex}\]"
+  semantics {
+    write_gpr(Rt, 0, sext(load(read_gpr_sp(Rn, 1) + imm(imm12, 64), 8), 32));
+  }
+}
+
+insn strh_imm_unsigned {
+  encoding "0111100100" imm12:12 Rn:5 Rt:5
+  asm "strh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12 << 1:hex}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(imm12 << 1, 64), trunc(read_gpr(Rt, 0), 16));
+  }
+}
+
+insn ldrh_imm_unsigned {
+  encoding "0111100101" imm12:12 Rn:5 Rt:5
+  asm "ldrh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12 << 1:hex}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + imm(imm12 << 1, 64), 16), 32));
+  }
+}
+
+insn ldrsh64_imm_unsigned {
+  encoding "0111100110" imm12:12 Rn:5 Rt:5
+  asm "ldrsh {Rt:reg(1)}, \[{Rn:regsp(1)}, #{imm12 << 1:hex}\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + imm(imm12 << 1, 64), 16), 64));
+  }
+}
+
+insn ldrsh32_imm_unsigned {
+  encoding "0111100111" imm12:12 Rn:5 Rt:5
+  asm "ldrsh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{imm12 << 1:hex}\]"
+  semantics {
+    write_gpr(Rt, 0, sext(load(read_gpr_sp(Rn, 1) + imm(imm12 << 1, 64), 16), 32));
+  }
+}
+
+insn str_imm_unsigned {
+  encoding "1" sz:1 "11100100" imm12:12 Rn:5 Rt:5
+  asm "str {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{imm12 << (2 + sz):hex}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(imm12 << (2 + sz), 64), read_gpr(Rt, sz));
+  }
+}
+
+insn ldr_imm_unsigned {
+  encoding "1" sz:1 "11100101" imm12:12 Rn:5 Rt:5
+  asm "ldr {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{imm12 << (2 + sz):hex}\]"
+  semantics {
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1) + imm(imm12 << (2 + sz), 64), 32 << sz));
+  }
+}
+
+insn ldrsw_imm_unsigned {
+  encoding "1011100110" imm12:12 Rn:5 Rt:5
+  asm "ldrsw {Rt:reg(1)}, \[{Rn:regsp(1)}, #{imm12 << 2:hex}\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + imm(imm12 << 2, 64), 32), 64));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loads and stores: register, unscaled immediate (ldur/stur)
+// ---------------------------------------------------------------------------
+
+insn sturb {
+  encoding "00111000000" imm9:9 "00" Rn:5 Rt:5
+  asm "sturb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), trunc(read_gpr(Rt, 0), 8));
+  }
+}
+
+insn ldurb {
+  encoding "00111000010" imm9:9 "00" Rn:5 Rt:5
+  asm "ldurb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), 8), 32));
+  }
+}
+
+insn sturh {
+  encoding "01111000000" imm9:9 "00" Rn:5 Rt:5
+  asm "sturh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), trunc(read_gpr(Rt, 0), 16));
+  }
+}
+
+insn ldurh {
+  encoding "01111000010" imm9:9 "00" Rn:5 Rt:5
+  asm "ldurh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), 16), 32));
+  }
+}
+
+insn stur {
+  encoding "1" sz:1 "111000000" imm9:9 "00" Rn:5 Rt:5
+  asm "stur {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), read_gpr(Rt, sz));
+  }
+}
+
+insn ldur {
+  encoding "1" sz:1 "111000010" imm9:9 "00" Rn:5 Rt:5
+  asm "ldur {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), 32 << sz));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loads and stores: register, immediate pre/post-indexed
+// ---------------------------------------------------------------------------
+//
+// Writeback is ordered: post-index reads at the old address and then updates the
+// base, pre-index updates first. Getting the order wrong produces code that is
+// off by the offset exactly once per loop iteration.
+
+insn str_imm_post {
+  encoding "1" sz:1 "111000000" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "str {Rt:reg(sz)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, read_gpr(Rt, sz));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldr_imm_post {
+  encoding "1" sz:1 "111000010" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldr {Rt:reg(sz)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn str_imm_pre {
+  encoding "1" sz:1 "111000000" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "str {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    store(address, read_gpr(Rt, sz));
+  }
+}
+
+insn ldr_imm_pre {
+  encoding "1" sz:1 "111000010" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldr {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    write_gpr(Rt, sz, load(address, 32 << sz));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loads and stores: register offset
+// ---------------------------------------------------------------------------
+
+insn str_reg_offset {
+  encoding "1" sz:1 "111000001" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "str {Rt:reg(sz)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 2 + sz : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 2 + sz : 0);
+    store(read_gpr_sp(Rn, 1) + index, read_gpr(Rt, sz));
+  }
+}
+
+insn ldr_reg_offset {
+  encoding "1" sz:1 "111000011" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldr {Rt:reg(sz)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 2 + sz : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 2 + sz : 0);
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1) + index, 32 << sz));
+  }
+}
+
+insn ldrsw_reg_offset {
+  encoding "10111000101" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrsw {Rt:reg(1)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 2 : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 2 : 0);
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + index, 32), 64));
+  }
+}
+
+insn ldrsb64_reg_offset {
+  encoding "00111000101" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrsb {Rt:reg(1)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}]\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + extend_reg(1, Rm, option, 0), 8), 64));
+  }
+}
+
+insn ldrsh64_reg_offset {
+  encoding "01111000101" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrsh {Rt:reg(1)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 1 : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 1 : 0);
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + index, 16), 64));
+  }
+}
+
+insn ldrb_reg_offset {
+  encoding "00111000011" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrb {Rt:reg(0)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, 0);
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + index, 8), 32));
+  }
+}
+
+insn strb_reg_offset {
+  encoding "00111000001" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "strb {Rt:reg(0)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, 0);
+    store(read_gpr_sp(Rn, 1) + index, trunc(read_gpr(Rt, 0), 8));
+  }
+}
+
+// The byte and halfword forms of the indexed and unscaled modes. Spelled out
+// rather than folded into the word-sized rules because the access width and the
+// register width move independently here: `ldrb` loads eight bits into a 32-bit
+// register, so no single `sz` field describes both.
+
+insn strb_imm_post {
+  encoding "00111000000" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "strb {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, trunc(read_gpr(Rt, 0), 8));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn strb_imm_pre {
+  encoding "00111000000" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "strb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    store(address, trunc(read_gpr(Rt, 0), 8));
+  }
+}
+
+insn ldrb_imm_post {
+  encoding "00111000010" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrb {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 0, zext(load(base, 8), 32));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrb_imm_pre {
+  encoding "00111000010" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    write_gpr(Rt, 0, zext(load(address, 8), 32));
+  }
+}
+
+insn strh_imm_post {
+  encoding "01111000000" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "strh {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, trunc(read_gpr(Rt, 0), 16));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn strh_imm_pre {
+  encoding "01111000000" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "strh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    store(address, trunc(read_gpr(Rt, 0), 16));
+  }
+}
+
+insn ldrh_imm_post {
+  encoding "01111000010" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrh {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 0, zext(load(base, 16), 32));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrh_imm_pre {
+  encoding "01111000010" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let address = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr_sp(Rn, 1, address);
+    write_gpr(Rt, 0, zext(load(address, 16), 32));
+  }
+}
+
+insn ldursb {
+  encoding "00111000100" imm9:9 "00" Rn:5 Rt:5
+  asm "ldursb {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), 8), 64));
+  }
+}
+
+insn ldursw {
+  encoding "10111000100" imm9:9 "00" Rn:5 Rt:5
+  asm "ldursw {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, 1, sext(load(read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64), 32), 64));
+  }
+}
+
+// The sign-extending loads with writeback. Split by destination width rather
+// than computed from the opc bit, for the same reason the unsigned-offset forms
+// are: the width is `1 - opc<0>`, and a rule that says so cannot be shown to
+// keep the destination width in range.
+
+insn ldrsb64_imm_post {
+  encoding "00111000100" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsb {Rt:reg(1)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 1, sext(load(base, 8), 64));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrsb32_imm_post {
+  encoding "00111000110" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsb {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 0, sext(load(base, 8), 32));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrsb64_imm_pre {
+  encoding "00111000100" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsb {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr(Rt, 1, sext(load(base, 8), 64));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
+insn ldrsb32_imm_pre {
+  encoding "00111000110" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsb {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr(Rt, 0, sext(load(base, 8), 32));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
+insn ldrsh64_imm_post {
+  encoding "01111000100" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsh {Rt:reg(1)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 1, sext(load(base, 16), 64));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrsh32_imm_post {
+  encoding "01111000110" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsh {Rt:reg(0)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 0, sext(load(base, 16), 32));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrsh64_imm_pre {
+  encoding "01111000100" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsh {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr(Rt, 1, sext(load(base, 16), 64));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
+insn ldrsh32_imm_pre {
+  encoding "01111000110" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsh {Rt:reg(0)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr(Rt, 0, sext(load(base, 16), 32));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
+insn ldrsw_imm_post {
+  encoding "10111000100" imm9:9 "01" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsw {Rt:reg(1)}, \[{Rn:regsp(1)}\], #{sextint(imm9, 9):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 1, sext(load(base, 32), 64));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm9, 9), 64));
+  }
+}
+
+insn ldrsw_imm_pre {
+  encoding "10111000100" imm9:9 "11" Rn:5 Rt:5
+  require Rn == 31 || Rn != Rt;
+  asm "ldrsw {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm9, 9), 64);
+    write_gpr(Rt, 1, sext(load(base, 32), 64));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
+insn strh_reg_offset {
+  encoding "01111000001" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "strh {Rt:reg(0)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 1 : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 1 : 0);
+    store(read_gpr_sp(Rn, 1) + index, trunc(read_gpr(Rt, 0), 16));
+  }
+}
+
+insn ldrh_reg_offset {
+  encoding "01111000011" Rm:5 option:3 S:1 "10" Rn:5 Rt:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "ldrh {Rt:reg(0)}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}[, {option == 3 && S == 0 ? 0 : option + 1:extend}[ #{S == 1 ? 1 : 0:dec}]]\]"
+  semantics {
+    let index = extend_reg(1, Rm, option, S == 1 ? 1 : 0);
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1) + index, 16), 32));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loads and stores: literal and pair
+// ---------------------------------------------------------------------------
+
+insn ldr_literal {
+  encoding "0" sz:1 "011000" imm19:19 Rt:5
+  asm "ldr {Rt:reg(sz)}, #{insn_pc + (sextint(imm19, 19) << 2):hex}"
+  semantics {
+    write_gpr(Rt, sz, load(imm(insn_pc + (sextint(imm19, 19) << 2), 64), 32 << sz));
+  }
+}
+
+insn stp_offset {
+  encoding sz:1 "010100100" imm7:7 Rt2:5 Rn:5 Rt:5
+  asm "stp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+  }
+}
+
+insn ldp_offset {
+  encoding sz:1 "010100101" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  asm "ldp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+  }
+}
+
+insn stp_pre {
+  encoding sz:1 "010100110" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "stp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    write_gpr_sp(Rn, 1, base);
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+  }
+}
+
+insn ldp_post {
+  encoding sz:1 "010100011" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "ldp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\], #{sextint(imm7, 7) << (2 + sz):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm7, 7) << (2 + sz), 64));
+  }
+}
+
+insn stp_post {
+  encoding sz:1 "010100010" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "stp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}\], #{sextint(imm7, 7) << (2 + sz):dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm7, 7) << (2 + sz), 64));
+  }
+}
+
+insn ldp_pre {
+  encoding sz:1 "010100111" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "ldp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    write_gpr_sp(Rn, 1, base);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Loads and stores: ordered and exclusive
+// ---------------------------------------------------------------------------
+//
+// The ordering and the reservation are real effects that the IL does not model,
+// so they are intrinsics wrapped around an ordinary access rather than a plain
+// load or store that a later pass would feel free to move.
+
+insn stlr {
+  encoding "1" sz:1 "00100010011111111111" Rn:5 Rt:5
+  asm "stlr {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.release");
+    store(read_gpr_sp(Rn, 1), read_gpr(Rt, sz));
+  }
+}
+
+insn ldar {
+  encoding "1" sz:1 "00100011011111111111" Rn:5 Rt:5
+  asm "ldar {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1), 32 << sz));
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn stlrb {
+  encoding "0000100010011111111111" Rn:5 Rt:5
+  asm "stlrb {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.release");
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 8));
+  }
+}
+
+insn ldarb {
+  encoding "0000100011011111111111" Rn:5 Rt:5
+  asm "ldarb {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 8), 32));
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn stlrh {
+  encoding "0100100010011111111111" Rn:5 Rt:5
+  asm "stlrh {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.release");
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 16));
+  }
+}
+
+insn ldarh {
+  encoding "0100100011011111111111" Rn:5 Rt:5
+  asm "ldarh {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 16), 32));
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn ldaxr {
+  encoding "1" sz:1 "00100001011111111111" Rn:5 Rt:5
+  asm "ldaxr {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1), 32 << sz));
+  }
+}
+
+insn stlxr {
+  encoding "1" sz:1 "001000000" Rs:5 "111111" Rn:5 Rt:5
+  asm "stlxr {Rs:reg(0)}, {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1), read_gpr(Rt, sz));
+    // The status result is genuinely unpredictable, and a spin loop that reads
+    // it must not be folded away on the assumption that it is always zero.
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}

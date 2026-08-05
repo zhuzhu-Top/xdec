@@ -1,0 +1,135 @@
+# E:\workspace\af\com.intech.c66app__\libsdk_bc_lib.so block 0x8e6dc state 3
+#   pc: il cond taken to 0x8d84c, unicorn at 0x8e6e4
+words 0xaa0003e9 0xb6ff8b69
+reg x0 0xaa0baa4f49d1bc22
+reg x1 0xc66bac94520b7027
+reg x2 0x1000000008b0
+reg x3 0x7fff00003ed0
+reg x4 0x86d2abc827ec1c3f
+reg x5 0xe5c2680d7f86776e
+reg x6 0xb007b7c39e5072c
+reg x7 0x9db2972fb1a4fa91
+reg x8 0x30f2b0
+reg x9 0x39804152f70cc791
+reg x10 0x100000002820
+reg x11 0x303eb0
+reg x12 0x894db3a98628b43f
+reg x13 0x828e8f476d1ab28e
+reg x14 0xafc231daef8ec05
+reg x15 0xaa4aaf4f519db33b
+reg x16 0x100000002a30
+reg x17 0x88862b3865ca48f
+reg x18 0x4aaf0b61a8a4e0d
+reg x19 0xc9a2391f892c00d2
+reg x20 0x53def9848a75f3a2
+reg x21 0x100000003b80
+reg x22 0xb4590
+reg x23 0xf43bf2ab44b30e47
+reg x24 0x2ba3c7e1b1357a44
+reg x25 0x78848e4bccada283
+reg x26 0x302ff0
+reg x27 0xfacffb68d96fe10a
+reg x28 0x100000003120
+reg x29 0xc4840
+reg x30 0x7fff000014d0
+reg sp 0x7fff000085a0
+reg nzcv 0xf
+reg q0 0x2266a6df5819dc4e5b4d0ae65e3ff26b
+reg q1 0xc21422cc7f91e8bd7be3213213ed3031
+reg q2 0xba2cbcdb3e886e3dc06d7a1ad7ad8694
+reg q3 0x7d1ea43125d74d9cf9ef9a59c6cca9ef
+reg q4 0x939d49e239cf6460327323b2a08ecac1
+reg q5 0x8ed06e1c7e896937022f628bf776e69a
+reg q6 0x56218cdacf987d64686458b136b590a2
+reg q7 0x5ca10b03f3b89b28de302ae717acd5cd
+reg q8 0xa354b4cd4d5623d79b96747a1167550d
+reg q9 0x163b27f4d4a4c882736d0a913901c3c6
+reg q10 0x484d0f8a02602b8304bdd5d527854270
+reg q11 0x3b83050b437bc5470995209b83842cd
+reg q12 0x6b9195f95bed905104a054675aa493c9
+reg q13 0xe5896c26f0f69ed83c732aa6522d1be0
+reg q14 0x20bdb76602386c9e7a95b49a8c28f1d2
+reg q15 0xb0de3b3cba0ad3d277dc71ea679b8f5d
+reg q16 0xf10be609f82d4b6678503966cdf3c7c3
+reg q17 0xb0bc352d36138c21b6183e6c85827c07
+reg q18 0x54d708bca0b1f17a5747c1b2b16b1fd2
+reg q19 0x8fb4ed4388647b2098e0d30a57acc805
+reg q20 0x8fc9a4ad872bd3471a8e7af0e270f1cd
+reg q21 0x6761a2b847ee639f5aa27841bee5b3c7
+reg q22 0x329e6f69e34805f37aab5d70bd31e2db
+reg q23 0xdd471750b5085c6e9e2baa509edb1305
+reg q24 0x6aab8fe29de5b2e206c57cf96de84ddb
+reg q25 0x384a9a0104a25f351281a54db84d044a
+reg q26 0x69e05c635b912d8f0d74a07713860592
+reg q27 0xed3fd39e5a025d97dc6ef4d3bd5e4921
+reg q28 0xfbfb52efe9e687a467e4a38f7c47cc30
+reg q29 0x2276d59f401b575148555dce6c18fac9
+reg q30 0x5c6b1f2c8e28e77be8d6ba0cfb721be
+reg q31 0x5bab96c104fa3d1b60b7dccd17b51a6a
+memfill 0x7fff00000000 0x10000 0xc433292d232be6b0
+memfill 0x100000000000 0x10000 0xc433292d232be6b1
+expect reg x0 0xaa0baa4f49d1bc22
+expect reg x1 0xc66bac94520b7027
+expect reg x2 0x1000000008b0
+expect reg x3 0x7fff00003ed0
+expect reg x4 0x86d2abc827ec1c3f
+expect reg x5 0xe5c2680d7f86776e
+expect reg x6 0xb007b7c39e5072c
+expect reg x7 0x9db2972fb1a4fa91
+expect reg x8 0x30f2b0
+expect reg x9 0xaa0baa4f49d1bc22
+expect reg x10 0x100000002820
+expect reg x11 0x303eb0
+expect reg x12 0x894db3a98628b43f
+expect reg x13 0x828e8f476d1ab28e
+expect reg x14 0xafc231daef8ec05
+expect reg x15 0xaa4aaf4f519db33b
+expect reg x16 0x100000002a30
+expect reg x17 0x88862b3865ca48f
+expect reg x18 0x4aaf0b61a8a4e0d
+expect reg x19 0xc9a2391f892c00d2
+expect reg x20 0x53def9848a75f3a2
+expect reg x21 0x100000003b80
+expect reg x22 0xb4590
+expect reg x23 0xf43bf2ab44b30e47
+expect reg x24 0x2ba3c7e1b1357a44
+expect reg x25 0x78848e4bccada283
+expect reg x26 0x302ff0
+expect reg x27 0xfacffb68d96fe10a
+expect reg x28 0x100000003120
+expect reg x29 0xc4840
+expect reg x30 0x7fff000014d0
+expect reg sp 0x7fff000085a0
+expect reg nzcv 0xf
+expect reg q0 0x2266a6df5819dc4e5b4d0ae65e3ff26b
+expect reg q1 0xc21422cc7f91e8bd7be3213213ed3031
+expect reg q2 0xba2cbcdb3e886e3dc06d7a1ad7ad8694
+expect reg q3 0x7d1ea43125d74d9cf9ef9a59c6cca9ef
+expect reg q4 0x939d49e239cf6460327323b2a08ecac1
+expect reg q5 0x8ed06e1c7e896937022f628bf776e69a
+expect reg q6 0x56218cdacf987d64686458b136b590a2
+expect reg q7 0x5ca10b03f3b89b28de302ae717acd5cd
+expect reg q8 0xa354b4cd4d5623d79b96747a1167550d
+expect reg q9 0x163b27f4d4a4c882736d0a913901c3c6
+expect reg q10 0x484d0f8a02602b8304bdd5d527854270
+expect reg q11 0x3b83050b437bc5470995209b83842cd
+expect reg q12 0x6b9195f95bed905104a054675aa493c9
+expect reg q13 0xe5896c26f0f69ed83c732aa6522d1be0
+expect reg q14 0x20bdb76602386c9e7a95b49a8c28f1d2
+expect reg q15 0xb0de3b3cba0ad3d277dc71ea679b8f5d
+expect reg q16 0xf10be609f82d4b6678503966cdf3c7c3
+expect reg q17 0xb0bc352d36138c21b6183e6c85827c07
+expect reg q18 0x54d708bca0b1f17a5747c1b2b16b1fd2
+expect reg q19 0x8fb4ed4388647b2098e0d30a57acc805
+expect reg q20 0x8fc9a4ad872bd3471a8e7af0e270f1cd
+expect reg q21 0x6761a2b847ee639f5aa27841bee5b3c7
+expect reg q22 0x329e6f69e34805f37aab5d70bd31e2db
+expect reg q23 0xdd471750b5085c6e9e2baa509edb1305
+expect reg q24 0x6aab8fe29de5b2e206c57cf96de84ddb
+expect reg q25 0x384a9a0104a25f351281a54db84d044a
+expect reg q26 0x69e05c635b912d8f0d74a07713860592
+expect reg q27 0xed3fd39e5a025d97dc6ef4d3bd5e4921
+expect reg q28 0xfbfb52efe9e687a467e4a38f7c47cc30
+expect reg q29 0x2276d59f401b575148555dce6c18fac9
+expect reg q30 0x5c6b1f2c8e28e77be8d6ba0cfb721be
+expect reg q31 0x5bab96c104fa3d1b60b7dccd17b51a6a

@@ -1,0 +1,409 @@
+// System instructions.
+//
+// Barriers, hints, system-register moves and the exception-generating
+// instructions. Almost nothing here has modelled semantics: what matters is that
+// each is recognised, keeps its identity as an intrinsic argument, and does not
+// terminate the block it sits in.
+// ---------------------------------------------------------------------------
+// System
+// ---------------------------------------------------------------------------
+
+insn hint {
+  encoding "11010101000000110010" crm:4 op2:3 "11111"
+  asm "hint #{(crm << 3) | op2:dec}"
+  semantics {
+    // nop, yield, the pointer-authentication hints and bti all live here. They
+    // are distinguishable but not modelled, so they keep their identity as an
+    // argument rather than collapsing to nothing.
+    intrinsic("aarch64.hint", imm((crm << 3) | op2, 8));
+  }
+}
+
+insn nop {
+  encoding "11010101000000110010000000011111"
+  asm "nop"
+  semantics {
+    nop();
+  }
+}
+
+// The hints that every AAPCS64 prologue and epilogue emits. They are the same
+// intrinsic as any other hint; naming them is worth a rule each because a
+// function whose first instruction reads `hint #25` hides the fact that it is
+// pointer-authenticated, and that is something a later pass has to know.
+insn paciasp {
+  encoding "11010101000000110010001100111111"
+  asm "paciasp"
+  semantics {
+    intrinsic("aarch64.pac.ia", read_gpr(30, 1), read_gpr_sp(31, 1));
+  }
+}
+
+insn autiasp {
+  encoding "11010101000000110010001110111111"
+  asm "autiasp"
+  semantics {
+    intrinsic("aarch64.aut.ia", read_gpr(30, 1), read_gpr_sp(31, 1));
+  }
+}
+
+// The 1716 forms sign and authenticate x17 against x16, which is what a PLT stub
+// uses: it has no frame to key against.
+insn pacia1716 {
+  encoding "11010101000000110010000100011111"
+  asm "pacia1716"
+  semantics {
+    intrinsic("aarch64.pac.ia", read_gpr(17, 1), read_gpr(16, 1));
+  }
+}
+
+insn autia1716 {
+  encoding "11010101000000110010000110011111"
+  asm "autia1716"
+  semantics {
+    intrinsic("aarch64.aut.ia", read_gpr(17, 1), read_gpr(16, 1));
+  }
+}
+
+insn pacib1716 {
+  encoding "11010101000000110010000101011111"
+  asm "pacib1716"
+  semantics {
+    intrinsic("aarch64.pac.ib", read_gpr(17, 1), read_gpr(16, 1));
+  }
+}
+
+insn autib1716 {
+  encoding "11010101000000110010000111011111"
+  asm "autib1716"
+  semantics {
+    intrinsic("aarch64.aut.ib", read_gpr(17, 1), read_gpr(16, 1));
+  }
+}
+
+insn paciaz {
+  encoding "11010101000000110010001100011111"
+  asm "paciaz"
+  semantics {
+    intrinsic("aarch64.pac.ia", read_gpr(30, 1));
+  }
+}
+
+insn autiaz {
+  encoding "11010101000000110010001110011111"
+  asm "autiaz"
+  semantics {
+    intrinsic("aarch64.aut.ia", read_gpr(30, 1));
+  }
+}
+
+insn pacibsp {
+  encoding "11010101000000110010001101111111"
+  asm "pacibsp"
+  semantics {
+    intrinsic("aarch64.pac.ib", read_gpr(30, 1), read_gpr_sp(31, 1));
+  }
+}
+
+insn autibsp {
+  encoding "11010101000000110010001111111111"
+  asm "autibsp"
+  semantics {
+    intrinsic("aarch64.aut.ib", read_gpr(30, 1), read_gpr_sp(31, 1));
+  }
+}
+
+// Branch target identification. Which kinds of indirect branch may land here is
+// spelled rather than numbered, so the four forms are four rules; a `targets`
+// field would need an asm style that exists for nothing else.
+insn bti {
+  encoding "11010101000000110010010000011111"
+  asm "bti"
+  semantics {
+    intrinsic("aarch64.bti", imm(0, 8));
+  }
+}
+
+insn bti_c {
+  encoding "11010101000000110010010001011111"
+  asm "bti c"
+  semantics {
+    intrinsic("aarch64.bti", imm(1, 8));
+  }
+}
+
+insn bti_j {
+  encoding "11010101000000110010010010011111"
+  asm "bti j"
+  semantics {
+    intrinsic("aarch64.bti", imm(2, 8));
+  }
+}
+
+insn bti_jc {
+  encoding "11010101000000110010010011011111"
+  asm "bti jc"
+  semantics {
+    intrinsic("aarch64.bti", imm(3, 8));
+  }
+}
+
+insn dsb_barrier {
+  encoding "11010101000000110011" crm:4 "10011111"
+  asm "dsb #{crm:dec}"
+  semantics {
+    intrinsic("aarch64.dsb", imm(crm, 8));
+  }
+}
+
+// A barrier's effect is real but not modelled, so it becomes an intrinsic rather
+// than a nop. Pretending it does nothing would let a later pass reorder across
+// it.
+insn dmb_barrier {
+  encoding "11010101000000110011" crm:4 "10111111"
+  asm "dmb #{crm:dec}"
+  semantics {
+    intrinsic("aarch64.dmb", imm(crm, 8));
+  }
+}
+
+insn isb_barrier {
+  encoding "11010101000000110011" crm:4 "11011111"
+  asm "isb"
+  semantics {
+    intrinsic("aarch64.isb", imm(crm, 8));
+  }
+}
+
+// Clearing the exclusive monitor matters to a real atomics loop, but in the
+// single-threaded model the monitor never contends, so the effect is nothing.
+// It is still an intrinsic: pretending the instruction does not exist would be
+// worse than admitting we do not model it.
+insn clrex {
+  encoding "11010101000000110011" crm:4 "01011111"
+  asm "clrex #{crm:dec}"
+  semantics {
+    intrinsic("aarch64.clrex", imm(crm, 4));
+  }
+}
+
+// Cache maintenance. The op0 == 01 corner of the SYS space carries dc/ic; the
+// named rules cover the operations real code emits (buffer-cache writeback in
+// JITs and protectors), and sys/sysl catch the rest so nothing in the space is
+// ever a decode hole. All of it stays opaque to the decompiler: a cache clean
+// changes no architectural state a decompilation should model.
+insn dc_zva {
+  encoding "1101010100" "0" "01" "011" "0111" "0100" "001" Rt:5
+  require Rt != 31;
+  asm "dc zva, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.zva", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_ivac {
+  encoding "1101010100" "0" "01" "011" "0111" "0110" "000" Rt:5
+  require Rt != 31;
+  asm "dc ivac, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.ivac", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_isw {
+  encoding "1101010100" "0" "01" "011" "0111" "0110" "001" Rt:5
+  require Rt != 31;
+  asm "dc isw, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.isw", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_cvau {
+  encoding "1101010100" "0" "01" "011" "0111" "1011" "001" Rt:5
+  require Rt != 31;
+  asm "dc cvau, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.cvau", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_cvac {
+  encoding "1101010100" "0" "01" "011" "0111" "1010" "001" Rt:5
+  require Rt != 31;
+  asm "dc cvac, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.cvac", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_csw {
+  encoding "1101010100" "0" "01" "011" "0111" "1010" "010" Rt:5
+  require Rt != 31;
+  asm "dc csw, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.csw", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_cvap {
+  encoding "1101010100" "0" "01" "011" "0111" "1100" "001" Rt:5
+  require Rt != 31;
+  asm "dc cvap, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.cvap", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_cvadp {
+  encoding "1101010100" "0" "01" "011" "0111" "1101" "001" Rt:5
+  require Rt != 31;
+  asm "dc cvadp, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.cvadp", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_civac {
+  encoding "1101010100" "0" "01" "011" "0111" "1110" "001" Rt:5
+  require Rt != 31;
+  asm "dc civac, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.civac", read_gpr(Rt, 1));
+  }
+}
+
+insn dc_cisw {
+  encoding "1101010100" "0" "01" "011" "0111" "1110" "010" Rt:5
+  require Rt != 31;
+  asm "dc cisw, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.dc.cisw", read_gpr(Rt, 1));
+  }
+}
+
+insn ic_ialluis {
+  encoding "1101010100" "0" "01" "011" "0111" "0001" "000" "11111"
+  asm "ic ialluis"
+  semantics {
+    intrinsic("aarch64.ic.ialluis");
+  }
+}
+
+insn ic_iallu {
+  encoding "1101010100" "0" "01" "011" "0111" "0101" "000" "11111"
+  asm "ic iallu"
+  semantics {
+    intrinsic("aarch64.ic.iallu");
+  }
+}
+
+insn ic_ivau {
+  encoding "1101010100" "0" "01" "011" "0111" "0101" "001" Rt:5
+  require Rt != 31;
+  asm "ic ivau, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.ic.ivau", read_gpr(Rt, 1));
+  }
+}
+
+// Everything else in the op0 == 01 space (at/tlbi and the rarer cache ops) is
+// opaque system work: visible, with its operands, modelled as a black box.
+insn sys {
+  encoding "1101010100" "0" "01" op1:3 CRn:4 CRm:4 op2:3 Rt:5
+  asm "sys #1, c{CRn:dec}, c{CRm:dec}, #{op2:dec}, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.sys",
+              imm((op1 << 11) | (CRn << 7) | (CRm << 3) | op2, 16),
+              read_gpr(Rt, 1));
+  }
+}
+
+insn sysl {
+  encoding "1101010100" "1" "01" op1:3 CRn:4 CRm:4 op2:3 Rt:5
+  asm "sysl #1, c{CRn:dec}, c{CRm:dec}, #{op2:dec}, {Rt:reg(1)}"
+  semantics {
+    write_gpr(Rt, 1,
+              intrinsic_value("aarch64.sysl", 64,
+                              imm((op1 << 11) | (CRn << 7) | (CRm << 3) | op2, 16),
+                              read_gpr(Rt, 1)));
+  }
+}
+
+// The thread pointer, named because it is the one system register that matters to
+// a decompiler: a read of it is the base of thread-local storage, and every
+// `__thread` access in the output starts here. The rest stay encoded; a partial
+// name table would leave a reader unable to tell an unnamed register from an
+// unrecognised one.
+insn mrs_tpidr_el0 {
+  encoding "1101010100111" "011" "1101" "0000" "010" Rt:5
+  priority 1
+  asm "mrs {Rt:reg(1)}, tpidr_el0"
+  semantics {
+    write_gpr(Rt, 1, intrinsic_value("aarch64.tls.base", 64));
+  }
+}
+
+insn mrs {
+  encoding "110101010011" o0:1 op1:3 CRn:4 CRm:4 op2:3 Rt:5
+  asm "mrs {Rt:reg(1)}, s3_{op1:dec}_c{CRn:dec}_c{CRm:dec}_{op2:dec}"
+  semantics {
+    // A system register read is a source of values the decompiler cannot see
+    // through, which is exactly why it must be visible rather than undefined.
+    write_gpr(Rt, 1,
+              intrinsic_value("aarch64.mrs", 64,
+                              imm((o0 << 14) | (op1 << 11) | (CRn << 7) | (CRm << 3) | op2, 16)));
+  }
+}
+
+insn msr_reg {
+  encoding "110101010001" o0:1 op1:3 CRn:4 CRm:4 op2:3 Rt:5
+  asm "msr s3_{op1:dec}_c{CRn:dec}_c{CRm:dec}_{op2:dec}, {Rt:reg(1)}"
+  semantics {
+    intrinsic("aarch64.msr",
+              imm((o0 << 14) | (op1 << 11) | (CRn << 7) | (CRm << 3) | op2, 16),
+              read_gpr(Rt, 1));
+  }
+}
+
+// A supervisor call, modelled with its Linux ABI rather than as an opaque event.
+//
+// The obvious lift — `intrinsic("aarch64.svc", imm16)` with no operands — is
+// wrong in a way that only shows up three passes later. Nothing reads x8 after
+// the svc, so the `mov x8, #64` that selected the syscall has no use, and dead
+// code elimination is entirely right to delete it. By the time a recovery pass
+// looks for the syscall number, the instruction that set it is gone. Scanning
+// backwards through the *lifted* IL instead would mean running before SSA, and
+// so before constant propagation, which is exactly the machinery needed to see
+// through a number that arrives via a register copy or a thunk's parameter.
+//
+// Naming the ABI here fixes both problems at once: the reads are real uses, so
+// the number survives to be constant-folded, and the recovery pass reads it off
+// an operand instead of guessing from position. The cost is that a syscall in
+// a function that never sets x5 now reads an undefined x5 — honest, since the
+// kernel does read it, and visible in the output as an unused argument rather
+// than as a silently dropped one.
+//
+// x8 is the syscall number, x0-x5 the six arguments, x0 the return value; that
+// is the whole Linux AArch64 convention. `imm16` stays an operand so that
+// `svc #0` and the rarer non-zero forms stay distinguishable.
+insn svc {
+  encoding "11010100000" imm16:16 "00001"
+  asm "svc #{imm16:hex}"
+  semantics {
+    write_gpr(0, 1,
+              intrinsic_value("aarch64.svc", 64, imm(imm16, 16),
+                              read_gpr(8, 1),
+                              read_gpr(0, 1), read_gpr(1, 1), read_gpr(2, 1),
+                              read_gpr(3, 1), read_gpr(4, 1), read_gpr(5, 1)));
+  }
+}
+
+insn brk {
+  encoding "11010100001" imm16:16 "00000"
+  asm "brk #{imm16:hex}"
+  semantics {
+    intrinsic("aarch64.brk", imm(imm16, 16));
+    unreachable();
+  }
+}

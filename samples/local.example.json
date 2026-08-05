@@ -1,0 +1,4 @@
+{
+  "_comment": "Copy this file to local.json (gitignored) and point each key at the real .so on disk. Keys match the 'binary' field of samples/manifest.json cases. An XDEC_SAMPLE_<KEY> environment variable (key upper-cased) overrides the file for a single run.",
+  "libtarget": "C:\\path\\to\\libtarget.so"
+}

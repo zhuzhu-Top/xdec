@@ -1,0 +1,41 @@
+{
+  "notes": [
+    "L1 regression suite: real obfuscated .so files the decompiler does not",
+    "control the source of, unlike eval/ which is built from known C. There is",
+    "no ground truth here, so a case is scored on structural shape only --",
+    "goto/switch/ternary counts and a clean (exit 0) decompile -- not on the",
+    "signature or type checks eval/manifest.json can make.",
+    "",
+    "'binary' is a key, not a path: the actual .so lives outside this repo, so",
+    "run.ps1 resolves it through samples/local.json (gitignored) or an",
+    "XDEC_SAMPLE_<KEY> environment variable. See samples/README.md."
+  ],
+  "cases": [
+    {
+      "name": "sample_jni_onload",
+      "category": "dispatcher",
+      "binary": "libtarget",
+      "address": "0xe4c8c",
+      "comment": "OLLVM-flattened JNI_OnLoad: a state variable (var_178) is threaded through if-chains and a table load (g_1e14d0 base + state*8) that picks the next block. No 'rounds' key, so it runs at the harness default of 8 -- pinned, which makes it a wall rather than a budget, so a regression in rounds-per-level fails the case instead of quietly costing time. It needed 24 before Phase A2 and takes 8 now (7 rounds of discovery, one to confirm the fixpoint): carrying a branch's candidate set with its discovery lets the round that lifts a level also open it. fold-resolved-branch (Phase A1) turned every single-target resolved branch into a plain fallthrough, which is most of why gotos/ifs are this low; the remaining ones are the genuine 3-way switch, its own back edge, and one dead-end self-loop the obfuscator pads with. The 13 remaining ternaries are the ones Phase A4 deliberately left: a select nested inside an address computation or hoisted to a shared temporary is not a statement, and rewriting it as one would invent control flow the code does not have.",
+      "expect": {
+        "max_gotos": 7,
+        "min_switches": 1,
+        "max_ternaries": 13
+      }
+    },
+    {
+      "name": "sample_mega_dispatcher",
+      "category": "dispatcher",
+      "binary": "libtarget",
+      "address": "0x199214",
+      "decompile_args": ["--allow-unresolved"],
+      "comment": "The same obfuscator turned up to a size nothing resolves whole: 320 blocks behind one entry, and ~300 of its computed branches are 'ldr xT,[x26,xI,lsl#3]; br xT' where x26 never narrows to one value, so the table shape never matches and the value set stays top. The driver still reaches a real fixpoint in 4 rounds -- this is not a round-budget case -- and until Phase A3 the run then failed the Resolved gate and produced nothing at all for 320 understood blocks. --allow-unresolved seals each unanswerable branch as an opaque terminator naming the expression it could not evaluate, so the case now scores what was recovered and tracks the holes as a number. Lowering max_unresolved_branches is the measure of progress on data-dependent brind resolution; raising it is a regression.",
+      "expect": {
+        "max_unresolved_branches": 301,
+        "max_undef": 28,
+        "min_switches": 1,
+        "max_ternaries": 3623
+      }
+    }
+  ]
+}

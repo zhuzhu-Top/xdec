@@ -1,0 +1,169 @@
+// Android NDK preset: the declarations a native library actually touches.
+//
+// This is not a copy of the NDK sysroot. It is the set of types and prototypes
+// that show up when reading decompiled JNI code — the JNI handles, the libc
+// calls a .so makes through the PLT, and the structs those calls fill in.
+// Importing it turns `uint64_t sub_841ac(uint64_t a0, uint64_t a1)` into
+// `jint JNI_OnLoad(JavaVM *vm, void *reserved)`.
+//
+// Import with `--types android-ndk`. Stack a project header on top of it with
+// a second `--types`; later files win on conflicts only when they agree, and
+// a real conflict is reported rather than silently resolved.
+//
+// The fixed-width integer names (uint8_t … uintptr_t, size_t, ssize_t) are
+// built into the type database and are not repeated here.
+
+// ---------------------------------------------------------------------------
+// JNI
+// ---------------------------------------------------------------------------
+
+typedef uint8_t jboolean;
+typedef int8_t jbyte;
+typedef uint16_t jchar;
+typedef int16_t jshort;
+typedef int32_t jint;
+typedef int64_t jlong;
+typedef float jfloat;
+typedef double jdouble;
+typedef int32_t jsize;
+
+// JNI reference types are opaque pointers in C. Keeping them distinct from
+// `void*` is the whole point: a decompiled call taking a `jobject` reads very
+// differently from one taking an arbitrary pointer.
+typedef struct _jobject *jobject;
+typedef jobject jclass;
+typedef jobject jstring;
+typedef jobject jarray;
+typedef jobject jthrowable;
+typedef jobject jweak;
+typedef jarray jobjectArray;
+typedef jarray jbooleanArray;
+typedef jarray jbyteArray;
+typedef jarray jcharArray;
+typedef jarray jshortArray;
+typedef jarray jintArray;
+typedef jarray jlongArray;
+typedef jarray jfloatArray;
+typedef jarray jdoubleArray;
+
+typedef struct _jfieldID *jfieldID;
+typedef struct _jmethodID *jmethodID;
+
+// The function tables. Their contents are indirect-call targets, so the
+// members are what let a `[x0 + 0x2b8]` call print as `GetMethodID`. Only the
+// shape matters here; the emitter reads offsets, not names it invents.
+struct JNINativeInterface;
+struct JNIInvokeInterface;
+
+typedef const struct JNINativeInterface *JNIEnv;
+typedef const struct JNIInvokeInterface *JavaVM;
+
+typedef struct {
+  const char *name;
+  const char *signature;
+  void *fnPtr;
+} JNINativeMethod;
+
+// ---------------------------------------------------------------------------
+// libc: the calls a native library reaches for through the PLT
+// ---------------------------------------------------------------------------
+
+void *malloc(size_t size);
+void *calloc(size_t count, size_t size);
+void *realloc(void *ptr, size_t size);
+void free(void *ptr);
+
+void *memcpy(void *dst, const void *src, size_t n);
+void *memmove(void *dst, const void *src, size_t n);
+void *memset(void *dst, int value, size_t n);
+int memcmp(const void *lhs, const void *rhs, size_t n);
+void *memchr(const void *buf, int value, size_t n);
+
+size_t strlen(const char *s);
+char *strcpy(char *dst, const char *src);
+char *strncpy(char *dst, const char *src, size_t n);
+char *strcat(char *dst, const char *src);
+int strcmp(const char *lhs, const char *rhs);
+int strncmp(const char *lhs, const char *rhs, size_t n);
+char *strstr(const char *haystack, const char *needle);
+char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
+char *strdup(const char *s);
+
+int snprintf(char *buf, size_t size, const char *format, ...);
+int sprintf(char *buf, const char *format, ...);
+int printf(const char *format, ...);
+int puts(const char *s);
+
+void *dlopen(const char *filename, int flags);
+void *dlsym(void *handle, const char *symbol);
+int dlclose(void *handle);
+char *dlerror(void);
+
+void abort(void);
+void exit(int status);
+void __stack_chk_fail(void);
+int atoi(const char *s);
+long strtol(const char *s, char **end, int base);
+
+int open(const char *path, int flags, ...);
+ssize_t read(int fd, void *buf, size_t count);
+ssize_t write(int fd, const void *buf, size_t count);
+int close(int fd);
+off_t lseek(int fd, off_t offset, int whence);
+
+int access(const char *path, int mode);
+pid_t getpid(void);
+pid_t gettid(void);
+uid_t getuid(void);
+int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4,
+          unsigned long a5);
+
+// ---------------------------------------------------------------------------
+// Time and the structs syscalls fill in
+// ---------------------------------------------------------------------------
+
+struct timeval {
+  time_t tv_sec;
+  suseconds_t tv_usec;
+};
+
+struct timespec {
+  time_t tv_sec;
+  long tv_nsec;
+};
+
+struct timezone {
+  int tz_minuteswest;
+  int tz_dsttime;
+};
+
+int gettimeofday(struct timeval *tv, struct timezone *tz);
+int clock_gettime(int clock_id, struct timespec *ts);
+time_t time(time_t *out);
+int nanosleep(const struct timespec *request, struct timespec *remain);
+
+// ---------------------------------------------------------------------------
+// pthreads
+// ---------------------------------------------------------------------------
+
+typedef long pthread_t;
+typedef struct { int64_t opaque[4]; } pthread_mutex_t;
+typedef struct { int64_t opaque[6]; } pthread_cond_t;
+typedef struct { int32_t opaque[1]; } pthread_once_t;
+typedef int32_t pthread_key_t;
+
+int pthread_mutex_lock(pthread_mutex_t *mutex);
+int pthread_mutex_unlock(pthread_mutex_t *mutex);
+int pthread_once(pthread_once_t *control, void (*init)(void));
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
+void *pthread_getspecific(pthread_key_t key);
+int pthread_setspecific(pthread_key_t key, const void *value);
+pthread_t pthread_self(void);
+
+// ---------------------------------------------------------------------------
+// Android logging
+// ---------------------------------------------------------------------------
+
+int __android_log_print(int priority, const char *tag, const char *format, ...);
+int __android_log_write(int priority, const char *tag, const char *text);

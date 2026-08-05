@@ -1,0 +1,73 @@
+﻿0x00199214  d10183ff  sub sp, sp, #0x60                
+0x00199218  a9037bfd  stp x29, x30, [sp, #48]          
+0x0019921c  f90023f5  str x21, [sp, #0x40]             
+0x00199220  a9054ff4  stp x20, x19, [sp, #80]          
+0x00199224  9100c3fd  add x29, sp, #0x30               
+0x00199228  d53bd053  mrs x19, tpidr_el0               
+0x0019922c  52800069  mov w9, #0x3                     
+0x00199230  d503201f  nop                              
+0x00199234  102e6d74  adr x20, #0x1f5fe0               
+0x00199238  f9401668  ldr x8, [x19, #0x28]             
+0x0019923c  f81f83a8  stur x8, [x29, #-8]              
+0x00199240  aa0903e8  mov x8, x9                       
+0x00199244  f90007e9  str x9, [sp, #0x8]               
+0x00199248  f1000d1f  cmp x8, #0x3                     
+0x0019924c  52800049  mov w9, #0x2                     
+0x00199250  9a88c128  csel x8, x9, x8, gt              
+0x00199254  f8687a88  ldr x8, [x20, x8, lsl #3]        
+0x00199258  d61f0100  br x8                            indirect-branch
+0x0019925c  aa1f03e9  mov x9, xzr                      
+0x00199260  910043ea  add x10, sp, #0x10               
+0x00199264  aa0a03e0  mov x0, x10                      
+0x00199268  aa0903e1  mov x1, x9                       
+0x0019926c  d2801528  mov x8, #0xa9                    
+0x00199270  d4000001  svc #0x0                         
+0x00199274  aa0003e9  mov x9, x0                       
+0x00199278  b81f43a9  stur w9, [x29, #-12]             
+0x0019927c  b90007e9  str w9, [sp, #0x4]               
+0x00199280  52800049  mov w9, #0x2                     
+0x00199284  b94007e8  ldr w8, [sp, #0x4]               
+0x00199288  3140051f  cmn w8, #0x1000                  
+0x0019928c  1a9f97e8  cset w8, hi                      
+0x00199290  f1000d1f  cmp x8, #0x3                     
+0x00199294  f90007e8  str x8, [sp, #0x8]               
+0x00199298  9a88c128  csel x8, x9, x8, gt              
+0x0019929c  f8687a88  ldr x8, [x20, x8, lsl #3]        
+0x001992a0  d61f0100  br x8                            indirect-branch
+0x001992a4  b94007e8  ldr w8, [sp, #0x4]               
+0x001992a8  4b0803f5  neg w21, w8                      
+0x001992ac  9400e57d  bl 0x1d28a0                      
+0x001992b0  aa1f03e8  mov x8, xzr                      
+0x001992b4  52800049  mov w9, #0x2                     
+0x001992b8  b9000015  str w21, [x0, #0x0]              
+0x001992bc  f1000d1f  cmp x8, #0x3                     
+0x001992c0  f90007ff  str xzr, [sp, #0x8]              
+0x001992c4  9a88c128  csel x8, x9, x8, gt              
+0x001992c8  f8687a88  ldr x8, [x20, x8, lsl #3]        
+0x001992cc  d61f0100  br x8                            indirect-branch
+0x001992d0  52800048  mov w8, #0x2                     
+0x001992d4  52800049  mov w9, #0x2                     
+0x001992d8  f1000d1f  cmp x8, #0x3                     
+0x001992dc  f90007e8  str x8, [sp, #0x8]               
+0x001992e0  9a88c128  csel x8, x9, x8, gt              
+0x001992e4  f8687a88  ldr x8, [x20, x8, lsl #3]        
+0x001992e8  d61f0100  br x8                            indirect-branch
+0x001992ec  a94127e8  ldp x8, x9, [sp, #16]            
+0x001992f0  f940166a  ldr x10, [x19, #0x28]            
+0x001992f4  f85f83ab  ldur x11, [x29, #-8]             
+0x001992f8  eb0b015f  cmp x10, x11                     
+0x001992fc  540001e1  b.ne 0x199338                    cond-branch
+0x00199300  52807d0a  mov w10, #0x3e8                  
+0x00199304  d343fd29  lsr x9, x9, #3                   
+0x00199308  9b0a7d08  mul x8, x8, x10                  
+0x0019930c  d29ef9ea  mov x10, #0xf7cf                 
+0x00199310  f2bc6a6a  movk x10, #0xe353, lsl #16       
+0x00199314  f2d374aa  movk x10, #0x9ba5, lsl #32       
+0x00199318  f2e4188a  movk x10, #0x20c4, lsl #48       
+0x0019931c  9bca7d29  umulh x9, x9, x10                
+0x00199320  8b491100  add x0, x8, x9, lsr #4           
+0x00199324  a9454ff4  ldp x20, x19, [sp, #80]          
+0x00199328  f94023f5  ldr x21, [sp, #0x40]             
+0x0019932c  a9437bfd  ldp x29, x30, [sp, #48]          
+0x00199330  910183ff  add sp, sp, #0x60                
+0x00199334  d65f03c0  ret                              return

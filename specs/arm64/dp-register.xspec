@@ -1,0 +1,892 @@
+// Data processing, register operands.
+//
+// Bits 27..25 are `101`. Logical and arithmetic with a shifted or extended second
+// operand, the carry-propagating forms, conditional select and its aliases, and
+// the one, two and three source groups: divide, variable shift, bit reverse,
+// count leading zeros, multiply and multiply-accumulate.
+// ---------------------------------------------------------------------------
+// Data processing -- register: logical, shifted register
+// ---------------------------------------------------------------------------
+
+insn and_shifted_reg {
+  encoding sf:1 "0001010" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "and {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) & shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn bic_shifted_reg {
+  encoding sf:1 "0001010" shift:2 "1" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "bic {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) & ~shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn orr_shifted_reg {
+  encoding sf:1 "0101010" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "orr {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) | shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+// The most common instruction in both samples, and it does not exist: a register
+// move is an or with the zero register.
+insn mov_reg {
+  encoding sf:1 "0101010" "00" "0" Rm:5 "000000" "11111" Rd:5
+  asm "mov {Rd:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rm, sf));
+  }
+}
+
+insn orn_shifted_reg {
+  encoding sf:1 "0101010" shift:2 "1" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "orn {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) | ~shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn mvn_reg {
+  encoding sf:1 "0101010" shift:2 "1" Rm:5 imm6:6 "11111" Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "mvn {Rd:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, ~shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn eor_shifted_reg {
+  encoding sf:1 "1001010" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "eor {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) ^ shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn eon_shifted_reg {
+  encoding sf:1 "1001010" shift:2 "1" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "eon {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) ^ ~shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn ands_shifted_reg {
+  encoding sf:1 "1101010" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "ands {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    let r = read_gpr(Rn, sf) & shift_reg(sf, read_gpr(Rm, sf), shift, imm6);
+    write_gpr(Rd, sf, r);
+    nzcv = flagdef_logic(r);
+  }
+}
+
+insn tst_shifted_reg {
+  encoding sf:1 "1101010" shift:2 "0" Rm:5 imm6:6 Rn:5 "11111"
+  require sf == 1 || imm6 < 32;
+  asm "tst {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    nzcv = flagdef_logic(read_gpr(Rn, sf) & shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn bics_shifted_reg {
+  encoding sf:1 "1101010" shift:2 "1" Rm:5 imm6:6 Rn:5 Rd:5
+  require sf == 1 || imm6 < 32;
+  asm "bics {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    let r = read_gpr(Rn, sf) & ~shift_reg(sf, read_gpr(Rm, sf), shift, imm6);
+    write_gpr(Rd, sf, r);
+    nzcv = flagdef_logic(r);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- register: add/subtract, shifted register
+// ---------------------------------------------------------------------------
+
+insn add_shifted_reg {
+  encoding sf:1 "0001011" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "add {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) + shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn adds_shifted_reg {
+  encoding sf:1 "0101011" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "adds {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = shift_reg(sf, read_gpr(Rm, sf), shift, imm6);
+    write_gpr(Rd, sf, a + b);
+    nzcv = flagdef_add(a, b);
+  }
+}
+
+insn cmn_shifted_reg {
+  encoding sf:1 "0101011" shift:2 "0" Rm:5 imm6:6 Rn:5 "11111"
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "cmn {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    nzcv = flagdef_add(read_gpr(Rn, sf), shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn sub_shifted_reg {
+  encoding sf:1 "1001011" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "sub {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) - shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn neg_shifted_reg {
+  encoding sf:1 "1001011" shift:2 "0" Rm:5 imm6:6 "11111" Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "neg {Rd:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    write_gpr(Rd, sf, -shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn subs_shifted_reg {
+  encoding sf:1 "1101011" shift:2 "0" Rm:5 imm6:6 Rn:5 Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "subs {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = shift_reg(sf, read_gpr(Rm, sf), shift, imm6);
+    write_gpr(Rd, sf, a - b);
+    nzcv = flagdef_sub(a, b);
+  }
+}
+
+// `cmp` is `subs` writing to the zero register. It overlaps subs_shifted_reg but
+// constrains one more field, so it is unambiguously the more specific rule and
+// the overlap checker accepts it.
+insn cmp_shifted_reg {
+  encoding sf:1 "1101011" shift:2 "0" Rm:5 imm6:6 Rn:5 "11111"
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  // `subs xzr, xzr, xm` is equally `negs xzr, xm`. Every other disassembler
+  // reads it as cmp, and agreeing with them costs one line.
+  priority 1
+  asm "cmp {Rn:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    nzcv = flagdef_sub(read_gpr(Rn, sf), shift_reg(sf, read_gpr(Rm, sf), shift, imm6));
+  }
+}
+
+insn negs_shifted_reg {
+  encoding sf:1 "1101011" shift:2 "0" Rm:5 imm6:6 "11111" Rd:5
+  require (sf == 1 || imm6 < 32) && shift != 3;
+  asm "negs {Rd:reg(sf)}, {Rm:reg(sf)}[, {shift:shift} #{imm6:dec}]"
+  semantics {
+    let b = shift_reg(sf, read_gpr(Rm, sf), shift, imm6);
+    write_gpr(Rd, sf, -b);
+    nzcv = flagdef_sub(imm(0, 32 << sf), b);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- register: add/subtract, extended register
+// ---------------------------------------------------------------------------
+//
+// The extend is part of the operand and has to be printed: `add x10, x8, w9`
+// and `add x10, x8, w9, uxth #2` are different instructions. Three things vary
+// together, so the templates below are wordier than the rest of the file.
+//
+// The source register is a w register for every extend but uxtx and sxtx, which
+// is what `(option & 3) == 3` tests. The extend itself is written `lsl` when it
+// is the one that does nothing to the value -- uxtx at 64 bits, uxtw at 32 --
+// and then it is left out entirely if it also shifts by nothing.
+
+insn add_extended_reg {
+  encoding sf:1 "0001011001" Rm:5 option:3 imm3:3 Rn:5 Rd:5
+  require imm3 <= 4;
+  asm "add {Rd:regsp(sf)}, {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    write_gpr_sp(Rd, sf, read_gpr_sp(Rn, sf) + extend_reg(sf, Rm, option, imm3));
+  }
+}
+
+insn adds_extended_reg {
+  encoding sf:1 "0101011001" Rm:5 option:3 imm3:3 Rn:5 Rd:5
+  require imm3 <= 4;
+  asm "adds {Rd:reg(sf)}, {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = extend_reg(sf, Rm, option, imm3);
+    write_gpr(Rd, sf, a + b);
+    nzcv = flagdef_add(a, b);
+  }
+}
+
+insn cmn_extended_reg {
+  encoding sf:1 "0101011001" Rm:5 option:3 imm3:3 Rn:5 "11111"
+  require imm3 <= 4;
+  priority 1
+  asm "cmn {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = extend_reg(sf, Rm, option, imm3);
+    nzcv = flagdef_add(a, b);
+  }
+}
+
+insn sub_extended_reg {
+  encoding sf:1 "1001011001" Rm:5 option:3 imm3:3 Rn:5 Rd:5
+  require imm3 <= 4;
+  asm "sub {Rd:regsp(sf)}, {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    write_gpr_sp(Rd, sf, read_gpr_sp(Rn, sf) - extend_reg(sf, Rm, option, imm3));
+  }
+}
+
+insn cmp_extended_reg {
+  encoding sf:1 "1101011001" Rm:5 option:3 imm3:3 Rn:5 "11111"
+  require imm3 <= 4;
+  priority 1
+  asm "cmp {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = extend_reg(sf, Rm, option, imm3);
+    nzcv = flagdef_sub(a, b);
+  }
+}
+
+insn subs_extended_reg {
+  encoding sf:1 "1101011001" Rm:5 option:3 imm3:3 Rn:5 Rd:5
+  require imm3 <= 4;
+  asm "subs {Rd:reg(sf)}, {Rn:regsp(sf)}, {Rm:reg((option & 3) == 3 ? 1 : 0)}[, {option == (sf == 1 ? 3 : 2) ? (imm3 == 0 ? 0 : 4) : option + 1:extend}[ #{imm3:dec}]]"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = extend_reg(sf, Rm, option, imm3);
+    write_gpr(Rd, sf, a - b);
+    nzcv = flagdef_sub(a, b);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- register: carry, conditional select
+// ---------------------------------------------------------------------------
+
+insn adc {
+  encoding sf:1 "0011010000" Rm:5 "000000" Rn:5 Rd:5
+  asm "adc {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, a + b + zext(c, 32 << sf));
+  }
+}
+
+insn adcs {
+  encoding sf:1 "0111010000" Rm:5 "000000" Rn:5 Rd:5
+  asm "adcs {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, a + b + zext(c, 32 << sf));
+    nzcv = flagdef_adc(a, b, c);
+  }
+}
+
+insn sbc {
+  encoding sf:1 "1011010000" Rm:5 "000000" Rn:5 Rd:5
+  asm "sbc {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, a - b - zext(~c, 32 << sf));
+  }
+}
+
+// Subtracting from the zero register with borrow negates, which is how a
+// multi-word negation carries between words.
+insn ngc {
+  encoding sf:1 "1011010000" Rm:5 "000000" "11111" Rd:5
+  priority 1
+  asm "ngc {Rd:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, -b - zext(~c, 32 << sf));
+  }
+}
+
+insn sbcs {
+  encoding sf:1 "1111010000" Rm:5 "000000" Rn:5 Rd:5
+  asm "sbcs {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let a = read_gpr(Rn, sf);
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, a - b - zext(~c, 32 << sf));
+    nzcv = flagdef_sbc(a, b, c);
+  }
+}
+
+insn ngcs {
+  encoding sf:1 "1111010000" Rm:5 "000000" "11111" Rd:5
+  priority 1
+  asm "ngcs {Rd:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let a = imm(0, 32 << sf);
+    let b = read_gpr(Rm, sf);
+    let c = flagbit(nzcv, 2);
+    write_gpr(Rd, sf, a - b - zext(~c, 32 << sf));
+    nzcv = flagdef_sbc(a, b, c);
+  }
+}
+
+// Conditional compare is the reason the IL has a flags constant: when the
+// condition fails the architecture writes a literal NZCV rather than the result
+// of any comparison, and there is no pair of operands to `flagdef_sub` that
+// produces an arbitrary bundle.
+insn ccmp_reg {
+  encoding sf:1 "1111010010" Rm:5 cc:4 "00" Rn:5 "0" nzcv_imm:4
+  asm "ccmp {Rn:reg(sf)}, {Rm:reg(sf)}, #{nzcv_imm:hex}, {cc:cond}"
+  semantics {
+    nzcv = select_flags(cond(nzcv, cc),
+                        flagdef_sub(read_gpr(Rn, sf), read_gpr(Rm, sf)),
+                        flagconst(imm(nzcv_imm, 4)));
+  }
+}
+
+insn ccmn_reg {
+  encoding sf:1 "0111010010" Rm:5 cc:4 "00" Rn:5 "0" nzcv_imm:4
+  asm "ccmn {Rn:reg(sf)}, {Rm:reg(sf)}, #{nzcv_imm:hex}, {cc:cond}"
+  semantics {
+    nzcv = select_flags(cond(nzcv, cc),
+                        flagdef_add(read_gpr(Rn, sf), read_gpr(Rm, sf)),
+                        flagconst(imm(nzcv_imm, 4)));
+  }
+}
+
+insn ccmp_imm {
+  encoding sf:1 "1111010010" imm5:5 cc:4 "10" Rn:5 "0" nzcv_imm:4
+  asm "ccmp {Rn:reg(sf)}, #{imm5:hex}, #{nzcv_imm:hex}, {cc:cond}"
+  semantics {
+    nzcv = select_flags(cond(nzcv, cc),
+                        flagdef_sub(read_gpr(Rn, sf), imm(imm5, 32 << sf)),
+                        flagconst(imm(nzcv_imm, 4)));
+  }
+}
+
+insn ccmn_imm {
+  encoding sf:1 "0111010010" imm5:5 cc:4 "10" Rn:5 "0" nzcv_imm:4
+  asm "ccmn {Rn:reg(sf)}, #{imm5:hex}, #{nzcv_imm:hex}, {cc:cond}"
+  semantics {
+    nzcv = select_flags(cond(nzcv, cc),
+                        flagdef_add(read_gpr(Rn, sf), imm(imm5, 32 << sf)),
+                        flagconst(imm(nzcv_imm, 4)));
+  }
+}
+
+insn csel {
+  encoding sf:1 "0011010100" Rm:5 cc:4 "00" Rn:5 Rd:5
+  asm "csel {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {cc:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), read_gpr(Rn, sf), read_gpr(Rm, sf)));
+  }
+}
+
+insn csinc {
+  encoding sf:1 "0011010100" Rm:5 cc:4 "01" Rn:5 Rd:5
+  asm "csinc {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {cc:cond}"
+  semantics {
+    write_gpr(Rd, sf,
+              select(cond(nzcv, cc), read_gpr(Rn, sf), read_gpr(Rm, sf) + imm(1, 32 << sf)));
+  }
+}
+
+// cset Rd, cc is csinc Rd, xzr, xzr, invert(cc). Left as its own rule because a
+// boolean materialised into a register is worth recognising downstream.
+insn cset {
+  encoding sf:1 "0011010100" "11111" cc:4 "01" "11111" Rd:5
+  require cc != 14 && cc != 15;
+  asm "cset {Rd:reg(sf)}, {cc ^ 1:cond}"
+  semantics {
+    write_gpr(Rd, sf, zext(~cond(nzcv, cc), 32 << sf));
+  }
+}
+
+// `cinc Rd, Rn, cc` is `csinc Rd, Rn, Rn, invert(cc)`: increment when the
+// condition holds, copy when it does not. The three `c*` aliases below all read
+// the same way, and all three print the inverted condition, because the encoded
+// condition selects the copy and the alias names what happens instead.
+insn cinc {
+  encoding sf:1 "0011010100" Rm:5 cc:4 "01" Rn:5 Rd:5
+  require Rm == Rn && Rn != 31;
+  require cc != 14 && cc != 15;
+  priority 1
+  asm "cinc {Rd:reg(sf)}, {Rn:reg(sf)}, {cc ^ 1:cond}"
+  semantics {
+    write_gpr(Rd, sf,
+              select(cond(nzcv, cc), read_gpr(Rn, sf), read_gpr(Rm, sf) + imm(1, 32 << sf)));
+  }
+}
+
+insn csinv {
+  encoding sf:1 "1011010100" Rm:5 cc:4 "00" Rn:5 Rd:5
+  asm "csinv {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {cc:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), read_gpr(Rn, sf), ~read_gpr(Rm, sf)));
+  }
+}
+
+insn cinv {
+  encoding sf:1 "1011010100" Rm:5 cc:4 "00" Rn:5 Rd:5
+  require Rm == Rn && Rn != 31;
+  require cc != 14 && cc != 15;
+  priority 1
+  asm "cinv {Rd:reg(sf)}, {Rn:reg(sf)}, {cc ^ 1:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), read_gpr(Rn, sf), ~read_gpr(Rm, sf)));
+  }
+}
+
+insn csetm {
+  encoding sf:1 "1011010100" "11111" cc:4 "00" "11111" Rd:5
+  require cc != 14 && cc != 15;
+  priority 2
+  asm "csetm {Rd:reg(sf)}, {cc ^ 1:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), imm(0, 32 << sf), imm(ones_int(32 << sf), 32 << sf)));
+  }
+}
+
+insn csneg {
+  encoding sf:1 "1011010100" Rm:5 cc:4 "01" Rn:5 Rd:5
+  asm "csneg {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {cc:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), read_gpr(Rn, sf), -read_gpr(Rm, sf)));
+  }
+}
+
+insn cneg {
+  encoding sf:1 "1011010100" Rm:5 cc:4 "01" Rn:5 Rd:5
+  require Rm == Rn;
+  require cc != 14 && cc != 15;
+  priority 1
+  asm "cneg {Rd:reg(sf)}, {Rn:reg(sf)}, {cc ^ 1:cond}"
+  semantics {
+    write_gpr(Rd, sf, select(cond(nzcv, cc), read_gpr(Rn, sf), -read_gpr(Rm, sf)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- register: two and three source
+// ---------------------------------------------------------------------------
+
+insn udiv {
+  encoding sf:1 "0011010110" Rm:5 "000010" Rn:5 Rd:5
+  asm "udiv {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) / read_gpr(Rm, sf));
+  }
+}
+
+insn sdiv {
+  encoding sf:1 "0011010110" Rm:5 "000011" Rn:5 Rd:5
+  asm "sdiv {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) /s read_gpr(Rm, sf));
+  }
+}
+
+// The variable-shift forms mask the amount by the operand size, which is why
+// they cannot simply reuse shift_reg.
+insn lslv {
+  encoding sf:1 "0011010110" Rm:5 "001000" Rn:5 Rd:5
+  asm "lsl {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let mask = imm(ones_int(5 + sf), 32 << sf);
+    write_gpr(Rd, sf, read_gpr(Rn, sf) << (read_gpr(Rm, sf) & mask));
+  }
+}
+
+insn lsrv {
+  encoding sf:1 "0011010110" Rm:5 "001001" Rn:5 Rd:5
+  asm "lsr {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let mask = imm(ones_int(5 + sf), 32 << sf);
+    write_gpr(Rd, sf, read_gpr(Rn, sf) >> (read_gpr(Rm, sf) & mask));
+  }
+}
+
+insn asrv {
+  encoding sf:1 "0011010110" Rm:5 "001010" Rn:5 Rd:5
+  asm "asr {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let mask = imm(ones_int(5 + sf), 32 << sf);
+    write_gpr(Rd, sf, read_gpr(Rn, sf) >>> (read_gpr(Rm, sf) & mask));
+  }
+}
+
+insn rorv {
+  encoding sf:1 "0011010110" Rm:5 "001011" Rn:5 Rd:5
+  asm "ror {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    let mask = imm(ones_int(5 + sf), 32 << sf);
+    write_gpr(Rd, sf, rotr(read_gpr(Rn, sf), read_gpr(Rm, sf) & mask));
+  }
+}
+
+// Pointer authentication on an arbitrary register pair, as opposed to the fixed
+// x30/sp forms that live with the hints. The key and whether it signs or
+// authenticates are in `opcode`, and none of it is modelled: what matters is that
+// the destination is known to change and the sources are known to be read.
+insn pacia {
+  encoding "11011010110" "00001" "0" "00000" Rn:5 Rd:5
+  asm "pacia {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.pacia", 64, imm(0, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn pacib {
+  encoding "11011010110" "00001" "0" "00001" Rn:5 Rd:5
+  asm "pacib {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.pacib", 64, imm(1, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn pacda {
+  encoding "11011010110" "00001" "0" "00010" Rn:5 Rd:5
+  asm "pacda {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.pacda", 64, imm(2, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn pacdb {
+  encoding "11011010110" "00001" "0" "00011" Rn:5 Rd:5
+  asm "pacdb {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.pacdb", 64, imm(3, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn autia {
+  encoding "11011010110" "00001" "0" "00100" Rn:5 Rd:5
+  asm "autia {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.autia", 64, imm(4, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn autib {
+  encoding "11011010110" "00001" "0" "00101" Rn:5 Rd:5
+  asm "autib {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.autib", 64, imm(5, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn autda {
+  encoding "11011010110" "00001" "0" "00110" Rn:5 Rd:5
+  asm "autda {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.autda", 64, imm(6, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn autdb {
+  encoding "11011010110" "00001" "0" "00111" Rn:5 Rd:5
+  asm "autdb {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    gpr[Rd] = intrinsic_value("aarch64.autdb", 64, imm(7, 8), gpr[Rd], read_gpr_sp(Rn, 1));
+  }
+}
+
+insn rbit {
+  encoding sf:1 "1011010110" "00000" "000000" Rn:5 Rd:5
+  asm "rbit {Rd:reg(sf)}, {Rn:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, brev(read_gpr(Rn, sf)));
+  }
+}
+
+insn rev {
+  encoding sf:1 "1011010110" "00000" "00001" sf2:1 Rn:5 Rd:5
+  require sf2 == sf;
+  asm "rev {Rd:reg(sf)}, {Rn:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, bswap(read_gpr(Rn, sf)));
+  }
+}
+
+// `rev16` and `rev32` reverse bytes within each halfword or word rather than
+// across the register, so they are byte swaps of a narrower unit rather than a
+// `bswap`. Written as mask-and-shift because that is what they are; the masks are
+// built by replicating a pattern rather than spelled out, so one expression
+// serves both register widths.
+insn rev16 {
+  encoding sf:1 "1011010110" "00000" "000001" Rn:5 Rd:5
+  asm "rev16 {Rd:reg(sf)}, {Rn:reg(sf)}"
+  semantics {
+    let esize = 32 << sf;
+    let low = imm(replicate_int(0x00ff, 16, esize), esize);
+    let high = imm(replicate_int(0xff00, 16, esize), esize);
+    let v = read_gpr(Rn, sf);
+    write_gpr(Rd, sf, ((v << imm(8, esize)) & high) | ((v >> imm(8, esize)) & low));
+  }
+}
+
+insn rev32 {
+  encoding "11011010110" "00000" "000010" Rn:5 Rd:5
+  asm "rev32 {Rd:reg(1)}, {Rn:reg(1)}"
+  semantics {
+    let bytes = imm(replicate_int(0x00ff, 16, 64), 64);
+    let halves = imm(replicate_int(0x0000ffff, 32, 64), 64);
+    let v = read_gpr(Rn, 1);
+    // Swap the bytes of every halfword, then the halfwords of every word.
+    let swapped = ((v & bytes) << imm(8, 64)) | ((v >> imm(8, 64)) & bytes);
+    write_gpr(Rd, 1,
+              ((swapped & halves) << imm(16, 64)) | ((swapped >> imm(16, 64)) & halves));
+  }
+}
+
+insn clz {
+  encoding sf:1 "1011010110" "00000" "000100" Rn:5 Rd:5
+  asm "clz {Rd:reg(sf)}, {Rn:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, clz(read_gpr(Rn, sf)));
+  }
+}
+
+// Leading sign bits. Exclusive-or with the arithmetic shift of itself clears
+// every bit that matches its neighbour above, so the leading run collapses to
+// zeroes and the count is one less than the count of leading zeroes -- and the
+// top bit is always cleared, so that count is never zero.
+insn cls {
+  encoding sf:1 "1011010110" "00000" "000101" Rn:5 Rd:5
+  asm "cls {Rd:reg(sf)}, {Rn:reg(sf)}"
+  semantics {
+    let esize = 32 << sf;
+    let v = read_gpr(Rn, sf);
+    write_gpr(Rd, sf, clz(v ^ (v >>> imm(1, esize))) - imm(1, esize));
+  }
+}
+
+// The hardware CRC32. An intrinsic rather than modelled: the polynomial step is a
+// loop over bits, the DSL has no loops on purpose, and no analysis downstream
+// gains anything from seeing the arithmetic. What it does gain is the data flow,
+// which is why the accumulator and the data both go in as arguments.
+//
+// Eight rules rather than one because the mnemonic carries the operand size and
+// the polynomial, and a template cannot spell a mnemonic from a field.
+fn crc32_step(acc: int(0..31), data: bits(32), name: int) -> bits(32) {
+  return intrinsic_value("aarch64.crc32", 32, imm(name, 8), read_gpr(acc, 0), data);
+}
+
+insn crc32b {
+  encoding "00011010110" Rm:5 "010000" Rn:5 Rd:5
+  asm "crc32b {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, zext(trunc(read_gpr(Rm, 0), 8), 32), 0));
+  }
+}
+
+insn crc32h {
+  encoding "00011010110" Rm:5 "010001" Rn:5 Rd:5
+  asm "crc32h {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, zext(trunc(read_gpr(Rm, 0), 16), 32), 1));
+  }
+}
+
+insn crc32w {
+  encoding "00011010110" Rm:5 "010010" Rn:5 Rd:5
+  asm "crc32w {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, read_gpr(Rm, 0), 2));
+  }
+}
+
+insn crc32x {
+  encoding "10011010110" Rm:5 "010011" Rn:5 Rd:5
+  asm "crc32x {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(1)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, trunc(read_gpr(Rm, 1), 32), 3));
+  }
+}
+
+insn crc32cb {
+  encoding "00011010110" Rm:5 "010100" Rn:5 Rd:5
+  asm "crc32cb {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, zext(trunc(read_gpr(Rm, 0), 8), 32), 4));
+  }
+}
+
+insn crc32ch {
+  encoding "00011010110" Rm:5 "010101" Rn:5 Rd:5
+  asm "crc32ch {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, zext(trunc(read_gpr(Rm, 0), 16), 32), 5));
+  }
+}
+
+insn crc32cw {
+  encoding "00011010110" Rm:5 "010110" Rn:5 Rd:5
+  asm "crc32cw {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, read_gpr(Rm, 0), 6));
+  }
+}
+
+insn crc32cx {
+  encoding "10011010110" Rm:5 "010111" Rn:5 Rd:5
+  asm "crc32cx {Rd:reg(0)}, {Rn:reg(0)}, {Rm:reg(1)}"
+  semantics {
+    write_gpr(Rd, 0, crc32_step(Rn, trunc(read_gpr(Rm, 1), 32), 7));
+  }
+}
+
+insn madd {
+  encoding sf:1 "0011011000" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "madd {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {Ra:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Ra, sf) + read_gpr(Rn, sf) * read_gpr(Rm, sf));
+  }
+}
+
+insn mul {
+  encoding sf:1 "0011011000" Rm:5 "0" "11111" Rn:5 Rd:5
+  asm "mul {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Rn, sf) * read_gpr(Rm, sf));
+  }
+}
+
+insn msub {
+  encoding sf:1 "0011011000" Rm:5 "1" Ra:5 Rn:5 Rd:5
+  asm "msub {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, {Ra:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, read_gpr(Ra, sf) - read_gpr(Rn, sf) * read_gpr(Rm, sf));
+  }
+}
+
+insn mneg {
+  encoding sf:1 "0011011000" Rm:5 "1" "11111" Rn:5 Rd:5
+  priority 1
+  asm "mneg {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}"
+  semantics {
+    write_gpr(Rd, sf, -(read_gpr(Rn, sf) * read_gpr(Rm, sf)));
+  }
+}
+
+insn smaddl {
+  encoding "10011011001" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "smaddl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}, {Ra:reg(1)}"
+  semantics {
+    let a = sext(read_gpr(Rn, 0), 64);
+    let b = sext(read_gpr(Rm, 0), 64);
+    write_gpr(Rd, 1, read_gpr(Ra, 1) + a * b);
+  }
+}
+
+// A widening multiply-accumulate that accumulates into the zero register is a
+// widening multiply, and that is what a compiler emits for `(int64_t)a * b`.
+insn smull {
+  encoding "10011011001" Rm:5 "0" "11111" Rn:5 Rd:5
+  priority 1
+  asm "smull {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 1, sext(read_gpr(Rn, 0), 64) * sext(read_gpr(Rm, 0), 64));
+  }
+}
+
+insn umaddl {
+  encoding "10011011101" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "umaddl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}, {Ra:reg(1)}"
+  semantics {
+    let a = zext(read_gpr(Rn, 0), 64);
+    let b = zext(read_gpr(Rm, 0), 64);
+    write_gpr(Rd, 1, read_gpr(Ra, 1) + a * b);
+  }
+}
+
+insn smsubl {
+  encoding "10011011001" Rm:5 "1" Ra:5 Rn:5 Rd:5
+  asm "smsubl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}, {Ra:reg(1)}"
+  semantics {
+    let a = sext(read_gpr(Rn, 0), 64);
+    let b = sext(read_gpr(Rm, 0), 64);
+    write_gpr(Rd, 1, read_gpr(Ra, 1) - a * b);
+  }
+}
+
+insn smnegl {
+  encoding "10011011001" Rm:5 "1" "11111" Rn:5 Rd:5
+  priority 1
+  asm "smnegl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 1, -(sext(read_gpr(Rn, 0), 64) * sext(read_gpr(Rm, 0), 64)));
+  }
+}
+
+insn umsubl {
+  encoding "10011011101" Rm:5 "1" Ra:5 Rn:5 Rd:5
+  asm "umsubl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}, {Ra:reg(1)}"
+  semantics {
+    let a = zext(read_gpr(Rn, 0), 64);
+    let b = zext(read_gpr(Rm, 0), 64);
+    write_gpr(Rd, 1, read_gpr(Ra, 1) - a * b);
+  }
+}
+
+insn umnegl {
+  encoding "10011011101" Rm:5 "1" "11111" Rn:5 Rd:5
+  priority 1
+  asm "umnegl {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 1, -(zext(read_gpr(Rn, 0), 64) * zext(read_gpr(Rm, 0), 64)));
+  }
+}
+
+insn umull {
+  encoding "10011011101" Rm:5 "0" "11111" Rn:5 Rd:5
+  priority 1
+  asm "umull {Rd:reg(1)}, {Rn:reg(0)}, {Rm:reg(0)}"
+  semantics {
+    write_gpr(Rd, 1, zext(read_gpr(Rn, 0), 64) * zext(read_gpr(Rm, 0), 64));
+  }
+}
+
+insn smulh {
+  encoding "10011011010" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "smulh {Rd:reg(1)}, {Rn:reg(1)}, {Rm:reg(1)}"
+  semantics {
+    write_gpr(Rd, 1, mulhi_s(read_gpr(Rn, 1), read_gpr(Rm, 1)));
+  }
+}
+
+insn umulh {
+  encoding "10011011110" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "umulh {Rd:reg(1)}, {Rn:reg(1)}, {Rm:reg(1)}"
+  semantics {
+    write_gpr(Rd, 1, mulhi_u(read_gpr(Rn, 1), read_gpr(Rm, 1)));
+  }
+}

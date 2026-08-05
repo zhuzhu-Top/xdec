@@ -1,0 +1,6 @@
+# cmp w8,#1 + b.gt with w8=5 (taken); real words from libsdk 0x4e484
+base 0x4e484
+words 0x7100051f 0x540000cc
+reg w8 0x5
+expect reg nzcv 0x2
+expect pc 0x4e4a0

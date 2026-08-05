@@ -1,0 +1,79 @@
+{
+  "manifest": "D:\\funtune\\xdec\\samples\\manifest.json",
+  "source_c": "D:\\funtune\\xdec\\samples\\build\\all.c",
+  "total": 2,
+  "passed": 2,
+  "failed": 0,
+  "cases": [
+    {
+      "name": "sample_jni_onload",
+      "category": "dispatcher",
+      "emitted": "/* __xdec_intrin_*: target intrinsics, supplied by the embedder */\n\nuint32_t JNI_OnLoad(uint64_t* a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)",
+      "ok": true,
+      "issues": [],
+      "metrics": {
+        "lines": 370,
+        "gotos": 7,
+        "labels": 6,
+        "switches": 1,
+        "cases": 3,
+        "ifs": 12,
+        "ternaries": 13,
+        "conditionals": 25,
+        "loops_while": 0,
+        "loops_do": 0,
+        "loops_for": 0,
+        "returns": 1,
+        "undef": 0,
+        "unnamed": 0,
+        "dead": 0,
+        "intrinsics": 1,
+        "unresolved_branches": 0,
+        "unhandled": 0,
+        "temps": 67,
+        "svc_intrinsics": 0,
+        "syscall_named": 0,
+        "syscall_raw": 0,
+        "struct_arrow": 0
+      }
+    },
+    {
+      "name": "sample_mega_dispatcher",
+      "category": "dispatcher",
+      "emitted": "/* __xdec_intrin_*: target intrinsics, supplied by the embedder */\n/* __xdec_mulhiu64: semantics helper, supplied by the embedder */\n\nuint64_t sub_199214(uint64_t a0 /* unused */, uint64_t a1 /* unused */, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)",
+      "ok": true,
+      "issues": [],
+      "metrics": {
+        "lines": 97203,
+        "gotos": 2169,
+        "labels": 322,
+        "switches": 5,
+        "cases": 1535,
+        "ifs": 3835,
+        "ternaries": 3623,
+        "conditionals": 7458,
+        "loops_while": 0,
+        "loops_do": 0,
+        "loops_for": 0,
+        "returns": 3,
+        "undef": 28,
+        "unnamed": 0,
+        "dead": 0,
+        "intrinsics": 7851,
+        "unresolved_branches": 301,
+        "unhandled": 0,
+        "temps": 11511,
+        "svc_intrinsics": 0,
+        "syscall_named": 2,
+        "syscall_raw": 0,
+        "struct_arrow": 0
+      }
+    }
+  ],
+  "category_summary": {
+    "dispatcher": {
+      "total": 2,
+      "passed": 2
+    }
+  }
+}

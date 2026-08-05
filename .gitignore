@@ -1,0 +1,7 @@
+build/
+out/
+.cache/
+compile_commands.json
+*.user
+samples/local.json
+samples/build/

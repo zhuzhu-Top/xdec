@@ -1,0 +1,95 @@
+// Branches, exception generation and system-register branches.
+//
+// The rules that decide the shape of the control-flow graph. A branch whose
+// target this file gets wrong does not produce a wrong instruction, it produces a
+// wrong function, so the displacement scaling is worth checking against the
+// manual rather than against intuition.
+// ---------------------------------------------------------------------------
+// Branches
+// ---------------------------------------------------------------------------
+
+insn b_uncond {
+  encoding "000101" imm26:26
+  asm "b {imm26:label}"
+  semantics {
+    branch(insn_pc + (sextint(imm26, 26) << 2));
+  }
+}
+
+insn bl {
+  encoding "100101" imm26:26
+  asm "bl {imm26:label}"
+  semantics {
+    gpr[30] = imm(insn_pc + insn_len, 64);
+    call(insn_pc + (sextint(imm26, 26) << 2));
+  }
+}
+
+insn b_cond {
+  encoding "01010100" imm19:19 "0" cc:4
+  asm "b.{cc:cond} {imm19:label}"
+  semantics {
+    cbranch(cond(nzcv, cc), insn_pc + (sextint(imm19, 19) << 2), insn_pc + insn_len);
+  }
+}
+
+insn cbz {
+  encoding sf:1 "0110100" imm19:19 Rt:5
+  asm "cbz {Rt:reg(sf)}, {imm19:label}"
+  semantics {
+    cbranch(read_gpr(Rt, sf) == imm(0, 32 << sf),
+            insn_pc + (sextint(imm19, 19) << 2), insn_pc + insn_len);
+  }
+}
+
+insn cbnz {
+  encoding sf:1 "0110101" imm19:19 Rt:5
+  asm "cbnz {Rt:reg(sf)}, {imm19:label}"
+  semantics {
+    cbranch(read_gpr(Rt, sf) != imm(0, 32 << sf),
+            insn_pc + (sextint(imm19, 19) << 2), insn_pc + insn_len);
+  }
+}
+
+insn tbz {
+  encoding b5:1 "0110110" b40:5 imm14:14 Rt:5
+  asm "tbz {Rt:reg(b5)}, #{(b5 << 5) | b40:dec}, {imm14:label}"
+  semantics {
+    cbranch(extract(read_gpr(Rt, b5), (b5 << 5) | b40, 1) == imm(0, 1),
+            insn_pc + (sextint(imm14, 14) << 2), insn_pc + insn_len);
+  }
+}
+
+insn tbnz {
+  encoding b5:1 "0110111" b40:5 imm14:14 Rt:5
+  asm "tbnz {Rt:reg(b5)}, #{(b5 << 5) | b40:dec}, {imm14:label}"
+  semantics {
+    cbranch(extract(read_gpr(Rt, b5), (b5 << 5) | b40, 1) != imm(0, 1),
+            insn_pc + (sextint(imm14, 14) << 2), insn_pc + insn_len);
+  }
+}
+
+insn br_reg {
+  encoding "1101011000011111000000" Rn:5 "00000"
+  asm "br {Rn:reg(1)}"
+  semantics {
+    brind(read_gpr(Rn, 1));
+  }
+}
+
+insn blr_reg {
+  encoding "1101011000111111000000" Rn:5 "00000"
+  asm "blr {Rn:reg(1)}"
+  semantics {
+    gpr[30] = imm(insn_pc + insn_len, 64);
+    callind(read_gpr(Rn, 1));
+  }
+}
+
+insn ret_reg {
+  encoding "1101011001011111000000" Rn:5 "00000"
+  asm "ret"
+  semantics {
+    ret();
+  }
+}

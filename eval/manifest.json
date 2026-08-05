@@ -1,0 +1,698 @@
+{
+  "library": "libxdec_eval.so",
+  "opt_level": "O1",
+  "abi": "arm64-v8a",
+  "notes": [
+    "signature.return and signature.params describe the ground-truth C shape,",
+    "classified only by width and pointer-ness: '32' means a 32-bit scalar,",
+    "'ptr' a pointer, '64' a 64-bit scalar. Signedness is deliberately not",
+    "checked -- recovering it reliably needs more evidence than a single",
+    "function body carries, and a wrong guess reads worse than an honest",
+    "unsigned. Width and pointer-ness are both recoverable, so both are held to."
+  ],
+  "cases": [
+    {
+      "name": "eval_add_three",
+      "category": "basic",
+      "source": "int32_t eval_add_three(int32_t a, int32_t b, int32_t c)",
+      "expect": {
+        "max_gotos": 0,
+        "needs_return": true,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_bitwise_mix",
+      "category": "basic",
+      "source": "uint32_t eval_bitwise_mix(uint32_t x, uint32_t y)",
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "&",
+          "|",
+          "<<",
+          ">>"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_rotr32",
+      "category": "basic",
+      "source": "uint32_t eval_rotr32(uint32_t x, unsigned n)",
+      "comment": "A rotate is emitted as the __xdec_rotr32 helper, which is the honest spelling of one: C has no rotate operator, and open-coding the shift pair would be longer and no clearer.",
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "rotr"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_abs",
+      "category": "conditional",
+      "source": "int32_t eval_abs(int32_t x)",
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_max",
+      "category": "conditional",
+      "source": "int32_t eval_max(int32_t a, int32_t b)",
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_clamp",
+      "category": "conditional",
+      "source": "int32_t eval_clamp(int32_t x, int32_t lo, int32_t hi)",
+      "expect": {
+        "min_ifs": 2,
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_sum_array",
+      "category": "loop",
+      "source": "int32_t eval_sum_array(const int32_t* arr, size_t n)",
+      "comment": "The source counts i up to n; -O1 counts n down instead and branches on the flags the decrement sets, so there is no `i < n` in the machine code and no relational compare to recover. What is held to is that the condition is about the counter the loop carries, which is what an unrecovered merge would lose.",
+      "expect": {
+        "min_loops": 1,
+        "max_gotos": 2,
+        "loop_condition_varies": true,
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "64"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_factorial",
+      "category": "loop",
+      "source": "uint32_t eval_factorial(unsigned n)",
+      "expect": {
+        "min_loops": 1,
+        "max_gotos": 2,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        },
+        "loop_condition_varies": true
+      }
+    },
+    {
+      "name": "eval_count_bits",
+      "category": "loop",
+      "source": "int32_t eval_count_bits(uint32_t x)",
+      "expect": {
+        "min_loops": 1,
+        "max_gotos": 2,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        },
+        "loop_condition_varies": true
+      }
+    },
+    {
+      "name": "eval_switch_arith",
+      "category": "switch",
+      "source": "int32_t eval_switch_arith(int32_t op, int32_t a, int32_t b)",
+      "expect": {
+        "min_switches": 1,
+        "max_gotos": 2,
+        "patterns": [
+          "switch",
+          "case"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_switch_sparse",
+      "category": "switch",
+      "source": "int32_t eval_switch_sparse(int32_t code)",
+      "comment": "Lowered by the compiler to arithmetic over a packed table rather than a branch per case, so there is no switch in the machine code to recover. Held only to being goto-free and correctly typed.",
+      "expect": {
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_vec3_dot",
+      "category": "memory",
+      "source": "int32_t eval_vec3_dot(const Vec3* v, const Vec3* w)",
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "*"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "ptr"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_array_max",
+      "category": "memory",
+      "source": "int32_t eval_array_max(const int32_t* arr, size_t n)",
+      "expect": {
+        "min_ifs": 1,
+        "min_loops": 1,
+        "max_gotos": 3,
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "64"
+          ]
+        },
+        "loop_condition_varies": true
+      }
+    },
+    {
+      "name": "eval_call_chain",
+      "category": "call",
+      "source": "int32_t eval_call_chain(int32_t x)",
+      "comment": "helper_double and helper_triple are static and inlined at -O1, so the correct decompilation is the folded arithmetic (x * 6) with no call at all. Requiring a call here would be requiring a wrong answer.",
+      "expect": {
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_indirect_binop",
+      "category": "call",
+      "source": "int32_t eval_indirect_binop(int32_t op, int32_t a, int32_t b)",
+      "expect": {
+        "max_gotos": 2,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_sign_extend_chain",
+      "category": "signed",
+      "source": "int32_t eval_sign_extend_chain(int32_t x)",
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 2,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_cmp_signed",
+      "category": "signed",
+      "source": "int32_t eval_cmp_signed(int32_t a, int32_t b)",
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 0,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32"
+          ]
+        }
+      },
+      "comment": "The middle of the three-way compare is a cset: one of the two results is the comparison itself, used as a 0/1 value, and there is no branch in the machine code to recover. Returning the comparison says that in one line; spelling it as a second if that returns 1 or 0 is longer and no clearer."
+    },
+    {
+      "name": "eval_nested",
+      "category": "nested",
+      "source": "int32_t eval_nested(int32_t a, int32_t b, int32_t c)",
+      "expect": {
+        "min_ifs": 2,
+        "max_gotos": 5,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        },
+        "loop_condition_varies": true
+      }
+    },
+    {
+      "name": "eval_early_return",
+      "category": "control",
+      "source": "int32_t eval_early_return(int32_t* ok, int32_t code)",
+      "comment": "Two of the three guards end the same way, so the compiler emitted one shared tail and there is a single block with two predecessors. One goto to it is the faithful reading: xdec emits every block exactly once, which is what lets the output be checked against a disassembler, and buying a goto back by duplicating the tail would give that up.",
+      "expect": {
+        "min_ifs": 3,
+        "max_gotos": 1,
+        "entry_first": true,
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_state_machine",
+      "category": "control",
+      "source": "int32_t eval_state_machine(uint32_t state, int32_t acc)",
+      "expect": {
+        "min_loops": 1,
+        "min_switches": 1,
+        "max_gotos": 3,
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32"
+          ]
+        }
+      },
+      "comment": "Every way out of the dispatch loop is a return or a jump past it, so the loop itself has no condition to check -- while (true) is the honest spelling, and a case coming back around is a continue."
+    },
+    {
+      "name": "eval_types_struct_arg",
+      "category": "types",
+      "source": "int32_t eval_types_struct_arg(const EvalVec3* v)",
+      "comment": "The base case for the whole track, and an A/B against eval_vec3_dot, which is the same shape with no header to import. Baseline can prove a pointer and the width behind it; only the header can say the three words are x, y and z.",
+      "expect": {
+        "max_gotos": 0,
+        "needs_return": true
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr"
+          ]
+        }
+      },
+      "expect_typed": {
+        "min_struct_arrow": 3,
+        "signature_exact": {
+          "return": "int32_t",
+          "params": [
+            "EvalVec3*"
+          ]
+        },
+        "type_spelling": [
+          "struct EvalVec3 {"
+        ],
+        "forbid_patterns": [
+          "uint32_t\\*\\)\\(\\(uint64_t"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_struct_field",
+      "category": "types",
+      "source": "int32_t eval_types_struct_field(const EvalNode* node) -- reads node->left->weight",
+      "comment": "Two hops. The second one is the test: `left` is a pointer field, so naming it types the value it loaded, and the access through that value is nameable in turn. Without that carry the output stops at one level and reverts to offsets.",
+      "expect": {
+        "min_ifs": 2
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr"
+          ]
+        }
+      },
+      "expect_typed": {
+        "min_struct_arrow": 4,
+        "signature_exact": {
+          "return": "int32_t",
+          "params": [
+            "EvalNode*"
+          ]
+        },
+        "patterns": [
+          "node->left",
+          "->weight"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_enum_switch",
+      "category": "types",
+      "source": "int32_t eval_types_enum_switch(EvalKind kind, int32_t a, int32_t b)",
+      "comment": "An enum is a 32-bit integer to the machine and a set of names to a reader. The case labels stay numeric -- the switch is over a value, not over a declaration, and rewriting 0x1 as EVAL_KIND_SUM is a claim about which enum this integer belongs to that the parameter's type alone does not license for arbitrary arithmetic on it.",
+      "expect": {
+        "min_switches": 1
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "32",
+          "params": [
+            "32",
+            "32",
+            "32"
+          ]
+        }
+      },
+      "expect_typed": {
+        "signature_exact": {
+          "return": "int32_t",
+          "params": [
+            "EvalKind",
+            "int32_t",
+            "int32_t"
+          ]
+        },
+        "type_spelling": [
+          "EVAL_KIND_DIFF = 3"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_typedef_chain",
+      "category": "types",
+      "source": "SizeTy eval_types_typedef_chain(const uint8_t* data, SizeTy n) -- SizeTy is size_t",
+      "comment": "Two typedefs deep: SizeTy names size_t, which names a 64-bit unsigned. Inference reaches the last of those and can never reach the first two, and the definition emitted for it says `typedef size_t SizeTy` rather than expanding size_t -- the platform's header owns that name.",
+      "expect": {
+        "min_loops": 1
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "64",
+          "params": [
+            "ptr",
+            "64"
+          ]
+        }
+      },
+      "expect_typed": {
+        "signature_exact": {
+          "return": "SizeTy",
+          "params": [
+            "uint8_t*",
+            "SizeTy"
+          ]
+        },
+        "type_spelling": [
+          "typedef size_t SizeTy;"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_fn_ptr",
+      "category": "types",
+      "source": "int32_t eval_types_fn_ptr(EvalBinOp op, int32_t a, int32_t b) -- returns op(a, b), a tail call through the parameter",
+      "comment": "Arity, not spelling, over a tail call. `br x0` is read as a call through the caller's pointer (recover-tailcall), so both modes get a call and a return; the arity is then the same story as any indirect call. With no declaration every one of the eight argument registers might be an argument, so the call passes eight and the enclosing signature grows to match. The header says two, and saying so before argument recovery runs is what makes both the call and the signature come out right. The baseline return is a machine word because a tail call hands back whatever the callee left in x0 and nothing here narrows it.",
+      "expect": {
+        "needs_return": true
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "64",
+          "params": [
+            "64",
+            "32",
+            "64",
+            "64",
+            "64",
+            "64",
+            "64",
+            "64"
+          ]
+        }
+      },
+      "expect_typed": {
+        "signature_exact": {
+          "return": "int32_t",
+          "params": [
+            "EvalBinOp",
+            "int32_t",
+            "int32_t"
+          ]
+        },
+        "patterns": [
+          "(int32_t (*)(int32_t, int32_t))"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_return_struct",
+      "category": "types",
+      "source": "EvalVec3 eval_types_return_struct(int32_t x, int32_t y, int32_t z) -- 12 bytes, returned in x0 and x1",
+      "comment": "A struct returned by value does not fit the recovered shape and must not be forced into it: the body hands back registers, so declaring EvalVec3 would produce C that does not compile. The header's claim goes in a comment beside the type that is true. The third component travels in x1 and is not recovered at all, which is the return-register modelling limit rather than anything type import can fix.",
+      "expect": {
+        "needs_return": true,
+        "max_gotos": 0
+      },
+      "expect_typed": {
+        "type_spelling": [
+          "/* header says EvalVec3 */"
+        ]
+      }
+    },
+    {
+      "name": "eval_types_extern_global",
+      "category": "types",
+      "source": "uint64_t eval_types_extern_global(uint64_t add) -- reads and writes extern EvalStats g_eval_stats",
+      "comment": "A global reached through the GOT: the relocation names the symbol, so the slot is called ptr_g_eval_stats in both modes. Typing it is not done -- the slot would have to be declared as EvalStats* and the load through it would have to stop being a dereference, together, or the output stops compiling. Until then the header adds nothing here, which is what this case records.",
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "ptr_g_eval_stats"
+        ],
+        "signature": {
+          "return": "64",
+          "params": [
+            "64"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_types_void_ptr",
+      "category": "types",
+      "source": "int32_t eval_types_void_ptr(void* buf, SizeTy n)",
+      "comment": "The one place inference is more specific than the header: the body reads bytes through buf, so baseline recovers uint8_t* where the declaration says void*. The header still wins, because void* is what every caller was compiled against, and the byte reads are visible in the body either way.",
+      "expect": {
+        "min_loops": 1
+      },
+      "expect_baseline": {
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "64"
+          ]
+        }
+      },
+      "expect_typed": {
+        "signature_exact": {
+          "return": "int32_t",
+          "params": [
+            "void*",
+            "SizeTy"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_svc_write",
+      "category": "syscall",
+      "source": "long eval_svc_write(const void* buf, unsigned long n) -- svc #0, x8=64",
+      "comment": "The base case for the whole track. write takes three arguments, so the three registers the source never set must come off the call, and the name must be the kernel's rather than a number.",
+      "expect": {
+        "max_gotos": 0,
+        "needs_return": true,
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_write("
+        ],
+        "forbid_patterns": [
+          "__xdec_intrin\\w*\\.?svc"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_gettimeofday",
+      "category": "syscall",
+      "source": "int eval_svc_gettimeofday(void* tv, void* tz) -- svc #0, x8=169",
+      "comment": "Two pointer arguments whose types the syscall table knows. Casting to them is what turns two 64-bit registers into an argument list a reader can check against the man page.",
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_gettimeofday("
+        ],
+        "type_spelling": [
+          "struct timeval*"
+        ],
+        "forbid_patterns": [
+          "__xdec_intrin\\w*\\.?svc"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_getpid",
+      "category": "syscall",
+      "source": "long eval_svc_getpid(void) -- svc #0, x8=172",
+      "comment": "getpid reads nothing, so every argument register comes off and the call prints empty. The clearest single check that arity trimming happened at all.",
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_getpid()"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_unknown",
+      "category": "syscall",
+      "source": "long eval_svc_unknown(long a0) -- svc #0, x8=9999",
+      "comment": "A number no kernel defines. The number is printed and nothing is invented; the six raw registers stay, because with an unknown callee any of them might be an argument, and that is also why the recovered signature has six parameters rather than the source's one.",
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "__xdec_syscall(9999"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_nr_from_arg",
+      "category": "syscall",
+      "source": "long eval_svc_nr_from_arg(long nr, long a0) -- svc #0, x8 from a parameter",
+      "comment": "The number is this function's argument, so it cannot be known from the function alone. What must survive is that the instruction is still recognised as a syscall and the expression that produced the number is still printed -- degrading, not guessing.",
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "__xdec_syscall(",
+          "/* x8 */"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_errno",
+      "category": "syscall",
+      "source": "long eval_svc_errno(const void* buf, unsigned long n) -- write, then a sign test",
+      "comment": "The idiom at every real syscall site: the kernel returns -errno, so the caller tests the sign. Here it is written plainly, and it must read as one comparison; B4 is about the obfuscated form of the same test.",
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 0,
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_write("
+        ]
+      }
+    },
+    {
+      "name": "eval_tailcall_table",
+      "category": "tailcall",
+      "source": "int32_t eval_tailcall_table(const EvalTailOp* ops, int32_t index, int32_t a, int32_t b) -- returns ops[index](a, b)",
+      "comment": "A tail call through a pointer read out of an array the caller passed. `-O1` emits `ldr x4,[x0,index,lsl#3]; br x4`, which is the jump-table shape with the base in a register instead of in the instruction stream -- and that difference is the whole decision: nothing in this image says what is in the caller's array, so the branch leaves. Before recover-tailcall this failed the decompilation outright. The call still passes eight registers because no declaration says otherwise; eval_types_fn_ptr is where a header cuts that down.",
+      "expect": {
+        "max_gotos": 0,
+        "needs_return": true,
+        "patterns": [
+          "tail call",
+          "return t"
+        ]
+      }
+    },
+    {
+      "name": "eval_tailcall_import",
+      "category": "tailcall",
+      "source": "ssize_t eval_tailcall_import(int32_t fd, const void* buf, size_t n) -- returns write(fd, buf, n)",
+      "comment": "A tail call to another module: `b write@plt`, and the stub's own `br x17` through the GOT. The loader's account of that slot is the evidence, and the import name is what a reader needs. This used to emit two blocks under the same label and C that did not compile, because the value set read the unrelocated slot and 'resolved' the branch into the stub it was already in.",
+      "expect": {
+        "max_gotos": 0,
+        "needs_return": true,
+        "patterns": [
+          "tail call",
+          "ptr_write"
+        ],
+        "forbid_patterns": [
+          "L_0x[0-9a-f]+:[\\s\\S]*L_0x[0-9a-f]+:"
+        ]
+      }
+    }
+  ]
+}

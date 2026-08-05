@@ -1,0 +1,15 @@
+xdec_add_library(xdec_il
+  SOURCES
+    ceval.cpp
+    expr.cpp
+    function.cpp
+    interp.cpp
+    maturity.cpp
+    op.cpp
+    parser.cpp
+    printer.cpp
+    register_file.cpp
+    type.cpp
+    verify.cpp
+  DEPS
+    xdec_support)

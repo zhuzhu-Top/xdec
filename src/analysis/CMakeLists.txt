@@ -1,0 +1,15 @@
+xdec_add_library(xdec_analysis
+  SOURCES
+    call_target.cpp
+    dominators.cpp
+    image_eval.cpp
+    index_bound.cpp
+    jump_table.cpp
+    loops.cpp
+    profile.cpp
+    scc.cpp
+    stack_frame.cpp
+    variables.cpp
+  DEPS
+    xdec_il
+    xdec_support)

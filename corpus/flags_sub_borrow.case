@@ -1,0 +1,7 @@
+# cmp x0,x1 + b.ne: x0=5 x1=7 (P5a carryIn regression)
+base 0x1000
+words 0xeb01001f 0x54000041
+reg x0 0x5
+reg x1 0x7
+expect reg nzcv 0x8
+expect pc 0x100c

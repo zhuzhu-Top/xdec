@@ -1,0 +1,55 @@
+// The floor: SIMD, floating point, and whatever else is left.
+//
+// Negative-priority rules that match wide swathes of the encoding space, so that
+// an instruction this spec does not model is a known intrinsic rather than an
+// undecodable word. Anything added elsewhere wins over these without them being
+// edited, which is why they can be written this broadly.
+// ---------------------------------------------------------------------------
+// SIMD and floating point
+// ---------------------------------------------------------------------------
+//
+// The arithmetic is not modelled. These rules exist so that a vector instruction
+// is a known unmodelled instruction rather than an undecodable word, and the
+// difference matters more than it looks: `Unimplemented` terminates a block, so
+// a single unmodelled instruction in a prologue would cut the rest of the
+// function off from its entry and every later analysis would be reasoning about
+// a truncated graph.
+//
+// An intrinsic falls through and is opaque, which is exactly the truth. What it
+// does not yet say is which V registers it read and wrote; that arrives with the
+// arithmetic, and until then a vector value that passes through arithmetic is
+// lost even though one that only moves through memory is not.
+//
+// The priority is negative so that any real rule added later wins without the
+// catch-alls having to be edited.
+
+// Bits 28..25 select the top-level encoding group. `x111` is the whole of
+// scalar floating point and Advanced SIMD.
+insn simd_fp_unmodelled {
+  encoding hi:4 "111" rest:25
+  priority -100
+  asm "simd #{opcode:hex}"
+  semantics {
+    intrinsic("aarch64.simd", imm(opcode, 32));
+  }
+}
+
+// `x1x0` is the whole of loads and stores. What reaches here is the vector and
+// exclusive forms the rules above do not cover. Naming it separately from the
+// SIMD catch-all keeps `xdec coverage` honest about which of the two is growing.
+insn memory_unmodelled {
+  encoding hi:3 g28:1 "1" g26:1 "0" rest:25
+  priority -110
+  asm "ldst #{opcode:hex}"
+  semantics {
+    intrinsic("aarch64.memory", imm(opcode, 32));
+  }
+}
+
+insn udf_trap {
+  encoding "0000000000000000" imm16:16
+  asm "udf #{imm16:hex}"
+  semantics {
+    unimplemented("udf");
+  }
+}

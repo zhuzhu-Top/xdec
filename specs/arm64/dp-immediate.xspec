@@ -1,0 +1,483 @@
+// Data processing, immediate operand.
+//
+// Bits 28..26 are `100`. PC-relative addressing, add and subtract with a shifted
+// twelve-bit immediate, the logical immediate and its bitmask decoder, the move
+// wide forms, and the bitfield instructions with the shift and extract aliases
+// that are the same encoding read under a condition.
+// ---------------------------------------------------------------------------
+// Data processing -- immediate: PC-relative addressing
+// ---------------------------------------------------------------------------
+
+insn adr {
+  encoding "0" immlo:2 "10000" immhi:19 Rd:5
+  asm "adr {Rd:reg(1)}, #{insn_pc + sextint((immhi << 2) | immlo, 21):hex}"
+  semantics {
+    write_gpr(Rd, 1, imm(insn_pc + sextint((immhi << 2) | immlo, 21), 64));
+  }
+}
+
+insn adrp {
+  encoding "1" immlo:2 "10000" immhi:19 Rd:5
+  asm "adrp {Rd:reg(1)}, #{(insn_pc & ~0xfff) + (sextint((immhi << 2) | immlo, 21) << 12):hex}"
+  semantics {
+    write_gpr(Rd, 1, imm((insn_pc & ~0xfff) + (sextint((immhi << 2) | immlo, 21) << 12), 64));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- immediate: add/subtract
+// ---------------------------------------------------------------------------
+
+insn add_imm {
+  encoding sf:1 "00100010" sh:1 imm12:12 Rn:5 Rd:5
+  asm "add {Rd:regsp(sf)}, {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf, read_gpr_sp(Rn, sf) + imm(imm12 << (sh * 12), 32 << sf));
+  }
+}
+
+// `add xd, sp, #0` and `add sp, xn, #0` are how a frame pointer is set up and how
+// the stack pointer is restored, and both are spelled `mov`. The priority is what
+// makes this win over `add_imm`, whose encoding it is a special case of.
+insn mov_sp {
+  encoding sf:1 "001000100" "000000000000" Rn:5 Rd:5
+  require Rd == 31 || Rn == 31;
+  priority 1
+  asm "mov {Rd:regsp(sf)}, {Rn:regsp(sf)}"
+  semantics {
+    write_gpr_sp(Rd, sf, read_gpr_sp(Rn, sf));
+  }
+}
+
+insn adds_imm {
+  encoding sf:1 "01100010" sh:1 imm12:12 Rn:5 Rd:5
+  asm "adds {Rd:reg(sf)}, {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = imm(imm12 << (sh * 12), 32 << sf);
+    write_gpr(Rd, sf, a + b);
+    nzcv = flagdef_add(a, b);
+  }
+}
+
+insn cmn_imm {
+  encoding sf:1 "01100010" sh:1 imm12:12 Rn:5 "11111"
+  asm "cmn {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    nzcv = flagdef_add(read_gpr_sp(Rn, sf), imm(imm12 << (sh * 12), 32 << sf));
+  }
+}
+
+insn sub_imm {
+  encoding sf:1 "10100010" sh:1 imm12:12 Rn:5 Rd:5
+  asm "sub {Rd:regsp(sf)}, {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf, read_gpr_sp(Rn, sf) - imm(imm12 << (sh * 12), 32 << sf));
+  }
+}
+
+insn subs_imm {
+  encoding sf:1 "11100010" sh:1 imm12:12 Rn:5 Rd:5
+  asm "subs {Rd:reg(sf)}, {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    let a = read_gpr_sp(Rn, sf);
+    let b = imm(imm12 << (sh * 12), 32 << sf);
+    write_gpr(Rd, sf, a - b);
+    nzcv = flagdef_sub(a, b);
+  }
+}
+
+insn cmp_imm {
+  encoding sf:1 "11100010" sh:1 imm12:12 Rn:5 "11111"
+  asm "cmp {Rn:regsp(sf)}, #{imm12 << (sh * 12):hex}"
+  semantics {
+    nzcv = flagdef_sub(read_gpr_sp(Rn, sf), imm(imm12 << (sh * 12), 32 << sf));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- immediate: logical
+// ---------------------------------------------------------------------------
+
+insn and_imm {
+  encoding sf:1 "00100100" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "and {Rd:regsp(sf)}, {Rn:reg(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf,
+                 read_gpr(Rn, sf) & imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf));
+  }
+}
+
+insn orr_imm {
+  encoding sf:1 "01100100" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "orr {Rd:regsp(sf)}, {Rn:reg(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf,
+                 read_gpr(Rn, sf) | imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf));
+  }
+}
+
+// `mov Rd, #imm` is `orr Rd, xzr, #imm`, and the bitmask encoding is unreadable
+// without the alias, so it gets its own rule rather than being left to a reader
+// of the disassembly.
+insn mov_bitmask_imm {
+  encoding sf:1 "01100100" N:1 immr:6 imms:6 "11111" Rd:5
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "mov {Rd:regsp(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf, imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf));
+  }
+}
+
+insn eor_imm {
+  encoding sf:1 "10100100" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "eor {Rd:regsp(sf)}, {Rn:reg(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    write_gpr_sp(Rd, sf,
+                 read_gpr(Rn, sf) ^ imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf));
+  }
+}
+
+insn ands_imm {
+  encoding sf:1 "11100100" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "ands {Rd:reg(sf)}, {Rn:reg(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    let r = read_gpr(Rn, sf) & imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf);
+    write_gpr(Rd, sf, r);
+    nzcv = flagdef_logic(r);
+  }
+}
+
+insn tst_imm {
+  encoding sf:1 "11100100" N:1 immr:6 imms:6 Rn:5 "11111"
+  require logical_imm_reserved(N, imms, sf) == 0;
+  asm "tst {Rn:reg(sf)}, #{logical_imm(N, immr, imms, 32 << sf):hex}"
+  semantics {
+    nzcv = flagdef_logic(read_gpr(Rn, sf) & imm(logical_imm(N, immr, imms, 32 << sf), 32 << sf));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- immediate: move wide
+// ---------------------------------------------------------------------------
+
+insn movz {
+  encoding sf:1 "10100101" hw:2 imm16:16 Rd:5
+  require sf == 1 || hw <= 1;
+  asm "mov {Rd:reg(sf)}, #{imm16 << (hw * 16):hex}"
+  semantics {
+    write_gpr(Rd, sf, imm(imm16 << (hw * 16), 32 << sf));
+  }
+}
+
+insn movn {
+  encoding sf:1 "00100101" hw:2 imm16:16 Rd:5
+  require sf == 1 || hw <= 1;
+  asm "mov {Rd:reg(sf)}, #{(~(imm16 << (hw * 16))) & ones_int(32 << sf):hex}"
+  semantics {
+    write_gpr(Rd, sf, imm((~(imm16 << (hw * 16))) & ones_int(32 << sf), 32 << sf));
+  }
+}
+
+// movk is the only move that reads its destination, which is why a run of them
+// builds a 64-bit constant sixteen bits at a time. That pattern is the single
+// most common instruction in both samples.
+insn movk {
+  encoding sf:1 "11100101" hw:2 imm16:16 Rd:5
+  require sf == 1 || hw <= 1;
+  asm "movk {Rd:reg(sf)}, #{imm16:hex}[, lsl #{hw * 16:dec}]"
+  semantics {
+    let keep = ones_int(32 << sf) & ~(0xffff << (hw * 16));
+    write_gpr(Rd, sf,
+              (read_gpr(Rd, sf) & imm(keep, 32 << sf)) | imm(imm16 << (hw * 16), 32 << sf));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Data processing -- immediate: bitfield
+// ---------------------------------------------------------------------------
+//
+// The bitfield forms all share DecodeBitMasks, but with N tied to sf the element
+// size always equals the operand size, so Replicate is the identity and the two
+// masks collapse to the closed forms below. That is what makes lsl, lsr, asr,
+// sxtb, uxtb, ubfx and bfi one rule each instead of a table.
+
+// Every bitfield instruction is one of these two, and every alias of them is the
+// same encoding read under a condition on immr and imms. The semantics live in a
+// helper so that the aliases are a mnemonic and a `require`, and so that there is
+// one place where the masks can be wrong rather than nine.
+fn ubfm_result(sf: int(0..1), immr: int(0..63), imms: int(0..63), n: int(0..31))
+    -> bits(32 << sf) {
+  let esize = 32 << sf;
+  let levels = ones_int(sf == 1 ? 6 : 5);
+  let s = imms & levels;
+  let r = immr & levels;
+  let d = (s - r) & levels;
+  let wmask = ror_int(ones_int(s + 1), r, esize);
+  let tmask = ones_int(d + 1);
+  let bot = rotr(read_gpr(n, sf), imm(r, esize)) & imm(wmask, esize);
+  return bot & imm(tmask, esize);
+}
+
+fn sbfm_result(sf: int(0..1), immr: int(0..63), imms: int(0..63), n: int(0..31))
+    -> bits(32 << sf) {
+  let esize = 32 << sf;
+  let levels = ones_int(sf == 1 ? 6 : 5);
+  let s = imms & levels;
+  let r = immr & levels;
+  let d = (s - r) & levels;
+  let wmask = ror_int(ones_int(s + 1), r, esize);
+  let tmask = ones_int(d + 1);
+  let src = read_gpr(n, sf);
+  let bot = rotr(src, imm(r, esize)) & imm(wmask, esize);
+  // The sign is bit s of the source, spread across everything above the field.
+  let top = sext(extract(src, s, 1), esize);
+  return (top & imm(ones_int(esize) & ~tmask, esize)) | (bot & imm(tmask, esize));
+}
+
+insn ubfm {
+  encoding sf:1 "10100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  asm "ubfm {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms:dec}"
+  semantics {
+    write_gpr(Rd, sf, ubfm_result(sf, immr, imms, Rn));
+  }
+}
+
+// The alias order is the manual's. `lsl` is tested first because its condition
+// and `lsr`'s can both hold, and `ubfx` is last because it is what a bitfield
+// extract that is neither a shift nor zero-anchored has to be called.
+insn lsl_imm {
+  encoding sf:1 "10100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms + 1 == immr;
+  require imms != (sf == 1 ? 63 : 31);
+  priority 3
+  asm "lsl {Rd:reg(sf)}, {Rn:reg(sf)}, #{(sf == 1 ? 64 : 32) - immr:dec}"
+  semantics {
+    write_gpr(Rd, sf, ubfm_result(sf, immr, imms, Rn));
+  }
+}
+
+insn lsr_imm {
+  encoding sf:1 "10100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms == (sf == 1 ? 63 : 31);
+  priority 2
+  asm "lsr {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}"
+  semantics {
+    write_gpr(Rd, sf, ubfm_result(sf, immr, imms, Rn));
+  }
+}
+
+insn ubfiz {
+  encoding sf:1 "10100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms < immr;
+  require imms + 1 != immr;
+  priority 1
+  asm "ubfiz {Rd:reg(sf)}, {Rn:reg(sf)}, #{(sf == 1 ? 64 : 32) - immr:dec}, #{imms + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, ubfm_result(sf, immr, imms, Rn));
+  }
+}
+
+// The zero-extends are `ubfm` anchored at bit zero, and only exist at 32 bits: a
+// 64-bit zero-extend of a w register is what an ordinary w-register write already
+// does, so the architecture has no encoding for it.
+insn uxtb {
+  encoding "0101001100" "000000" "000111" Rn:5 Rd:5
+  priority 3
+  asm "uxtb {Rd:reg(0)}, {Rn:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, ubfm_result(0, 0, 7, Rn));
+  }
+}
+
+insn uxth {
+  encoding "0101001100" "000000" "001111" Rn:5 Rd:5
+  priority 3
+  asm "uxth {Rd:reg(0)}, {Rn:reg(0)}"
+  semantics {
+    write_gpr(Rd, 0, ubfm_result(0, 0, 15, Rn));
+  }
+}
+
+insn ubfx {
+  encoding sf:1 "10100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms >= immr;
+  require imms != (sf == 1 ? 63 : 31);
+  priority 1
+  asm "ubfx {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms - immr + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, ubfm_result(sf, immr, imms, Rn));
+  }
+}
+
+insn sbfm {
+  encoding sf:1 "00100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  asm "sbfm {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms:dec}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, immr, imms, Rn));
+  }
+}
+
+insn asr_imm {
+  encoding sf:1 "00100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms == (sf == 1 ? 63 : 31);
+  priority 2
+  asm "asr {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, immr, imms, Rn));
+  }
+}
+
+// The sign-extends are `sbfm` anchored at bit zero. They read the source as a
+// w register whatever the destination width, which is why the width argument to
+// the printer is 0 rather than sf.
+insn sxtb {
+  encoding sf:1 "00100110" N:1 "000000" "000111" Rn:5 Rd:5
+  require N == sf;
+  priority 3
+  asm "sxtb {Rd:reg(sf)}, {Rn:reg(0)}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, 0, 7, Rn));
+  }
+}
+
+insn sxth {
+  encoding sf:1 "00100110" N:1 "000000" "001111" Rn:5 Rd:5
+  require N == sf;
+  priority 3
+  asm "sxth {Rd:reg(sf)}, {Rn:reg(0)}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, 0, 15, Rn));
+  }
+}
+
+insn sxtw {
+  encoding "1001001101" "000000" "011111" Rn:5 Rd:5
+  priority 3
+  asm "sxtw {Rd:reg(1)}, {Rn:reg(0)}"
+  semantics {
+    write_gpr(Rd, 1, sbfm_result(1, 0, 31, Rn));
+  }
+}
+
+insn sbfiz {
+  encoding sf:1 "00100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms < immr;
+  priority 1
+  asm "sbfiz {Rd:reg(sf)}, {Rn:reg(sf)}, #{(sf == 1 ? 64 : 32) - immr:dec}, #{imms + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, immr, imms, Rn));
+  }
+}
+
+insn sbfx {
+  encoding sf:1 "00100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms >= immr;
+  require imms != (sf == 1 ? 63 : 31);
+  priority 1
+  asm "sbfx {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms - immr + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, sbfm_result(sf, immr, imms, Rn));
+  }
+}
+
+// Unlike the other two, this one reads its destination: the bits outside the
+// field survive, which is the whole point of a bitfield move.
+fn bfm_result(sf: int(0..1), immr: int(0..63), imms: int(0..63), d: int(0..31), n: int(0..31))
+    -> bits(32 << sf) {
+  let esize = 32 << sf;
+  let levels = ones_int(sf == 1 ? 6 : 5);
+  let s = imms & levels;
+  let r = immr & levels;
+  let width = (s - r) & levels;
+  let wmask = ror_int(ones_int(s + 1), r, esize);
+  let tmask = ones_int(width + 1);
+  let keep = ones_int(esize) & ~(wmask & tmask);
+  let bot = rotr(read_gpr(n, sf), imm(r, esize)) & imm(wmask & tmask, esize);
+  return (read_gpr(d, sf) & imm(keep, esize)) | bot;
+}
+
+insn bfm {
+  encoding sf:1 "01100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  asm "bfm {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms:dec}"
+  semantics {
+    write_gpr(Rd, sf, bfm_result(sf, immr, imms, Rd, Rn));
+  }
+}
+
+// `bfi` inserts at a position counted from the top of the register, `bfxil`
+// extracts from one counted from the bottom. Which of the two an encoding is
+// depends only on whether imms is below immr.
+insn bfi {
+  encoding sf:1 "01100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms < immr;
+  priority 1
+  asm "bfi {Rd:reg(sf)}, {Rn:reg(sf)}, #{(sf == 1 ? 64 : 32) - immr:dec}, #{imms + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, bfm_result(sf, immr, imms, Rd, Rn));
+  }
+}
+
+insn bfxil {
+  encoding sf:1 "01100110" N:1 immr:6 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || (immr < 32 && imms < 32);
+  require imms >= immr;
+  priority 1
+  asm "bfxil {Rd:reg(sf)}, {Rn:reg(sf)}, #{immr:dec}, #{imms - immr + 1:dec}"
+  semantics {
+    write_gpr(Rd, sf, bfm_result(sf, immr, imms, Rd, Rn));
+  }
+}
+
+insn extr {
+  encoding sf:1 "00100111" N:1 "0" Rm:5 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || imms < 32;
+  asm "extr {Rd:reg(sf)}, {Rn:reg(sf)}, {Rm:reg(sf)}, #{imms:dec}"
+  semantics {
+    let esize = 32 << sf;
+    let joined = concat(read_gpr(Rn, sf), read_gpr(Rm, sf));
+    write_gpr(Rd, sf, trunc(joined >> imm(imms, (32 << sf) + (32 << sf)), esize));
+  }
+}
+
+// Extracting from a register concatenated with itself is a rotate, and it is the
+// only rotate-by-constant AArch64 has.
+insn ror_imm {
+  encoding sf:1 "00100111" N:1 "0" Rm:5 imms:6 Rn:5 Rd:5
+  require N == sf;
+  require sf == 1 || imms < 32;
+  require Rm == Rn;
+  priority 1
+  asm "ror {Rd:reg(sf)}, {Rn:reg(sf)}, #{imms:dec}"
+  semantics {
+    write_gpr(Rd, sf, rotr(read_gpr(Rn, sf), imm(imms, 32 << sf)));
+  }
+}

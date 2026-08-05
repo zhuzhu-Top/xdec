@@ -1,0 +1,70 @@
+/* The external type library for the eval corpus.
+ *
+ * This file plays two roles at once, on purpose. `source_types.c` includes it,
+ * so the compiled .so really is built from these declarations; and
+ * `run.ps1 -Typed` passes it to `xdec decompile --types`, so the decompiler is
+ * told the same thing a reverse engineer would tell IDA or Binary Ninja. What
+ * it is NOT is part of the binary: none of these names survive compilation
+ * except as the symbols the prototypes describe, which is exactly the
+ * situation type import exists for.
+ *
+ * Being one file rather than two is what keeps the ground truth honest. A
+ * separate .hdecl copied from a separate header would drift, and every drift
+ * would look like a decompiler bug.
+ *
+ * Keep it inside the .hdecl subset (see docs/06-type-import.md) AND valid C:
+ * it is read by both parsers.
+ */
+#ifndef XDEC_EVAL_TYPES_H
+#define XDEC_EVAL_TYPES_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* A small aggregate: three words, passed by pointer and returned in
+ * registers. */
+typedef struct EvalVec3 {
+  int32_t x;
+  int32_t y;
+  int32_t z;
+} EvalVec3;
+
+/* Self-referential, so the parser has to bind a pointer to an incomplete tag
+ * and the emitter has to forward-declare it. */
+typedef struct EvalNode {
+  int32_t value;
+  int32_t weight;
+  struct EvalNode* left;
+  struct EvalNode* right;
+} EvalNode;
+
+typedef enum EvalKind {
+  EVAL_KIND_NONE = 0,
+  EVAL_KIND_SUM = 1,
+  EVAL_KIND_MAX = 2,
+  EVAL_KIND_DIFF = 3
+} EvalKind;
+
+/* A typedef chain: the point is that the output says `SizeTy`, which is what
+ * the source said, rather than the `uint64_t` inference would find. */
+typedef size_t SizeTy;
+
+typedef int32_t (*EvalBinOp)(int32_t, int32_t);
+
+typedef struct EvalStats {
+  uint64_t calls;
+  uint64_t total;
+} EvalStats;
+
+extern EvalStats g_eval_stats;
+
+int32_t eval_types_struct_arg(const EvalVec3* v);
+int32_t eval_types_struct_field(const EvalNode* node);
+int32_t eval_types_enum_switch(EvalKind kind, int32_t a, int32_t b);
+SizeTy eval_types_typedef_chain(const uint8_t* data, SizeTy n);
+int32_t eval_types_fn_ptr(EvalBinOp op, int32_t a, int32_t b);
+EvalVec3 eval_types_return_struct(int32_t x, int32_t y, int32_t z);
+uint64_t eval_types_extern_global(uint64_t add);
+int32_t eval_types_void_ptr(void* buf, SizeTy n);
+
+#endif

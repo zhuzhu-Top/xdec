@@ -1,0 +1,116 @@
+// Register access and operand modifiers.
+//
+// Not instructions: the helpers every other file leans on. Reading a register at
+// one of two widths, the shift and extend an operand may carry, and the decoder
+// for the AArch64 logical immediate. They live together because a mistake here is
+// a mistake in every rule that calls them, so this is the file to read twice.
+// ---------------------------------------------------------------------------
+// Register access
+// ---------------------------------------------------------------------------
+
+// One reader covers both widths. The declared result `bits(32 << sf)` is what
+// the checker proves each branch against, so a rule that returns the wrong half
+// of a register fails to compile.
+fn read_gpr(n: int(0..31), sf: int(0..1)) -> bits(32 << sf) {
+  if sf == 1 {
+    return gpr[n];
+  } else {
+    return gpr[n].w;
+  }
+}
+
+// Register 31 reads as zero in most instructions and as the stack pointer in a
+// few, which is why the two readers are separate rather than one with a flag.
+fn read_gpr_sp(n: int(0..31), sf: int(0..1)) -> bits(32 << sf) {
+  if n == 31 {
+    if sf == 1 {
+      return sp;
+    } else {
+      return trunc(sp, 32);
+    }
+  } else {
+    return read_gpr(n, sf);
+  }
+}
+
+fn write_gpr(n: int(0..31), sf: int(0..1), v: bits(32 << sf)) {
+  if sf == 1 {
+    gpr[n] = v;
+  } else {
+    gpr[n].w = v;
+  }
+}
+
+// Used by the add/sub immediate and extended-register forms, where a 31 in the
+// destination names the stack pointer instead of discarding the result.
+fn write_gpr_sp(n: int(0..31), sf: int(0..1), v: bits(32 << sf)) {
+  if n == 31 {
+    if sf == 1 {
+      sp = v;
+    } else {
+      sp = zext(v, 64);
+    }
+  } else {
+    write_gpr(n, sf, v);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Operand modifiers
+// ---------------------------------------------------------------------------
+
+// kind: 0 lsl, 1 lsr, 2 asr, 3 ror
+fn shift_reg(sf: int(0..1), v: bits(32 << sf), kind: int(0..3), amount: int)
+    -> bits(32 << sf) {
+  let places = imm(amount, 32 << sf);
+  if kind == 0 {
+    return v << places;
+  } else if kind == 1 {
+    return v >> places;
+  } else {
+    if kind == 2 {
+      return v >>> places;
+    } else {
+      return rotr(v, places);
+    }
+  }
+}
+
+// option: 0 uxtb 1 uxth 2 uxtw 3 uxtx 4 sxtb 5 sxth 6 sxtw 7 sxtx
+fn extend_reg(sf: int(0..1), n: int(0..31), option: int(0..7), amount: int)
+    -> bits(32 << sf) {
+  let from = option == 0 ? 8 : (option == 1 ? 16 : (option == 2 ? 32 :
+             (option == 4 ? 8 : (option == 5 ? 16 : (option == 6 ? 32 : 64)))));
+  let signed = option >= 4;
+  // The source is always read at the full width and narrowed, because the
+  // extend width is independent of the operation width.
+  let raw = trunc(read_gpr_sp(n, 1), from > (32 << sf) ? (32 << sf) : from);
+  let widened = signed ? sext(raw, 32 << sf) : zext(raw, 32 << sf);
+  return widened << imm(amount, 32 << sf);
+}
+
+// The AArch64 logical immediate, decoded exactly as DecodeBitMasks does it. The
+// DSL has no loops on purpose, so this leans on the three compile-time helpers
+// that exist for this one job.
+fn logical_imm(n: int(0..1), immr: int(0..63), imms: int(0..63), width: int) -> int {
+  let len = highestbit_int((n << 6) | ((~imms) & 0x3f));
+  let levels = ones_int(len);
+  let s = imms & levels;
+  let r = immr & levels;
+  let esize = 1 << len;
+  return replicate_int(ror_int(ones_int(s + 1), r, esize), esize, width);
+}
+
+/// Mirrors the three ReservedValue() checks of the manual's DecodeBitMasks so
+/// encodings that do not denote any bitmask are rejected at decode time:
+///   1. sf == 0 requires n == 0 (a 32-bit register cannot hold a 64-bit element)
+///   2. n:~imms == 0 (len < 1 — no set bit anywhere)
+///   3. s == levels (the mask would be all-ones for the element size)
+fn logical_imm_reserved(n: int(0..1), imms: int(0..63), sf: int(0..1)) -> int {
+  if (sf == 0 && n == 1) { return 1; }
+  let code = (n << 6) | ((~imms) & 0x3f);
+  if (code == 0) { return 1; }
+  let levels = ones_int(highestbit_int(code));
+  if ((imms & levels) == levels) { return 1; }
+  return 0;
+}
