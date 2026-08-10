@@ -1,207 +1,207 @@
 # xdec
 
-**A general-purpose, self-contained, multi-level IL decompiler** — lift AArch64 machine code into a typed intermediate representation, simplify obfuscated control flow and MBA expressions, and emit readable structured C.
+**通用、自包含的多级 IL 反编译器** — 将 AArch64 机器码提升为类型化中间表示，化简混淆控制流与 MBA 表达式，输出可读的结构化 C 代码。
 
-Current regression status: **eval 96/96** (baseline) · **eval 36/36** (typed) · **samples 4/4** · **483 unit tests**
-
----
-
-## Highlights
-
-| Capability | What it does |
-|------------|--------------|
-| **Multi-level IL** | Lifted → Local → CFG → SSA → Resolved → Vars → Structured → Typed; each maturity level is inspectable and round-trippable |
-| **OLLVM flattening** | Recognizes dispatcher hubs, inlines switch case handlers, wraps `while(true) + switch(state)`, suppresses live-register phi noise |
-| **MBA simplification** | Algebra rewrite rules (proven by random-binding oracle) collapse obfuscated arithmetic; mega-block safe paths avoid hang on 5k+ op blocks |
-| **Indirect branch resolution** | Jump-table recognition, bound analysis, iterative driver discovers and lifts newly reachable code |
-| **Syscall recovery** | `svc` → named `sys_write(...)` with typed arguments via AArch64 Linux syscall table |
-| **Type import** | Optional C header presets (`android-ndk`) improve signatures, struct field access, and callee naming |
-| **Clean C output** | Structured `if/else`, `while`, `switch` — no gotos where recoverable; short helper names via `xdec_helpers.h` |
+当前回归状态：**eval 96/96**（baseline）· **eval 36/36**（typed）· **samples 4/4** · **483 个单元测试**
 
 ---
 
-## Quick start
+## 核心能力
 
-### Requirements
+| 能力 | 说明 |
+|------|------|
+| **多级 IL** | Lifted → Local → CFG → SSA → Resolved → Vars → Structured → Typed；每个成熟度层级可独立查看、文本可 round-trip |
+| **OLLVM 扁平化** | 识别 dispatcher hub、内联 switch case handler、生成 `while(true) + switch(state)`、抑制 live-register phi 噪声 |
+| **MBA 化简** | 代数重写规则（随机绑定 oracle 证明正确性）折叠混淆算术；mega-block 安全路径避免 5000+ 指令块 hang |
+| **间接分支解析** | 跳转表识别、边界分析、迭代 driver 发现并提升新可达代码 |
+| **Syscall 恢复** | `svc` → 带类型的 `sys_write(...)` 命名调用（AArch64 Linux 系统调用表） |
+| **类型导入** | 可选 C 头文件预设（`android-ndk`）改善函数签名、结构体字段访问、callee 命名 |
+| **结构化 C 输出** | `if/else`、`while`、`switch` — 能恢复的结构就不输出 goto；短名 helper 通过 `xdec_helpers.h` 提供 |
 
-- **CMake** ≥ 3.24, **Ninja**, **C++20** compiler (GCC 14+ or Clang 16+ tested)
-- **Catch2** — fetched automatically if not installed locally
+---
 
-### Build
+## 快速开始
+
+### 环境要求
+
+- **CMake** ≥ 3.24、**Ninja**、**C++20** 编译器（已测试 GCC 14+ / Clang 16+）
+- **Catch2** — 本地未安装时自动拉取
+
+### 构建
 
 ```powershell
 cd xdec
-cmake --preset gcc-debug          # or: cmake -B build/dev -G Ninja
+cmake --preset gcc-debug          # 或：cmake -B build/dev -G Ninja
 cmake --build build/dev
 ```
 
-The CLI lands at `build/dev/bin/xdec.exe`. A copy of `xdec_helpers.h` is placed next to it for decompiled output to include.
+CLI 位于 `build/dev/bin/xdec.exe`。构建时会将 `xdec_helpers.h` 复制到同目录，供反编译输出直接 `#include`。
 
-### Decompile a function
+### 反编译一个函数
 
 ```powershell
 .\build\dev\bin\xdec.exe decompile path\to\lib.so 0x2a2428 -o out.c
 ```
 
-For AArch64 Android `.so` files, type and syscall tables are inferred automatically — no extra flags needed:
+对 AArch64 Android `.so`，类型表与 syscall 表会自动推断，无需额外参数：
 
 ```powershell
 .\build\dev\bin\xdec.exe decompile libsdk_bc_lib.so 0x2a2428 -o sub_2a2428.c
 ```
 
-Common options:
+常用选项：
 
 ```
--o <file.c>              write output to file
---rounds <n>              fixpoint round cap (default 8)
---allow-unresolved        seal unknown indirect branches instead of failing
---types <header|preset>   import C declarations (repeatable)
---syscall-table <name>    syscall numbering table (default aarch64-linux)
---helpers-header <path>   helper include path (default xdec_helpers.h)
---dump-il                 print final IL before C emission
---no-annotate             omit block address comments
+-o <file.c>              输出到文件
+--rounds <n>              不动点轮次上限（默认 8）
+--allow-unresolved        将无法解析的间接分支标记为 opaque，而非失败退出
+--types <header|preset>   导入 C 声明（可重复指定）
+--syscall-table <name>    系统调用编号表（默认 aarch64-linux）
+--helpers-header <path>   helper 头文件路径（默认 xdec_helpers.h）
+--dump-il                 在 C 输出前打印最终 IL
+--no-annotate             省略基本块地址注释
 ```
 
-Set `XDEC_LOG=pass=debug,local=debug` for pass-level diagnostics.
+设置 `XDEC_LOG=pass=debug,local=debug` 可开启 pass 级诊断日志。
 
 ---
 
-## Pipeline
+## 反编译流水线
 
 ```mermaid
 flowchart LR
-  BIN["ELF / .so"] --> LIFT["Lift\n(specs/arm64)"]
-  LIFT --> LOCAL["Local simplify\nMBA + copyprop"]
-  LOCAL --> RESOLVE["Resolve indirect\njump tables"]
-  RESOLVE --> SSA["SSA construct\n+ optimize"]
-  SSA --> VARS["Variable recovery\n+ type apply"]
-  VARS --> STRUCT["Structurizer\nif/while/switch"]
-  STRUCT --> EMIT["C emitter"]
+  BIN["ELF / .so"] --> LIFT["提升 Lift\n(specs/arm64)"]
+  LIFT --> LOCAL["局部化简\nMBA + copyprop"]
+  LOCAL --> RESOLVE["间接分支解析\n跳转表"]
+  RESOLVE --> SSA["SSA 构建\n+ 优化"]
+  SSA --> VARS["变量恢复\n+ 类型应用"]
+  VARS --> STRUCT["结构化\nif/while/switch"]
+  STRUCT --> EMIT["C 输出"]
   EMIT --> OUT["*.c + xdec_helpers.h"]
 ```
 
-The **driver** (`decompile/driver.cpp`) runs lift → simplify → resolve in a fixpoint loop: each resolved branch may expose new code, which gets lifted and simplified in turn until convergence or the round cap.
+**Driver**（`decompile/driver.cpp`）以不动点循环运行 lift → simplify → resolve：每轮解析出的新分支可能暴露更多代码，继续提升与化简，直到收敛或达到轮次上限。
 
 ---
 
-## CLI commands
+## CLI 命令
 
-| Command | Purpose |
-|---------|---------|
-| `decompile <binary> <addr>` | Full pipeline → structured C |
-| `lift <binary> <addr> <n>` | Lift *n* instructions, print IL |
-| `observe <binary> <addr>` | Run passes step-by-step, dump each maturity |
-| `disasm <binary> <addr> <n>` | Disassemble *n* instructions |
-| `info / sections / symbols` | Inspect the binary image |
-| `types parse <header>...` | Parse and report imported C types |
-| `coverage <binary>` | Report undecoded instruction patterns |
-| `spec <file.xspec>` | Validate an architecture spec |
+| 命令 | 用途 |
+|------|------|
+| `decompile <binary> <addr>` | 完整流水线 → 结构化 C |
+| `lift <binary> <addr> <n>` | 提升 *n* 条指令，打印 IL |
+| `observe <binary> <addr>` | 逐步运行 pass，dump 每个成熟度层级 |
+| `disasm <binary> <addr> <n>` | 反汇编 *n* 条指令 |
+| `info / sections / symbols` | 查看二进制镜像信息 |
+| `types parse <header>...` | 解析并报告导入的 C 类型 |
+| `coverage <binary>` | 报告 spec 未覆盖的指令模式 |
+| `spec <file.xspec>` | 校验架构 spec |
 
-Run `xdec help` for the full list.
+运行 `xdec help` 查看完整命令列表。
 
 ---
 
-## Decompiled C output
+## 反编译 C 输出
 
-Generated `.c` files include standard headers plus, when needed:
+生成的 `.c` 文件包含标准头文件，按需附加：
 
 ```c
 #include "xdec_helpers.h"   /* rotr32, bswap64, cc_lt32, ... */
 ```
 
-Portable semantics (`rotr32`, `bswap32`, `popcount64`, overflow-exact condition codes) are fully defined in the header. Target-dependent stubs (`xdec_clz32`, `xdec_mulhiu64`, float ops) are declared for the embedder to implement. See [docs/11-helpers-header.md](docs/11-helpers-header.md).
+可移植语义（`rotr32`、`bswap32`、`popcount64`、溢出精确条件码）在头文件中完整定义；目标相关 stub（`xdec_clz32`、`xdec_mulhiu64`、浮点运算）仅声明，由 embedder 实现。详见 [docs/11-helpers-header.md](docs/11-helpers-header.md)。
 
 ---
 
-## Project layout
+## 项目结构
 
 ```
 xdec/
-├── specs/              Architecture specs (arm64.xspec)
-├── include/xdec/       Public headers + xdec_helpers.h
+├── specs/              架构 spec（arm64.xspec）
+├── include/xdec/       公共头文件 + xdec_helpers.h
 ├── src/
-│   ├── spec/           Lift engine (DSL → machine semantics)
-│   ├── il/             Intermediate representation
-│   ├── passes/         Optimization & deobfuscation passes
-│   ├── analysis/       CFG, dominators, jump tables, dispatcher shape, ...
-│   ├── decompile/      Multi-round discovery driver
-│   ├── emit/           Structurizer + C printer
+│   ├── spec/           提升引擎（DSL → 机器语义）
+│   ├── il/             中间表示
+│   ├── passes/         优化与去混淆 pass
+│   ├── analysis/       CFG、支配树、跳转表、dispatcher 形状分析等
+│   ├── decompile/      多轮发现 driver
+│   ├── emit/           结构化器 + C 打印器
 │   └── tools/          xdec CLI
-├── types/              Type database, syscall tables, NDK preset
-├── eval/               L0 regression: 96 functions with ground-truth C
-├── samples/            L1 regression: real obfuscated .so files
-├── tests/              483 Catch2 unit tests
-└── docs/               Design notes (01–11)
+├── types/              类型数据库、syscall 表、NDK 预设
+├── eval/               L0 回归：96 个有 ground-truth 的函数
+├── samples/            L1 回归：真实混淆 .so
+├── tests/              483 个 Catch2 单元测试
+└── docs/               设计文档（01–11）
 ```
 
 ---
 
-## Testing
+## 测试
 
-### Unit tests
+### 单元测试
 
 ```powershell
 cmake --build build/dev --target xdec_tests
 .\build\dev\bin\xdec_tests.exe
 ```
 
-### L0 — eval (ground-truth corpus)
+### L0 — eval（ground-truth 语料）
 
-Built from known C via Android NDK, scored against structural expectations in `eval/manifest.json`.
+用 Android NDK 从已知 C 源码编译，对照 `eval/manifest.json` 中的结构期望评分。
 
 ```powershell
 cd eval
-.\build.ps1           # requires Android NDK
-.\run.ps1             # baseline: 96/96
-.\run.ps1 -Typed      # typed:   36/36
+.\build.ps1           # 需要 Android NDK
+.\run.ps1             # baseline：96/96
+.\run.ps1 -Typed      # typed：  36/36
 ```
 
-Requires NDK at `%LOCALAPPDATA%\Android\Sdk\ndk\27.2.12479018` (override with `build.ps1 -NdkRoot`).
+默认 NDK 路径：`%LOCALAPPDATA%\Android\Sdk\ndk\27.2.12479018`（可用 `build.ps1 -NdkRoot` 覆盖）。
 
-### L1 — samples (real binaries)
+### L1 — samples（真实二进制）
 
-Scores decompilation *shape* (gotos, switches, line count) on obfuscated `.so` files you provide locally — binaries are not checked in.
+对本地提供的混淆 `.so` 评分反编译*形状*（goto 数、switch 数、行数等）——二进制不入库。
 
 ```powershell
-# Copy samples/local.example.json → samples/local.json and set .so paths
+# 复制 samples/local.example.json → samples/local.json 并填写 .so 路径
 .\samples\run.ps1     # 4/4
 ```
 
-See [samples/README.md](samples/README.md) for adding cases.
+添加新 case 见 [samples/README.md](samples/README.md)。
 
 ---
 
-## Documentation
+## 文档
 
-| Doc | Topic |
-|-----|-------|
-| [01-il-spec.md](docs/01-il-spec.md) | IL design: hash-consed expressions, lazy flags, text round-trip |
-| [05-deobfuscation.md](docs/05-deobfuscation.md) | MBA algebra, jump tables, discovery loop |
-| [06-type-import.md](docs/06-type-import.md) | Header import and type binding |
-| [07-syscall.md](docs/07-syscall.md) | Syscall ABI modelling and recovery |
-| [08-tailcall.md](docs/08-tailcall.md) | Tail-call recognition |
-| [09-expression-reuse.md](docs/09-expression-reuse.md) | CSE / subexpression sharing in emit |
-| [10-import-resolution.md](docs/10-import-resolution.md) | PLT/GOT import callee naming |
-| [11-helpers-header.md](docs/11-helpers-header.md) | Helper naming and `xdec_helpers.h` |
-| [eval/FINDINGS.md](eval/FINDINGS.md) | Regression history, performance notes, OLLVM work log |
+| 文档 | 主题 |
+|------|------|
+| [01-il-spec.md](docs/01-il-spec.md) | IL 设计：hash-cons 表达式、惰性标志位、文本 round-trip |
+| [05-deobfuscation.md](docs/05-deobfuscation.md) | MBA 代数、跳转表、发现循环 |
+| [06-type-import.md](docs/06-type-import.md) | 头文件导入与类型绑定 |
+| [07-syscall.md](docs/07-syscall.md) | Syscall ABI 建模与恢复 |
+| [08-tailcall.md](docs/08-tailcall.md) | 尾调用识别 |
+| [09-expression-reuse.md](docs/09-expression-reuse.md) | CSE / 子表达式共享 |
+| [10-import-resolution.md](docs/10-import-resolution.md) | PLT/GOT 导入 callee 命名 |
+| [11-helpers-header.md](docs/11-helpers-header.md) | Helper 命名与 `xdec_helpers.h` |
+| [eval/FINDINGS.md](eval/FINDINGS.md) | 回归历史、性能记录、OLLVM 优化日志 |
 
-Architecture spec DSL reference: [docs/02-dsl-ref.md](docs/02-dsl-ref.md), [docs/03-spec-compiler.md](docs/03-spec-compiler.md).
-
----
-
-## Target support
-
-| | Status |
-|---|--------|
-| **Architecture** | AArch64 (primary) |
-| **Binary format** | ELF64 (`.so`, executables) |
-| **Platform profile** | Android NDK / AArch64 Linux (auto-inferred) |
-| **Obfuscation** | OLLVM control-flow flattening, MBA, opaque predicates |
-
-x86 and other architectures are not supported today; the IL and spec framework are designed to be extensible via new `.xspec` files and target profiles.
+架构 spec DSL 参考：[docs/02-dsl-ref.md](docs/02-dsl-ref.md)、[docs/03-spec-compiler.md](docs/03-spec-compiler.md)。
 
 ---
 
-## License
+## 目标平台
 
-No license file is included yet. Contact the repository owner for usage terms.
+| | 状态 |
+|---|------|
+| **架构** | AArch64（主要支持） |
+| **二进制格式** | ELF64（`.so`、可执行文件） |
+| **平台配置** | Android NDK / AArch64 Linux（自动推断） |
+| **混淆类型** | OLLVM 控制流扁平化、MBA、不透明谓词 |
+
+x86 及其他架构暂不支持；IL 与 spec 框架可通过新增 `.xspec` 与 target profile 扩展。
+
+---
+
+## 许可证
+
+仓库尚未包含 License 文件。使用条款请联系仓库维护者。
