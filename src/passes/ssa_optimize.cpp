@@ -600,8 +600,20 @@ bool simplifyPhis(il::Function& function) {
   return changed;
 }
 
+/// `visitedExprs` memoizes on the expression's own identity, not just the
+/// Value leaves it bottoms out at: exprs are a DAG (algebra/copy-prop share
+/// subtrees across many parents), so without this a compound node reachable
+/// from N call sites gets walked from scratch N times, and on an MBA-heavy
+/// straight-line block that revisiting is combinatorial rather than merely
+/// redundant -- see eval/FINDINGS.md's "mega-block local-simplify" note.
+/// Marking `id` visited before recursing is safe because exprs are acyclic:
+/// the first visit always completes its subtree before this can be asked
+/// about the same id again.
 void collectUsed(il::Function& function, il::ExprId id, std::unordered_set<uint32_t>& needed,
-                 std::vector<il::ValueId>& work) {
+                 std::vector<il::ValueId>& work, std::unordered_set<uint32_t>& visitedExprs) {
+  if (!visitedExprs.insert(id.index()).second) {
+    return;
+  }
   const il::Expr& expr = function.expr(id);
   if (expr.op == il::ExprOp::Value) {
     const auto value = il::ValueId{static_cast<uint32_t>(expr.immediate)};
@@ -611,7 +623,7 @@ void collectUsed(il::Function& function, il::ExprId id, std::unordered_set<uint3
     return;
   }
   for (unsigned index = 0; index < expr.operandCount; ++index) {
-    collectUsed(function, expr.operands[index], needed, work);
+    collectUsed(function, expr.operands[index], needed, work, visitedExprs);
   }
 }
 
@@ -625,8 +637,11 @@ bool dce(il::Function& function) {
   while (true) {
     std::unordered_set<uint32_t> needed;
     std::vector<il::ValueId> work;
+    // Fresh per outer iteration, same as `needed`/`work`: a round that removed
+    // dead ops changed the IL a later round's walk must see accurately.
+    std::unordered_set<uint32_t> visitedExprs;
     const auto mark = [&](il::ExprId root) {
-      collectUsed(function, root, needed, work);
+      collectUsed(function, root, needed, work, visitedExprs);
     };
     // Roots: whatever the program observes — memory writes, calls, intrinsics,
     // and the conditions that steer control flow.
@@ -699,14 +714,18 @@ class SsaOptimize final : public pass::FunctionPass {
     // everything downstream, propagation and switch recovery included.
     const bool unflagged = foldFlagConditions(function);
     const int64_t flags = clock.lap();
+    XDEC_LOG_DEBUG(optimizeLog(), "  flags {}ms{}", flags, unflagged ? " changed" : "");
     const bool propagated = Sccp(function).run();
     const int64_t sccp = clock.lap();
+    XDEC_LOG_DEBUG(optimizeLog(), "  sccp {}ms{}", sccp, propagated ? " changed" : "");
     // Algebra after propagation: constants the analysis materialised plug
     // straight into the rules, and the rules unblock the next propagation.
     const bool simplified = simplifyAlgebra(function);
     const int64_t algebra = clock.lap();
+    XDEC_LOG_DEBUG(optimizeLog(), "  algebra {}ms{}", algebra, simplified ? " changed" : "");
     const bool merged = simplifyPhis(function);
     const int64_t phis = clock.lap();
+    XDEC_LOG_DEBUG(optimizeLog(), "  phis {}ms{}", phis, merged ? " changed" : "");
     const bool collected = dce(function);
     // This pass runs to fixpoint over four sub-analyses of quite different cost,
     // so its total says nothing about which one to look at — and a sub-analysis

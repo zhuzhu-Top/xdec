@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "xdec/analysis/dispatcher_shape.h"
 #include "xdec/analysis/jump_table.h"
 
 namespace xdec::emit {
@@ -158,16 +159,20 @@ void elideFallthroughGotos(StmtPtr& node, il::BlockId next) {
     case StmtKind::Switch:
       // Nothing follows a case: the next thing in the text is the next case,
       // which is never where the case's own code goes. Only a fallthrough
-      // wholly inside one case body is a fallthrough at all.
+      // wholly inside one case body is a fallthrough at all. The epilogue is
+      // different -- it is what runs right after the switch as a whole, so it
+      // inherits this switch's own `next`.
       for (StmtPtr& body : node->caseBodies) {
         elideFallthroughGotos(body, il::BlockId{});
       }
       elideFallthroughGotos(node->defaultBody, il::BlockId{});
+      elideFallthroughGotos(node->epilogue, next);
       return;
     case StmtKind::Block:
     case StmtKind::Continue:
-      // A continue names the loop it is in, not a block anything falls into, so
-      // there is no fallthrough here to elide it against.
+    case StmtKind::Break:
+      // Neither names a block anything falls into, so there is no
+      // fallthrough here to elide it against.
       return;
   }
 }
@@ -198,6 +203,7 @@ void collectReferences(const Stmt* node, std::set<il::BlockId>& out) {
     } else if (node->defaultCase.valid()) {
       out.insert(node->defaultCase);
     }
+    collectReferences(node->epilogue.get(), out);
   }
   for (const StmtPtr& item : node->items) {
     collectReferences(item.get(), out);
@@ -391,7 +397,11 @@ StmtPtr Structurizer::emitRegion(il::BlockId cur, il::BlockId stop,
       case il::OpCode::IndirectBranch: {
         seq->items.push_back(emitBlock(cur));
         mark(cur);
-        seq->items.push_back(switchFor(cur, *terminator, depth));
+        // wrapAsLoop is a no-op unless `cur` is itself a loop header whose
+        // cases branch back to it -- the same flattened-dispatcher shape
+        // tryDispatchTree already wraps when the dispatch is a compare
+        // chain instead of a resolved table.
+        seq->items.push_back(wrapAsLoop(switchFor(cur, *terminator, depth), cur));
         break;
       }
       default:
@@ -578,6 +588,25 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
     }
   }
 
+  // Infinite form: the header is the whole loop and its only exit is an
+  // unconditional jump back to itself -- no compiler emits this, but an
+  // obfuscator's anti-tampering trap or dead-state sentinel does. Nothing
+  // here tests a condition, so `while`/`do-while` above never fit; printed
+  // plainly this is the label-and-goto pair a reader has to notice loops
+  // forever, where `while (true)` says so directly.
+  if (result == nullptr && loop.blocks.size() == 1 &&
+      headTerm->code == il::OpCode::Branch &&
+      function_.targets(*headTerm)[0] == header) {
+    auto body = Stmt::make(StmtKind::Sequence);
+    body->items.push_back(emitBlock(header));
+    mark(header);
+    auto stmt = Stmt::make(StmtKind::While);
+    stmt->block = header;
+    stmt->body = std::move(body);
+    regionEnd_ = il::BlockId{};  // no exit edge: nothing follows this loop
+    result = std::move(stmt);
+  }
+
   // do-while form: one latch whose conditional returns to the header.
   if (result == nullptr) {
     for (const il::BlockId latch : loop.latches) {
@@ -701,8 +730,129 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
     }
   }
 
+  if (result == nullptr) {
+    result = tryDispatcherLoop(loop, depth);
+  }
+
   inProgressHeaders_.erase(header);
   return result;
+}
+
+StmtPtr Structurizer::tryDispatcherLoop(const analysis::NaturalLoop& loop, unsigned depth) {
+  const il::BlockId header = loop.header;
+  const il::Op* headTerm = terminatorOf(header);
+  if (headTerm == nullptr || headTerm->code != il::OpCode::CondBranch) {
+    return nullptr;
+  }
+  const auto headTargets = function_.targets(*headTerm);
+  const auto headOperands = function_.operands(*headTerm);
+  for (const int harm : {0, 1}) {
+    const il::BlockId dispatch = headTargets[static_cast<std::size_t>(harm)];
+    const il::BlockId headerExit = headTargets[static_cast<std::size_t>(harm ^ 1)];
+    if (!headerExit.valid() || dispatch == header || !loop.blocks.contains(dispatch) ||
+        emitted_.contains(dispatch)) {
+      continue;
+    }
+    const il::Op* dispatchTerm = terminatorOf(dispatch);
+    if (dispatchTerm == nullptr || dispatchTerm->code != il::OpCode::IndirectBranch) {
+      continue;
+    }
+    const auto dispatchTargets = function_.targets(*dispatchTerm);
+    const std::optional<analysis::DispatcherShape> shape =
+        analysis::matchDispatcherShape(function_, dispatch, dispatchTargets);
+    if (!shape.has_value() || shape->hub != header ||
+        std::find(loop.latches.begin(), loop.latches.end(), shape->merge) ==
+            loop.latches.end()) {
+      continue;
+    }
+    const std::size_t snapshot = trail_.size();
+    const std::size_t gotoSnapshot = gotoTrail_.size();
+    auto body = Stmt::make(StmtKind::Sequence);
+    body->items.push_back(emitBlock(header));
+    mark(header);
+    auto guard = Stmt::make(StmtKind::If);
+    guard->cond = headOperands[0];
+    guard->invertCond = harm == 0;
+
+    // Ordinarily headerExit truly leaves the loop, so the guard is a plain
+    // `if (cond) goto headerExit;` and dispatch/the switch just follow it,
+    // unconditionally, in the same sequence. bc_lib's own dispatcher instead
+    // has the "state out of range" arm do a small bit of its own work and
+    // then land on the very same `shape->merge` every handler does (see
+    // analysis::DispatcherShape) -- exactly the private, merge-bound handler
+    // shape `claimDispatcherCaseBody` already inlines for a switch case,
+    // just reached from `header` rather than `dispatch`. That is also *why*
+    // headerExit turns up inside `loop.blocks` at all here: the natural-loop
+    // walk reaches it backward from the latch, which a genuine exit never
+    // would. Since both arms now reach the same tail, dispatch/the switch has
+    // to move into a real `else` (an out-of-range state must not also run the
+    // switch on whatever garbage index it left behind), and the tail moves
+    // out from under the switch to run once after the whole `if`/`else`
+    // instead of once per arm.
+    const bool threeWayMerge = loop.blocks.contains(headerExit);
+    StmtPtr headerExitBody;
+    if (threeWayMerge) {
+      headerExitBody =
+          claimDispatcherCaseBody(header, headerExit, shape->merge, depth + 1, /*appendBreak=*/false);
+      if (!headerExitBody) {
+        rollback(snapshot, gotoSnapshot);
+        continue;
+      }
+    } else {
+      guard->thenArm = gotoStmt(headerExit);
+    }
+
+    auto emitDispatchAndSwitch = [&]() -> StmtPtr {
+      auto seq = Stmt::make(StmtKind::Sequence);
+      seq->items.push_back(emitBlock(dispatch));
+      mark(dispatch);
+      StmtPtr switchStmt = switchFor(dispatch, *dispatchTerm, depth + 1);
+      // The loop-back is implicit in `while (true)`'s own re-entry: strip the
+      // trailing `goto header` switchFor's epilogue printed on the (correct,
+      // context-free) assumption that nothing was going to wrap it in a loop.
+      if (switchStmt->epilogue && !switchStmt->epilogue->items.empty() &&
+          switchStmt->epilogue->items.back()->kind == StmtKind::Goto &&
+          switchStmt->epilogue->items.back()->block == header) {
+        switchStmt->epilogue->items.pop_back();
+      }
+      seq->items.push_back(std::move(switchStmt));
+      return seq;
+    };
+
+    StmtPtr sharedEpilogue;
+    if (threeWayMerge) {
+      StmtPtr dispatchAndSwitch = emitDispatchAndSwitch();
+      sharedEpilogue = std::move(dispatchAndSwitch->items.back()->epilogue);
+      guard->thenArm = std::move(headerExitBody);
+      guard->elseArm = std::move(dispatchAndSwitch);
+      if (!regionClosed(snapshot, header)) {
+        rollback(snapshot, gotoSnapshot);
+        continue;
+      }
+      body->items.push_back(std::move(guard));
+      if (sharedEpilogue) {
+        body->items.push_back(std::move(sharedEpilogue));
+      }
+    } else {
+      body->items.push_back(std::move(guard));
+      StmtPtr dispatchAndSwitch = emitDispatchAndSwitch();
+      if (!regionClosed(snapshot, header)) {
+        rollback(snapshot, gotoSnapshot);
+        continue;
+      }
+      for (StmtPtr& item : dispatchAndSwitch->items) {
+        body->items.push_back(std::move(item));
+      }
+    }
+    auto stmt = Stmt::make(StmtKind::While);
+    stmt->block = header;
+    stmt->body = std::move(body);
+    // A claimed headerExit rejoins merge, and merge's only way out is back
+    // through the header -- there is no path left out of this loop to name.
+    regionEnd_ = threeWayMerge ? il::BlockId{} : headerExit;
+    return stmt;
+  }
+  return nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -737,13 +887,51 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
   // copies on those edges have to come from.
   stmt->casePreds.assign(targets.size(), block);
   stmt->caseBodies.resize(targets.size());
+
+  // A flattening dispatcher's cases usually share one tail (see
+  // analysis::DispatcherShape): most of them do their own work and then land
+  // on the very same block before jumping back to the loop header.
+  // Structuring that block once here, as the switch's own epilogue, is what
+  // lets every handler that reaches it be written inline (see
+  // claimDispatcherCaseBody) instead of `goto`-ing to a label a hundred cases
+  // repeat. Skipped when `merge` is already spoken for -- some other region
+  // got there first, and claiming it twice would print it twice.
+  const std::optional<analysis::DispatcherShape> shape =
+      analysis::matchDispatcherShape(function_, block, targets);
+  StmtPtr epilogue;
+  if (shape.has_value() && !emitted_.contains(shape->merge) &&
+      !inProgressHeaders_.contains(shape->merge)) {
+    epilogue = emitRegion(shape->merge, il::BlockId{}, depth + 1);
+  }
   for (std::size_t index = 0; index < targets.size(); ++index) {
-    stmt->caseBodies[index] = claimCaseBody(block, targets[index], depth);
+    if (epilogue) {
+      stmt->caseBodies[index] =
+          claimDispatcherCaseBody(block, targets[index], shape->merge, depth);
+    }
+    if (!stmt->caseBodies[index]) {
+      stmt->caseBodies[index] = claimCaseBody(block, targets[index], depth);
+    }
     if (!stmt->caseBodies[index]) {
       addGotoTarget(targets[index]);
     }
   }
-  if (targets.size() >= 3) {
+  if (epilogue) {
+    stmt->epilogue = std::move(epilogue);
+    stmt->mergeBlock = shape->merge;
+    // Whether the handlers this switch just claimed carry their live
+    // registers to `epilogue` through the shadow-register protocol (see
+    // analysis::LiveRegisterFrame): when they do, emission can skip printing
+    // a case's save into a slot it never actually changes.
+    stmt->frame = analysis::matchLiveRegisterFrame(function_, *shape);
+  }
+  // A table match at two targets is still a real index dispatch -- an
+  // opaque-predicate pass upstream routinely leaves a flattened function's
+  // three- and four-way sites down to two live values once the others are
+  // proven unreachable, and a two-way `switch (state)` says exactly what
+  // happened where an address compare chain (`if (t == 0x...) ... else if
+  // (t == 0x...)`) makes the reader rediscover it from raw target addresses.
+  // Below two there is nothing a switch adds over a plain `if`.
+  if (targets.size() >= 2) {
     if (const auto table = analysis::matchJumpTable(function_, operands[0]);
         table.has_value() && table->index.valid()) {
       stmt->tableMode = true;
@@ -784,6 +972,40 @@ StmtPtr Structurizer::claimCaseBody(il::BlockId dispatcher, il::BlockId handler,
   return body;
 }
 
+StmtPtr Structurizer::claimDispatcherCaseBody(il::BlockId dispatcher, il::BlockId handler,
+                                              il::BlockId merge, unsigned depth,
+                                              bool appendBreak) {
+  if (depth >= kMaxDepth || budget_ == 0 || handler == dispatcher || handler == merge ||
+      emitted_.contains(handler) || inProgressHeaders_.contains(handler)) {
+    return nullptr;
+  }
+  // Same private-handler requirement as claimCaseBody: reached from this
+  // switch and from nowhere else.
+  const auto& predecessors = function_.block(handler).predecessors;
+  if (predecessors.size() != 1 || predecessors.front() != dispatcher) {
+    return nullptr;
+  }
+  const ScopedHeader inProgress(inProgressHeaders_, dispatcher);
+  const std::size_t snapshot = trail_.size();
+  const std::size_t gotoSnapshot = gotoTrail_.size();
+  // Stops AT merge rather than walking into it: merge belongs to the switch
+  // as a whole (see switchFor's epilogue), not to this one case.
+  StmtPtr body = emitRegion(handler, merge, depth + 1);
+  if (trail_.size() == snapshot || regionEnd_ != merge || !regionClosed(snapshot, dispatcher)) {
+    budget_ -= std::min(budget_, trail_.size() - snapshot);
+    rollback(snapshot, gotoSnapshot);
+    return nullptr;
+  }
+  // The handler's own code never says explicitly that it leaves for the
+  // tail -- that arrival is what `regionEnd_ == merge` above already proved;
+  // `Break` is what says the same thing in C, since the tail is about to be
+  // printed as the switch's epilogue rather than inline in this case.
+  if (appendBreak) {
+    body->items.push_back(Stmt::make(StmtKind::Break));
+  }
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -794,6 +1016,7 @@ bool Structurizer::alwaysLeaves(const Stmt* node) const {
   }
   switch (node->kind) {
     case StmtKind::Goto:
+    case StmtKind::Break:
       return true;
     case StmtKind::Block:
       return exits(node->block);
@@ -801,6 +1024,19 @@ bool Structurizer::alwaysLeaves(const Stmt* node) const {
       return !node->items.empty() && alwaysLeaves(node->items.back().get());
     case StmtKind::If:
       return alwaysLeaves(node->thenArm.get()) && alwaysLeaves(node->elseArm.get());
+    case StmtKind::Switch:
+      // A dispatcher shape's epilogue is what every `Break` case actually
+      // falls into, so whether the whole switch+epilogue unit leaves is the
+      // epilogue's question to answer, not the switch's.
+      if (node->epilogue) {
+        return alwaysLeaves(node->epilogue.get());
+      }
+      // Every case either was claimed (claimCaseBody already required its body
+      // to leave before accepting it) or prints as a `goto` to its handler,
+      // which also leaves -- so the only way control falls past a Switch is an
+      // unresolved compare chain, which has no default arm to catch a target
+      // matching none of its tests (see printSwitch's `enumerated` check).
+      return node->tableMode || !node->caseValues.empty();
     default:
       return false;
   }
@@ -908,3 +1144,4 @@ StructuredFunction structureFunction(
 }
 
 }  // namespace xdec::emit
+

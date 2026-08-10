@@ -2,6 +2,7 @@ xdec_add_library(xdec_il
   SOURCES
     ceval.cpp
     expr.cpp
+    expr_roots.cpp
     function.cpp
     interp.cpp
     maturity.cpp

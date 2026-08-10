@@ -344,6 +344,47 @@ TEST_CASE("an encrypted dispatch table is recognised and spelled out",
         "(encrypted dispatch table)");
 }
 
+// The same encrypted-table shape, but every piece of it -- the index, the
+// table base, the encoded entry, the key -- lives in read-only memory. This is
+// the shape `isEncryptedTableDispatch()` names, proving nothing special about
+// it stops `converges()` from resolving it exactly like the plain pointer
+// slot above: the index comes off two immutable slots agreeing (by way of
+// `eitherSlot`, the same runtime-branch shape the plain convergence test
+// uses) rather than a register, so nothing here needs a dedicated
+// table-dispatch resolver -- the general evaluator already walks through the
+// multiply, the add, and the xor once every load in the chain is provably
+// constant. What is not provable this way is bc_lib's actual shape: a table
+// base read from writable memory, which stays on the "describe" side (the
+// two tests above).
+TEST_CASE("an encrypted dispatch table with a knowable base still resolves",
+          "[passes][resolve-call]") {
+  Space space;
+  space.store64(Space::kRodata + 0x20, 2);
+  space.store64(Space::kRodata + 0x30, 2);
+  space.store64(Space::kRodata + 0x70, (Space::kCode + 0x20) ^ 0xd2880);
+
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const ExprId indexAddress =
+      eitherSlot(b, Space::kRodata + 0x20, Space::kRodata + 0x30);
+  const ExprId index = b.load(entry, 0x1000, indexAddress);
+  const ExprId term = b.function.binary(ExprOp::Mul, index, b.i64(0x10));
+  const ExprId tableEntry =
+      b.function.binary(ExprOp::Add, b.i64(Space::kRodata + 0x50), term);
+  const ExprId decoded = b.function.binary(
+      ExprOp::Xor, b.load(entry, 0x1004, tableEntry), b.i64(0xd2880));
+  b.function.appendCall(entry, 0x1008, decoded, Type::integer(64));
+  b.function.appendReturn(entry, 0x100c);
+  b.atCfg();
+
+  runToSsa(b.function, space);
+
+  uint64_t target = 0;
+  REQUIRE(calledAddress(b.function, target));
+  CHECK(target == Space::kCode + 0x20);
+  CHECK(noteOnCall(b.function) == "call target proved constant from read-only memory");
+}
+
 // A target assembled from registers alone reaches no memory, and saying so is
 // worth as much as naming a table: there is no table to go looking for.
 TEST_CASE("a target computed without a load says so", "[passes][resolve-call]") {

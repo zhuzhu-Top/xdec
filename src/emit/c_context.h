@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -63,21 +64,7 @@ class CContext {
   CContext(const il::Function& theFunction,
            const analysis::VariableTable& theVariables,
            const analysis::StackFrame& theFrame,
-           const StructuredFunction& theStructured, const COptions& theOptions)
-      : function(theFunction),
-        variables(theVariables),
-        frame(theFrame),
-        structured(theStructured),
-        options(theOptions) {
-    if (options.types != nullptr) {
-      binder_.emplace(*options.types, [this](uint64_t va) {
-        const SymbolRef symbol = symbolAt(va);
-        return symbol.exact()
-                   ? types::BoundName{symbol.name, symbol.isFunction}
-                   : types::BoundName{};
-      });
-    }
-  }
+           const StructuredFunction& theStructured, const COptions& theOptions);
 
   const il::Function& function;
   const analysis::VariableTable& variables;
@@ -121,6 +108,13 @@ class CContext {
   /// any other temp; c_stmt.cpp prints the assignment that fills each one
   /// as an ordinary statement right before the code that first needs it.
   std::vector<std::pair<std::string, uint32_t>> cseTemps;
+  /// Ops the body will never print -- today, exactly `deadJumpTableLoad`'s
+  /// finds (see c_stmt.h). Computed once, in the constructor, from the
+  /// already-built structured tree: before `Assembler::nameResultTemps`
+  /// walks every op deciding what needs a declaration, and before
+  /// `StmtPrinter` walks the same ops deciding what to print, so a
+  /// declared-but-never-assigned temporary can never happen.
+  std::unordered_set<uint32_t> deadOps;
 
   /// The temporary standing for a value, or nullptr when the value has none.
   [[nodiscard]] const std::string* tempFor(il::ValueId value) const;
@@ -207,6 +201,35 @@ class CContext {
   /// prototype covers it.
   [[nodiscard]] types::TypeId argumentType(const analysis::Variable& variable) const;
 
+  /// What this function itself returns, when every `ret` traced to the same
+  /// call/`svc` result and that result's callee typed it (see
+  /// analysis::TypedVariables::returnType) -- for a function no header names,
+  /// so `signature()` has nothing else to prefer over the inferred width.
+  /// Filtered through `consistent` against the inferred CType the same way an
+  /// argument or local is, so a header's return type never overrides one the
+  /// body's own operations contradict. Invalid when no evidence exists, no
+  /// header was imported, or the two disagree.
+  [[nodiscard]] types::TypeId functionReturnType() const;
+
+  /// `&var_10` for an address expression that is exactly the stack slot of a
+  /// local TypedVariables gave a struct type, empty otherwise.
+  ///
+  /// Checked ahead of the ordinary cast-and-print path (see StmtPrinter's
+  /// call and syscall argument loops) because those wrap every argument text
+  /// in the callee's own spelling: without this, `&var_10` would print as
+  /// `(struct timeval*)(__entry_sp + -0x10)` -- not wrong, since the slot is
+  /// declared as that struct, but a needless trip through arithmetic and a
+  /// cast for what is now just one named local's address.
+  [[nodiscard]] std::string addressOfLocal(il::ExprId address) const;
+
+  /// `var_50.tv_sec` for a `width`-bit access to the stack slot at `delta`,
+  /// when that slot is (or aliases into, see analysis::Variable::aliasBase) a
+  /// struct TypedVariables typed and the access lands on one field exactly.
+  /// Empty otherwise -- including a struct's own base slot read at some other
+  /// width than any single field, which is memoryLvalue's cast fallback to
+  /// handle, the same as it would for a local with no imported type at all.
+  [[nodiscard]] std::string localFieldAccess(int64_t delta, uint32_t width) const;
+
   /// Names, and on first sight declares, the variable for a full register.
   [[nodiscard]] const RegVar& registerVariable(il::RegId root);
 
@@ -216,14 +239,23 @@ class CContext {
   }
 
   /// The name to call the function at `va` by: its symbol's, when a symbol
-  /// starts exactly there, and `sub_<va>` otherwise. A symbol that merely
-  /// *covers* the address names a different function, so it is not used —
-  /// calling `foo` when the target is halfway inside `foo` would be a lie of
-  /// exactly the kind that makes decompiler output untrustworthy.
+  /// starts exactly there; the import behind a PLT stub's GOT indirection
+  /// (see `options.names`), when nothing else names it; `sub_<va>` otherwise.
+  /// A symbol that merely *covers* the address names a different function, so
+  /// it is not used — calling `foo` when the target is halfway inside `foo`
+  /// would be a lie of exactly the kind that makes decompiler output
+  /// untrustworthy.
   [[nodiscard]] std::string calleeName(uint64_t va) const {
     const SymbolRef symbol = symbolAt(va);
-    return symbol.exact() && symbol.isFunction ? symbol.name
-                                               : std::format("sub_{:x}", va);
+    if (symbol.exact() && symbol.isFunction) {
+      return symbol.name;
+    }
+    if (options.names) {
+      if (const types::BoundName named = options.names(va); !named.empty() && named.isFunction) {
+        return named.name;
+      }
+    }
+    return std::format("sub_{:x}", va);
   }
 
   /// The name to print for the fixed address `va`, registering it for

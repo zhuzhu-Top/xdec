@@ -12,13 +12,52 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "c_context.h"
 #include "c_expr.h"
+#include "xdec/analysis/live_register_frame.h"
 
 namespace xdec::emit {
+
+/// A resolved computed branch's own `IndirectBranch` never prints (control
+/// flow belongs to the statement tree, like every other terminator -- see
+/// StmtPrinter::printOp's terminator cases): once `switchStmt` is a genuine
+/// table-mode switch built from `blockStmt`'s terminator, the branch's
+/// ORIGINAL target -- table-base-plus-index-times-stride, read out of the
+/// jump table by a `Load` right before it -- has no reader left anywhere in
+/// the block. The switch dispatches on the index alone (see structure.cpp's
+/// `switchFor`), not the address that load computed, and `addExprRoots`
+/// already agrees nothing else in the block reaches it either. Printing
+/// that load's assignment anyway is exactly the shape D duplicate
+/// docs/09-expression-reuse.md calls out: a real memory read the target
+/// binary performs, now entirely vestigial in the reconstruction once the
+/// switch it fed is resolved. Returns that load's `OpId` when the shape
+/// matches exactly (single reader, resolved table mode), invalid otherwise.
+///
+/// Free (not a `StmtPrinter` member) so `collectDeadOps` can answer this
+/// once, before any op is named or printed -- see its own note on why that
+/// matters for declarations.
+[[nodiscard]] il::OpId deadJumpTableLoad(const il::Function& function, il::BlockId block,
+                                         bool tableMode, il::ExprId cond);
+
+/// Walks the whole structured tree for every Block-immediately-followed-by-
+/// its-own-Switch pairing (see `deadJumpTableLoad`), wherever it is nested --
+/// inside a loop body, an if arm, another switch's case -- and for every
+/// import-accessor call a later Store in the same block folds into itself
+/// (see `printOp`'s Store case and docs/10-import-resolution.md's errno
+/// idiom: `t = __errno_location(); *(uint32_t*)t = -ret;` becomes
+/// `*__errno_location() = -ret;`, and the call's own temporary is one this
+/// set marks dead the same way a vestigial jump-table load is). Computed
+/// once, up front: `c_printer.cpp`'s declaration pass must not declare a
+/// temporary for an op the body will never print, and `StmtPrinter::printOp`
+/// must skip (or fold away) that same op, so both read this one answer
+/// instead of risking two independently-reasoned ones drifting apart.
+[[nodiscard]] std::unordered_set<uint32_t> collectDeadOps(const il::Function& function,
+                                                          const Stmt& root,
+                                                          const COptions& options);
 
 class StmtPrinter {
  public:
@@ -35,7 +74,25 @@ class StmtPrinter {
   void printIf(const Stmt& stmt, std::string& out);
   void printWhile(const Stmt& stmt, std::string& out);
   void printDoWhile(const Stmt& stmt, std::string& out);
-  void printSwitch(const Stmt& stmt, std::string& out);
+  /// `openScope` is false only when `printStmt`'s Sequence handler has
+  /// already folded this switch's discriminant into the CSE scope its
+  /// immediately preceding paired block opened (see printBlock's
+  /// `extraRoots` and the Sequence case below): the switch then reuses that
+  /// scope instead of resetting it, so a value the block already shares
+  /// with the discriminant is named once, not twice.
+  void printSwitch(const Stmt& stmt, std::string& out, bool openScope = true);
+
+  /// `stmt.frame`, printed once as `shadow[i] = live[i]` for every slot,
+  /// right before the switch it belongs to. Establishes the invariant that
+  /// lets `printEdge` skip a handler's copy into a slot it never actually
+  /// changes (see the class-level note on `activeFrame_`): without this,
+  /// skipping that copy on whichever handler happens to run first would read
+  /// the shadow register's declaration-time garbage instead of the live
+  /// value it is supposed to still equal. `unanimous` slots (see
+  /// `ActiveFrame::unanimous`) skip even this: nothing downstream ever reads
+  /// the shadow variable's value for one of those, seeded or not.
+  void printFrameSeed(const analysis::LiveRegisterFrame& frame,
+                      const std::vector<bool>& unanimous, std::string& out);
 
   /// A select chain flattened into the guards it really is, every piece already
   /// printed to a name.
@@ -72,7 +129,13 @@ class StmtPrinter {
   /// the statement, so the arms have to exclude each other explicitly.
   bool printSelectAssign(il::ExprId value, std::string& out,
                          const std::function<std::string(const std::string&)>& assign);
-  void printBlock(const Stmt& stmt, std::string& out);
+  /// `extraRoots` are folded into this block's own CSE scope before any of
+  /// its ops print, so a value the block shares with them is recognised as
+  /// shared from its very first use (see printSwitch's `openScope`). An op
+  /// in `ctx_.deadOps` (see `collectDeadOps`) is skipped entirely: neither
+  /// counted as a CSE root nor printed.
+  void printBlock(const Stmt& stmt, std::string& out,
+                  const std::vector<il::ExprId>& extraRoots = {});
 
   // -- ops --------------------------------------------------------------------
 
@@ -85,6 +148,13 @@ class StmtPrinter {
   /// header said about the callee where it said anything.
   [[nodiscard]] std::string calleeCast(const types::TypeEntry* callee,
                                        std::size_t argCount, bool hasResult);
+  /// `*__errno_location() = -(x);` in place of the ordinary two-statement
+  /// form, for the one Store `collectDeadOps`'s `foldableErrnoCall` matched
+  /// (see its own note): the call this store's address value comes from is
+  /// already in `ctx_.deadOps`, so printing it here is this fold's only
+  /// remaining trace, same as any other dead op that never gets its own
+  /// statement. False for every other Store, and then nothing is printed.
+  [[nodiscard]] bool printFoldedImportStore(const il::Op& op, std::string& out);
   void printIntrinsic(const il::Op& op, std::string& out);
   /// The `svc` intrinsic as a syscall. False when this op is not one, or when
   /// nothing is known about the number, and then nothing has been printed and
@@ -161,6 +231,28 @@ class StmtPrinter {
   il::BlockId last_{};
   /// An edge whose copies the next statement must emit before its own code.
   il::BlockId pending_{};
+
+  /// The dispatcher frame the switch currently being printed carries (see
+  /// `printFrameSeed`), for the whole time its case bodies and epilogue are
+  /// printing. `printEdge` consults this to drop a handler's copy into a
+  /// slot `analysis::classifyHandlerExit` says it never touches: correct
+  /// only because `printFrameSeed` already made that slot's shadow variable
+  /// equal to the live one before any case ran, and the switch's own
+  /// (unsuppressed) restore edge copies it back out unconditionally on every
+  /// path, so a handler that skipped its copy leaves the same value there
+  /// the restore then reads. Null outside of such a switch, and whenever the
+  /// switch has no `frame` at all.
+  struct ActiveFrame {
+    il::BlockId merge;
+    analysis::LiveRegisterFrame frame;
+    /// Parallel to `frame.slots`: `analysis::unanimousPassthroughSlots`,
+    /// computed once when the switch is entered rather than per edge. A
+    /// unanimous slot needs no seed (see `printFrameSeed`) and no restore
+    /// copy either -- every handler already leaves the hub phi's own value
+    /// sitting exactly where the restore would have copied it from.
+    std::vector<bool> unanimous;
+  };
+  std::optional<ActiveFrame> activeFrame_;
 };
 
 }  // namespace xdec::emit

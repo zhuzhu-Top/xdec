@@ -164,20 +164,21 @@ class ResolveIndirect final : public pass::FunctionPass {
     }
 
     // Whole-table enumeration leads: a jump table's entries are all valid
-    // targets whatever the index computes, so the full set beats the value
-    // set's entry-zero singleton (which would walk the state machine one hop
-    // per driver round). The value set still contributes what the table
-    // matcher misses — select arms over two bases, lone global pointers.
+    // targets whatever the index computes -- except that tableCandidates now
+    // reads only the indices the index expression can actually take when it
+    // can prove a finite set of them (see its own comment), so "whatever the
+    // index computes" only means "every structurally possible one" when
+    // nothing narrower is provable. The value set is consulted second, and
+    // only when the table path found nothing at all: where both succeed they
+    // are reading the same underlying address computation and agree, so a
+    // union would only ever add duplicates; where the table path aborted
+    // because an entry misread, a stale value set filling in the gap would
+    // hide exactly the mismatch that abort exists to report.
     std::vector<uint64_t> candidates =
         tableCandidates(context, eval, dominators, blockId, operands[0]);
     const std::size_t fromTable = candidates.size();
-    {
-      std::vector<uint64_t> more = valueSetCandidates(eval, operands[0]);
-      for (const uint64_t va : more) {
-        if (std::find(candidates.begin(), candidates.end(), va) == candidates.end()) {
-          candidates.push_back(va);
-        }
-      }
+    if (candidates.empty()) {
+      candidates = valueSetCandidates(eval, operands[0]);
     }
     const uint64_t branchVa = function.op(terminatorId).va;
     if (candidates.empty()) {
@@ -271,12 +272,28 @@ class ResolveIndirect final : public pass::FunctionPass {
   }
 
   /// Path two: whole-table enumeration, for dispatchers whose index is not
-  /// statically knowable.
+  /// statically knowable -- and, first, the narrower answer for dispatchers
+  /// whose index *is*: read only the entries it can actually select.
   ///
-  /// How far to enumerate is the whole difficulty, and there are two answers.
-  /// The good one is the guard that bounds the index (analysis/index_bound.h):
-  /// it states the length, so every entry up to it is read and any entry that is
-  /// then not code means the table was misread and nothing is claimed.
+  /// A table's shape says every entry is a valid branch target; it says
+  /// nothing about which entries this particular branch, with this
+  /// particular index expression, can ever reach. A branchless clamp
+  /// (`state > k ? replacement : state`, see analysis/index_bound.h's
+  /// localBound for the structural version of the same reasoning) or a flag
+  /// zero-extended straight into the index can make the index's own value set
+  /// -- analysis/image_eval.h, the same evaluator every other pass in this
+  /// file already trusts -- a handful of concrete numbers well inside what
+  /// the structural bound merely allows. Reading only those is the difference
+  /// between a dispatcher's real cases and a `switch` with a live case for
+  /// every slot an obfuscator's dead state, padding, or neighboring table
+  /// happened to leave bound-reachable.
+  ///
+  /// How far to enumerate when the value set does not narrow anything (it is
+  /// `top`, or every value it offers gets discarded below) is the older
+  /// difficulty, and there are two answers. The good one is the guard that
+  /// bounds the index (analysis/index_bound.h): it states the length, so
+  /// every entry up to it is read and any entry that is then not code means
+  /// the table was misread and nothing is claimed.
   ///
   /// Without a guard, all that is left is to read until an entry stops looking
   /// like a target, which does not find the end so much as stumble over
@@ -308,11 +325,61 @@ class ResolveIndirect final : public pass::FunctionPass {
     // A bound is on the index, so the entry count is one more than it.
     const std::optional<uint64_t> proven =
         analysis::boundOnIndex(function, dominators, blockId, table->index);
+    const ByteReader& image = *context.image();
+
+    // The precise path: the index's own value set, when it is not top. A
+    // value the structural bound does not admit means the two proofs
+    // disagree about this table, which is a reason to distrust the precise
+    // set (fall through to the structural path below) rather than to pick a
+    // winner between two claims that cannot both be right. An entry that does
+    // not read as code is the same signal path two already treats as
+    // "misread the table, claim nothing" -- the value set being wrong about
+    // an index is not a reason to make up an answer for it, either.
+    const analysis::ValueSet indexValues = eval.eval(table->index);
+    if (!indexValues.isTop() && !indexValues.values().empty()) {
+      std::vector<uint64_t> preciseIndices(indexValues.values().begin(),
+                                           indexValues.values().end());
+      std::sort(preciseIndices.begin(), preciseIndices.end());
+      std::vector<uint64_t> out;
+      bool trustworthy = true;
+      for (const uint64_t index : preciseIndices) {
+        if (proven.has_value() && index > *proven) {
+          XDEC_LOG_DEBUG(resolveLog(),
+                         "table at {:#x}: the index's value set includes {} but the guard "
+                         "bounds it to {}; the two disagree, so the value set is not "
+                         "trusted and the structural bound is used instead",
+                         table->base, index, *proven);
+          trustworthy = false;
+          break;
+        }
+        const uint64_t va = entryTarget(image, *table, index);
+        if (!table->relative && va == 0) {
+          continue;
+        }
+        if (va == kNoTarget || !isCode(context, va)) {
+          XDEC_LOG_DEBUG(resolveLog(),
+                         "table at {:#x}: entry {} from the index's value set is not "
+                         "code, so the value set is being misread; falling back to the "
+                         "structural bound",
+                         table->base, index);
+          trustworthy = false;
+          break;
+        }
+        out.push_back(va);
+      }
+      if (trustworthy && !out.empty()) {
+        XDEC_LOG_DEBUG(resolveLog(),
+                       "table at {:#x}: {} of its entries are the ones the index {} can "
+                       "actually take",
+                       table->base, out.size(), il::printExpr(function, table->index));
+        return out;
+      }
+    }
+
     const uint64_t limit =
         proven.has_value() ? *proven + 1 : uint64_t{kMaxEntries};
 
     std::vector<uint64_t> out;
-    const ByteReader& image = *context.image();
     for (uint64_t index = 0; index <= limit; ++index) {
       if (index == limit) {
         if (proven.has_value()) {

@@ -10,6 +10,7 @@ xdec_add_library(xdec_passes
     dce.cpp
     fold.cpp
     fold_resolved_branch.cpp
+    load_forward.cpp
     local_simplify.cpp
     recover_syscall.cpp
     recover_tailcall.cpp

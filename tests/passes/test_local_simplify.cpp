@@ -8,6 +8,8 @@
 // the lifted block computed.
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
+#include <chrono>
 #include <string>
 
 #include "il/il_test_support.h"
@@ -229,6 +231,85 @@ TEST_CASE("writes to xzr vanish and reads of it become zero", "[passes][local]")
   CHECK(printed.find("xzr") == std::string::npos);
 }
 
+TEST_CASE("a second load of the same address is forwarded and removed",
+          "[passes][local][load-forward]") {
+  Fixture f;
+  // x2 = load(x1); x0 = load(x1)  ->  the second load is removed, its value forwarded.
+  const ExprId address = f.read(f.x1);
+  const ValueId first = f.function.appendLoad(f.block, 0x1000, Type::integer(64), address);
+  f.write(f.x2, f.function.valueRef(first));
+  const ValueId second = f.function.appendLoad(f.block, 0x1004, Type::integer(64), address);
+  f.write(f.x0, f.function.valueRef(second));
+  f.finish();
+
+  CHECK(xdec::passes::forwardRedundantLoads(f.function, f.block));
+  REQUIRE(verifiesClean(f.function));
+
+  unsigned loads = 0;
+  for (const il::OpId opId : f.function.block(f.block).ops) {
+    loads += f.function.op(opId).code == il::OpCode::Load ? 1u : 0u;
+  }
+  CHECK(loads == 1);
+  // The second write now reads straight off the first load's value.
+  const auto& ops = f.function.block(f.block).ops;
+  bool sawForwardedWrite = false;
+  for (const il::OpId opId : ops) {
+    const il::Op& op = f.function.op(opId);
+    if (op.code == il::OpCode::WriteReg && op.reg() == f.x0) {
+      const il::Expr& value = f.function.expr(f.function.operands(op)[0]);
+      REQUIRE(value.op == ExprOp::Value);
+      CHECK(il::ValueId{static_cast<uint32_t>(value.immediate)} == first);
+      sawForwardedWrite = true;
+    }
+  }
+  CHECK(sawForwardedWrite);
+}
+
+TEST_CASE("a store between two loads of the same address keeps both", "[passes][local][load-forward]") {
+  Fixture f;
+  const ExprId address = f.read(f.x0);
+  f.function.appendLoad(f.block, 0x1000, Type::integer(64), address);
+  f.function.appendStore(f.block, 0x1004, Type::integer(64), f.constant(0x9000), f.constant(0));
+  f.function.appendLoad(f.block, 0x1008, Type::integer(64), address);
+  f.finish();
+
+  CHECK_FALSE(xdec::passes::forwardRedundantLoads(f.function, f.block));
+  REQUIRE(verifiesClean(f.function));
+
+  unsigned loads = 0;
+  for (const il::OpId opId : f.function.block(f.block).ops) {
+    loads += f.function.op(opId).code == il::OpCode::Load ? 1u : 0u;
+  }
+  CHECK(loads == 2);
+}
+
+TEST_CASE("forwarding a repeated load reaches the same interpreted result",
+          "[passes][local][load-forward][oracle]") {
+  Fixture f;
+  // x2 = load(0x8000) + load(0x8000): both reads must see the seeded value,
+  // with or without forwarding.
+  const ExprId address = f.constant(0x8000);
+  const ValueId first = f.function.appendLoad(f.block, 0x1000, Type::integer(64), address);
+  const ValueId second = f.function.appendLoad(f.block, 0x1004, Type::integer(64), address);
+  f.write(f.x2, f.function.binary(ExprOp::Add, f.function.valueRef(first),
+                                  f.function.valueRef(second)));
+  f.finish();
+
+  // forwardRedundantLoads removes the redundant load outright (see its own
+  // note on why that is safe here); nothing is left for dceBlock to find.
+  CHECK(xdec::passes::forwardRedundantLoads(f.function, f.block));
+  REQUIRE(verifiesClean(f.function));
+
+  il::Interpreter interp(f.function);
+  const std::array<std::byte, 8> seeded = {std::byte{0x11}, std::byte{0x22}, std::byte{0x33},
+                                           std::byte{0x44}, std::byte{0},    std::byte{0},
+                                           std::byte{0},    std::byte{0}};
+  interp.memory().seed(0x8000, seeded);
+  const il::ExecOutcome outcome = interp.runBlock(f.block);
+  REQUIRE(outcome.stop == il::ExecStop::Return);
+  CHECK(interp.readRegister(f.x2).lo == 0x44332211ull * 2);
+}
+
 TEST_CASE("local-simplify reaches the same machine state as the lifted block",
           "[passes][local][oracle]") {
   Fixture f;
@@ -275,6 +356,122 @@ TEST_CASE("local-simplify reaches the same machine state as the lifted block",
     REQUIRE(outcome.stop == il::ExecStop::Return);
     CHECK(interp.readRegister(f.x2) == expected(in0, in1));
   }
+}
+
+// Regression coverage for the mega-block hang (see eval/FINDINGS.md's
+// "mega-block local-simplify" note): a straight-line accumulate chain long
+// enough to reproduce the growth these transforms used to choke on. Each
+// iteration writes `x0 = x0 + 1` off an unknown entry value (unfoldable, so
+// algebra/fold cannot collapse the chain away), which is exactly the shape
+// that made copyPropagateBlock embed an ever-larger substituted tree into
+// every following write before it capped how big a tracked value may grow.
+
+/// Appends `iterations` of `x0 = x0 + 1` to `f`'s block, starting from a
+/// fresh read of `x0` so the chain is not foldable to a single constant.
+void appendAccumulateChain(Fixture& f, unsigned iterations) {
+  for (unsigned i = 0; i < iterations; ++i) {
+    f.write(f.x0, f.function.binary(ExprOp::Add, f.read(f.x0), f.constant(1)));
+  }
+}
+
+TEST_CASE("a long straight-line accumulate chain stays fast and correct",
+          "[passes][local][oracle][mega-block]") {
+  Fixture f;
+  constexpr unsigned kIterations = 4000;  // well under kMegaBlockOpThreshold
+  appendAccumulateChain(f, kIterations);
+  f.finish();
+
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+  xdec::pass::Manager manager;
+  const auto started = std::chrono::steady_clock::now();
+  auto ran = manager.runTo(f.function, registry, Maturity::Local);
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+  const std::string error = ran ? std::string{} : ran.error().format();
+  INFO(error);
+  REQUIRE(ran);
+  REQUIRE(verifiesClean(f.function));
+  // A regression back to the unbounded substitution this pass used to do
+  // turns this into minutes; a generous bound still catches that while
+  // leaving room for slow CI machines.
+  CHECK(elapsedMs < 5000);
+
+  il::Interpreter interp(f.function);
+  interp.writeRegister(f.x0, ConcreteValue{10, 0});
+  const il::ExecOutcome outcome = interp.runBlock(f.function.entryBlock());
+  REQUIRE(outcome.stop == il::ExecStop::Return);
+  CHECK(interp.readRegister(f.x0).lo == 10 + kIterations);
+}
+
+TEST_CASE("a block past the mega-block threshold skips copy/load but still "
+          "interprets correctly",
+          "[passes][local][oracle][mega-block]") {
+  Fixture f;
+  // Twice kMegaBlockOpThreshold ops (2 per iteration), so local-simplify's
+  // block-size guard actually fires and copyPropagateBlock/
+  // forwardRedundantLoads are skipped for this block.
+  constexpr unsigned kIterations = xdec::passes::kMegaBlockOpThreshold;
+  appendAccumulateChain(f, kIterations);
+  f.finish();
+  REQUIRE(f.function.block(f.block).ops.size() > xdec::passes::kMegaBlockOpThreshold);
+
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+  xdec::pass::Manager manager;
+  const auto started = std::chrono::steady_clock::now();
+  auto ran = manager.runTo(f.function, registry, Maturity::Local);
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+  const std::string error = ran ? std::string{} : ran.error().format();
+  INFO(error);
+  REQUIRE(ran);
+  REQUIRE(verifiesClean(f.function));
+  CHECK(elapsedMs < 5000);
+
+  // Skipping copyprop/load-forwarding never changes what the block computes:
+  // the raw ReadReg/WriteReg chain is still correct without them.
+  il::Interpreter interp(f.function);
+  interp.writeRegister(f.x0, ConcreteValue{10, 0});
+  const il::ExecOutcome outcome = interp.runBlock(f.function.entryBlock());
+  REQUIRE(outcome.stop == il::ExecStop::Return);
+  CHECK(interp.readRegister(f.x0).lo == 10 + kIterations);
+}
+
+TEST_CASE("dce stays correct and fast when many ops share one subexpression",
+          "[passes][local][dce][mega-block]") {
+  Fixture f;
+  // One shared value (x0+x1) referenced as an operand by many independent
+  // writes: collectValueUses used to re-walk this subtree from scratch for
+  // every one of those references, which is combinatorial rather than
+  // redundant once algebra/copy-prop share subtrees this way on a real
+  // MBA-heavy block (see eval/FINDINGS.md's "mega-block local-simplify"
+  // note). Only the last write survives DCE; all the others are dead
+  // overwrites of the same register.
+  constexpr unsigned kWrites = 4000;
+  const ExprId shared = f.function.binary(ExprOp::Add, f.read(f.x0), f.read(f.x1));
+  for (unsigned i = 0; i < kWrites; ++i) {
+    f.write(f.x2, f.function.binary(ExprOp::Xor, shared, f.constant(i)));
+  }
+  f.finish();
+
+  const auto started = std::chrono::steady_clock::now();
+  const bool changed = xdec::passes::dceBlock(f.function, f.block);
+  const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count();
+  REQUIRE(verifiesClean(f.function));
+  CHECK(elapsedMs < 5000);
+  CHECK(changed);
+
+  unsigned writesToX2 = 0;
+  for (const il::OpId opId : f.function.block(f.block).ops) {
+    const il::Op& op = f.function.op(opId);
+    writesToX2 += (op.code == il::OpCode::WriteReg && op.reg() == f.x2) ? 1u : 0u;
+  }
+  CHECK(writesToX2 == 1);
 }
 
 }  // namespace

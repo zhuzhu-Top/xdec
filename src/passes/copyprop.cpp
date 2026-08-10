@@ -2,11 +2,43 @@
 #include "transform.h"
 
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace xdec::passes {
 
 namespace {
+
+/// Past this many distinct nodes, a tracked register's contents are not worth
+/// tracking anymore: substituting it into the *next* write re-embeds and
+/// re-interns the whole thing, so straight-line code that keeps combining
+/// already-large values compounds the cost of every following op until the
+/// block is unusable (the mega-block hang -- see eval/FINDINGS.md's
+/// "mega-block local-simplify" note). Capping the tracked size bounds that
+/// compounding; past the cap a write just clobbers, exactly like the
+/// non-zero-extending partial write case below.
+constexpr std::size_t kMaxTrackedExprNodes = 64;
+
+/// Distinct-node count of the DAG rooted at `id`, stopping as soon as it is
+/// clear the count exceeds `limit` -- callers only need to know "small enough
+/// to keep chaining" vs. not, never the exact size once it is not.
+[[nodiscard]] std::size_t boundedExprNodeCount(const il::Function& function, il::ExprId id,
+                                               std::size_t limit) {
+  std::unordered_set<uint32_t> visited;
+  std::vector<il::ExprId> stack{id};
+  while (!stack.empty() && visited.size() <= limit) {
+    const il::ExprId current = stack.back();
+    stack.pop_back();
+    if (!visited.insert(current.index()).second) {
+      continue;
+    }
+    const il::Expr& expr = function.expr(current);
+    for (unsigned index = 0; index < expr.operandCount; ++index) {
+      stack.push_back(expr.operands[index]);
+    }
+  }
+  return visited.size();
+}
 
 /// One block's propagation state: the expression each root register currently
 /// holds, when known.
@@ -42,6 +74,10 @@ struct BlockProp {
       return;  // the write is discarded; the op itself goes away separately
     }
     const il::RegId root = function.registers().rootOf(reg);
+    if (boundedExprNodeCount(function, value, kMaxTrackedExprNodes) > kMaxTrackedExprNodes) {
+      contents.erase(root);
+      return;
+    }
     if (!info.isSubRegister()) {
       contents[root] = value;
       return;

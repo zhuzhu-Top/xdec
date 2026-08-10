@@ -169,6 +169,53 @@ TEST_CASE("a budget one round short of the fixpoint extends itself",
   CHECK(result->function->op(source.ops.back()).code == il::OpCode::Branch);
 }
 
+// The shape the discovery-size warnings exist to name, made small enough to
+// assert on directly: two indirect branches that are both reachable without
+// any discovery at all (no fence needed -- see DriverOptions::maxTotalEntries
+// for why the cap is unconditional rather than fence-gated), each naming a
+// fresh address in the very first round. A real dispatcher chain never hands
+// over two brand-new entries at once like this; an entry that is not really a
+// function start is exactly the shape that would.
+TEST_CASE("a run capped mid-round on total entries still finishes",
+          "[decompile][driver]") {
+  FlatMemory memory;
+  memory.putInsn(0x1000, 0xB40000C0);  // cbz x0, #0x1018
+  memory.putInsn(0x1004, 0xB0000008);  // adrp x8, #0x2000 (from 0x1004's page)
+  memory.putInsn(0x1008, 0xF9400108);  // ldr x8, [x8]
+  memory.putInsn(0x100c, 0xD61F0100);  // br x8
+  memory.putInsn(0x1018, 0xD0000009);  // adrp x9, #0x3000 (from 0x1018's page)
+  memory.putInsn(0x101c, 0xF9400129);  // ldr x9, [x9]
+  memory.putInsn(0x1020, 0xD61F0120);  // br x9
+  memory.putQword(0x2000, 0x5000);
+  memory.putQword(0x3000, 0x5010);
+  memory.putInsn(0x5000, 0xD65F03C0);  // ret
+  memory.putInsn(0x5010, 0xD65F03C0);  // ret
+
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+
+  xdec::decompile::DriverOptions options;
+  // `known` starts at {0x1000}; this admits exactly one of the round's two
+  // simultaneous discoveries before the wall bites, deterministically (the
+  // set the driver walks them in is address-ordered) admitting the lower one.
+  options.maxTotalEntries = 2;
+  // The other branch's target is now permanently uncapped-for, so it never
+  // resolves -- sealing is what turns that into a hole in the output instead
+  // of the honest failure tests/decompile/test_driver.cpp's own "pointing
+  // nowhere" case checks for.
+  options.sealUnresolvedBranches = true;
+  auto result = xdec::decompile::decompile(engine(), memory.reader(), 0x1000, registry,
+                                           options);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+
+  REQUIRE(result->report.extraEntries.size() == 1);
+  CHECK(result->report.extraEntries[0] == 0x5000);
+  CHECK(result->function->blockAt(0x5000).valid());
+  CHECK_FALSE(result->function->blockAt(0x5010).valid());
+}
+
 TEST_CASE("a table slot pointing nowhere stays unresolved and fails honestly",
           "[decompile][driver]") {
   const FlatMemory memory = program(0x9999);  // unmapped

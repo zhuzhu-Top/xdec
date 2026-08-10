@@ -70,4 +70,32 @@ namespace xdec::passes {
 [[nodiscard]] il::ExprId matchShiftedCompare(il::Function& function,
                                              const il::Expr& cmpExpr);
 
+/// The `cmn C; cset hi` errno idiom, once `fold.cpp`'s lazy-flag folding has
+/// already turned it into pure comparisons: `(a+C <u a) & (a+C != 0)` is
+/// AArch64's `UnsignedGreater` condition over an `Add` flag bundle
+/// (`rewriteAdd`'s own case), spelling "the unsigned add of `a` and `C`
+/// overflows, and does not land exactly on zero" — which is true exactly when
+/// `a` (unsigned) is strictly greater than `-C`. Folds to that one comparison.
+/// `andExpr` is the And node; `C` must be a nonzero constant so `-C` is a
+/// meaningful bound (a zero addend can never overflow, and the rule does not
+/// need to fire there — the And already simplifies away on its own).
+[[nodiscard]] il::ExprId matchCarryCompare(il::Function& function, const il::Expr& andExpr);
+
+/// The `ls` (UnsignedLessEqual) mirror of `matchCarryCompare`: `(a <=u a+C) |
+/// (a+C == 0)` is the negated overflow test, folding to `a <=u -C` instead.
+/// `orExpr` is the Or node.
+[[nodiscard]] il::ExprId matchCarryCompareOr(il::Function& function, const il::Expr& orExpr);
+
+/// `(a + (k1 - x)) == (k2 - x)` is `a == (k2 - k1)`, and the same for `!=`:
+/// subtracting the identical `x` from both sides of an equality cancels it,
+/// whatever `x` is. An obfuscator's opaque predicate leans on exactly this to
+/// hide a fixed comparison behind a shared in-flight value -- a loop counter,
+/// a decrypted dispatcher state -- with `k1` and `k2` picked to look unrelated
+/// on their own. Not sound for an ordered comparison: which way `a <u b`
+/// points can change once the same `x` is subtracted from both, because the
+/// two sides wrap around zero independently. `cmpExpr` is the CmpEq/CmpNe
+/// node.
+[[nodiscard]] il::ExprId matchCancelledSubtrahend(il::Function& function,
+                                                  const il::Expr& cmpExpr);
+
 }  // namespace xdec::passes

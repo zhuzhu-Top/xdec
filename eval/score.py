@@ -143,13 +143,28 @@ def measure(body: str) -> dict[str, int]:
         # emission style, tracked separately so a change in style is visible.
         "conditionals": ifs + ternaries,
         "loops_while": len(re.findall(r"\bwhile\s*\(", body)),
+        # An OLLVM hub loop's own shape once the structurizer recognizes one:
+        # tracked apart from loops_while because a plain `while (cond)` proves
+        # nothing about a dispatcher, but a hub wrapped as `while (true)` is
+        # exactly the skeleton bc_lib's optimization plan is chasing.
+        "loops_while_true": len(re.findall(r"\bwhile\s*\(\s*true\s*\)", body)),
         "loops_do": len(re.findall(r"\bdo\s*\{", body)),
         "loops_for": len(re.findall(r"\bfor\s*\(", body)),
         "returns": len(re.findall(r"\breturn\b", body)),
         "undef": body.count("/*undef*/"),
         "unnamed": body.count("/*unnamed-value"),
         "dead": body.count("/*dead-value*/"),
-        "intrinsics": len(re.findall(r"__xdec_", body)),
+        # Names an embedder still has to supply a definition for: the
+        # `xdec_`-prefixed stubs (clz/ctz/mulhi/brev/flagbit/float/
+        # flagcond_stub, syscall, intrin). Rotate, byte swap, population
+        # count and the overflow-exact conditions are fully defined in
+        # xdec_helpers.h now, so they no longer count here even though some
+        # of them used to carry an `__xdec_` name -- and the `#include
+        # "xdec_helpers.h"` line itself is excluded, or every body that
+        # merely used one of those would count as an intrinsic too.
+        "intrinsics": len(
+            [m for m in re.findall(r"xdec_\w+", body) if m != "xdec_helpers"]
+        ),
         # Computed branches that resolution could not answer and --allow-unresolved
         # sealed as opaque. Each one is a hole in the CFG the reader has to fill
         # by hand, so it is the number that says how far short of the function
@@ -162,9 +177,25 @@ def measure(body: str) -> dict[str, int]:
         "svc_intrinsics": len(re.findall(r"__xdec_intrin_\w*\.?svc", body)),
         "syscall_named": len(re.findall(r"\bsys_[a-z_0-9]+\s*\(", body)),
         "syscall_raw": len(re.findall(r"__xdec_syscall\s*\(", body)),
+        # A direct call still printed as a numbered address rather than a name:
+        # exactly the failure import resolution exists to remove (see
+        # docs/10-import-resolution.md), counted so a case can hold a PLT/GOT
+        # call to zero of these instead of allowing an unnamed `sub_<va>`.
+        "plt_sub_calls": len(re.findall(r"\bsub_[0-9a-f]+\s*\(", body)),
+        "import_comments": len(re.findall(r"/\* import: \w+ \*/", body)),
         # Field access through a recovered struct type, as opposed to the
         # `*(int32_t*)(p + 8)` a decompiler writes when it has no type.
         "struct_arrow": body.count("->"),
+        # A `blr`/`br` dispatch resolution could not turn into a CFG edge, so
+        # it stayed a function-pointer call annotated with how the target is
+        # computed (see analysis/call_target.h). This is bc_lib's main OLLVM
+        # shape: each one is a handler transition the reader still has to
+        # follow through a call instead of a goto.
+        "encrypted_dispatch_calls": body.count("(encrypted dispatch table)"),
+        # Whether variable recovery promoted a stack slot to `state` (see
+        # analysis/variables.cpp's dispatcher-state heuristic) -- 0 or 1, not
+        # a count, since at most one slot per function is ever promoted.
+        "state_named": 1 if re.search(r"\bstate;", body) else 0,
     }
 
 
@@ -238,6 +269,8 @@ def check_case(
 
     if expect.get("max_gotos") is not None and m["gotos"] > expect["max_gotos"]:
         issues.append(f"gotos={m['gotos']} > max {expect['max_gotos']}")
+    if expect.get("max_lines") is not None and m["lines"] > expect["max_lines"]:
+        issues.append(f"lines={m['lines']} > max {expect['max_lines']}")
     if expect.get("max_ternaries") is not None and m["ternaries"] > expect["max_ternaries"]:
         issues.append(f"ternaries={m['ternaries']} > max {expect['max_ternaries']}")
     if expect.get("min_ifs") is not None and m["ifs"] < expect["min_ifs"]:
@@ -284,8 +317,36 @@ def check_case(
         limit = expect["max_svc_intrinsics"]
         if m["svc_intrinsics"] > limit:
             issues.append(f"svc_intrinsics={m['svc_intrinsics']} > max {limit}")
+    if expect.get("max_plt_sub_calls") is not None:
+        limit = expect["max_plt_sub_calls"]
+        if m["plt_sub_calls"] > limit:
+            issues.append(f"plt_sub_calls={m['plt_sub_calls']} > max {limit}")
+    if (
+        expect.get("min_import_comments") is not None
+        and m["import_comments"] < expect["min_import_comments"]
+    ):
+        issues.append(
+            f"import_comments={m['import_comments']} < min {expect['min_import_comments']}"
+        )
     if expect.get("min_struct_arrow") is not None and m["struct_arrow"] < expect["min_struct_arrow"]:
         issues.append(f"struct_arrow={m['struct_arrow']} < min {expect['min_struct_arrow']}")
+    if (
+        expect.get("min_loops_while_true") is not None
+        and m["loops_while_true"] < expect["min_loops_while_true"]
+    ):
+        issues.append(
+            f"loops_while_true={m['loops_while_true']} < min {expect['min_loops_while_true']}"
+        )
+    if (
+        expect.get("max_encrypted_dispatch_calls") is not None
+        and m["encrypted_dispatch_calls"] > expect["max_encrypted_dispatch_calls"]
+    ):
+        issues.append(
+            f"encrypted_dispatch_calls={m['encrypted_dispatch_calls']} > max "
+            f"{expect['max_encrypted_dispatch_calls']}"
+        )
+    if expect.get("min_state_named") is not None and m["state_named"] < expect["min_state_named"]:
+        issues.append(f"state_named={m['state_named']} < min {expect['min_state_named']}")
 
     if "signature" in expect:
         issues += check_signature(returns, params, expect["signature"])

@@ -21,6 +21,7 @@ body, and never emit C that does not compile.
 | `.hdecl` parser | read a C header subset without a C compiler | `types/parse.h` |
 | `TypeBinder` | which declaration, if any, describes *this* address | `types/binder.h` |
 | apply-types | how many arguments does this call really have | `passes/apply_types.h` |
+| `TypedVariables` | what does a call or `svc` site's own signature say about the values that fill it | `analysis/typed_variables.h` |
 | emitter | the signature, the field names, the definitions to emit | `src/emit/c_context.cpp` |
 
 ## The database
@@ -129,6 +130,78 @@ This is also why `pass::Context` carries a `NameAt` resolver and a
 without depending on the types library, so `pass::SymbolName` mirrors
 `types::BoundName` across that boundary.
 
+## `TypedVariables`: propagating a call's own signature backward
+
+Everything above answers a question at the *call site*: what does the header
+say the callee takes, and how many registers does that trim the call to. It
+says nothing about the value on the other end of the call — the argument
+register itself stays a plain `uint64_t` wherever else the function reads it,
+and the syscall table's `struct timeval*` for `gettimeofday` never reaches
+the stack slot the address actually points at. `analysis::TypedVariables`
+(`analysis/typed_variables.h`) is the piece that carries a signature's
+evidence from where it is known — the call — to where it would change what
+gets declared: the argument's `EntryReg`, the stack slot behind `sp + delta`,
+a phi that merges several definitions, or the call's own result value.
+
+It runs as a post-pipeline analysis, the same shape as `StackFrame` and
+`VariableTable`, rather than as an IL pass: a `TypeId` has no business inside
+the pure expression pool (see `types/type.h`), and its only consumers —
+`VariableTable::applyImportedTypes` and the emitter's `CContext` — already run
+after the pass manager, not inside it. Four sources feed it, all through the
+same `types::TypeBinder::consistent` gate that decides whether an imported
+type may stand in for what inference proved:
+
+- a **direct call or a call through a typed function-pointer parameter** —
+  the same two shapes `apply-types` binds against (`calleeOf`, mirrored
+  rather than shared, so `analysis` never depends on `passes`);
+- a **call through a GOT/import slot**: the target is not a constant the
+  binder can look up, but the loader value the slot resolves to names an
+  import (`calleeThroughImportSlot`), which is what types a call to `write`
+  or `malloc` reached through the PLT in a real PIE `.so`, not just one
+  resolved to a bare address;
+- a **value loaded from a GOT/import slot naming a *data* symbol**: the slot
+  holds the address of an `extern` global's own object, so the loaded value
+  is a pointer to whatever the header declared under that name
+  (`globalPointerType`) — see Known gaps for what this does and does not fix;
+- the **syscall table**, once `SyscallTable::resolveTypes` has turned its
+  JSON argument spellings into `TypeId`s against whatever header was
+  imported (falling back to the bare string when none was).
+
+From each typed call, a small use-def walker traces every argument and
+result backward: an `EntryReg` names an argument variable directly; `sp +
+delta` records a stack-frame slot (through one pointer, since a syscall's
+`struct timeval*` parameter describes the slot's *contents*, not the address
+handed to it); a `Select` or a loop-carried `Phi` visits every incoming
+value; anything else — arithmetic, a load, an opaque previous result — is
+left alone rather than guessed at, the same evidence-not-instruction rule
+`TypeBinder` states elsewhere. `VariableTable::applyImportedTypes` then
+layers this onto the `CType`-inferred variables (an `importedType` beside
+each argument, local, and temp) and, where a stack slot's evidence is a
+complete struct whose size matches the slot's own access width, promotes it
+from an anonymous `uint64_t var_50` to a named `struct timeval var_50` —
+folding any locals that turn out to be exactly one of its fields
+(`var_58` becomes `var_50.tv_usec`, not a second disconnected variable).
+
+A call's own result and a function's own return type follow the same
+evidence: a syscall result temp declares at the callee's typed return
+(`int32_t`, not the raw 64-bit register), and the enclosing function's own
+`ret` is retyped to match when *every* reachable return traces to the same
+already-typed value — never when one path returns a typed call's result and
+another returns something else untraced, since that would let the presence
+of evidence on one path override its absence on another.
+
+**Cross-function reuse (optional).** `summaryOf(variables, typed)` exports a
+finished function's own recovered signature — parameter types read off
+`VariableTable`'s `a0, a1, ...` naming, return type from `TypedVariables`
+itself — as a `CalleeSummary`, keyed by entry address into a
+`CalleeSummaries` map `TypedVariables::recover` also accepts as input. A
+caller decompiling more than one function from the same binary in one run
+can feed a finished function's summary back in for whichever later functions
+call it, which is what types a call to a local helper no header names. Today
+this is a building block, not a batch mode: the CLI still decompiles one
+function per invocation, so `summaries` is always empty and costs nothing
+until something drives it.
+
 ## What the reader sees
 
 **Signatures.** The imported prototype replaces the inferred one when every
@@ -190,11 +263,19 @@ only on a header's authority.
 
 ## Known gaps
 
-- **Globals through the GOT.** The slot is named from the relocation
-  (`ptr_g_eval_stats`) in both modes, but not typed. Typing it requires
-  declaring the slot as `EvalStats*` and simultaneously making the load through
-  it stop being a dereference; doing one without the other stops the output from
-  compiling. `eval_types_extern_global` records the current behaviour.
+- **Globals through the GOT: the slot's own declaration.** The slot is still
+  named from the relocation (`ptr_g_eval_stats`) and still declared
+  `uint8_t[]`, in both modes. Typing the *slot* requires declaring it as
+  `EvalStats*` and simultaneously making the load through it stop being a
+  dereference; doing one without the other stops the output from compiling,
+  so it is not attempted. What `TypedVariables::globalPointerType` *does* type
+  is the value the first load produces — if some other declaration in the
+  same header already spells `EvalStats*` (a function taking one, say), the
+  loaded temp is recognized as that pointer and a *second-level* field access
+  through it prints as a field rather than a raw offset. `eval_types.hdecl`
+  never spells `EvalStats*` anywhere else, so `eval_types_extern_global`
+  still records today's behaviour unchanged — this is a real but narrow gap,
+  not the whole feature.
 - **Structs by value** are reported in a comment, never adopted.
 - **Enum case labels** stay numeric. The switch is over a value, not over a
   declaration, and rewriting `0x1` as `EVAL_KIND_SUM` is a claim about which
@@ -212,4 +293,19 @@ imports, so the test cannot drift from the ground truth. Every case is scored in
 both modes (`run.ps1` / `run.ps1 -Typed`): the baseline expectation says what
 inference proves on its own, the typed one says what the header adds. Unit
 tests: `tests/types/test_hdecl_parser.cpp`, `tests/types/test_type_database.cpp`,
-`tests/passes/test_apply_types.cpp`, `tests/emit/test_c_types.cpp`.
+`tests/types/test_binder.cpp`, `tests/passes/test_apply_types.cpp` (including
+its GOT/import-slot cases), `tests/emit/test_c_types.cpp`.
+
+`TypedVariables` itself: `tests/analysis/test_typed_variables.cpp` (backward
+propagation into arguments, stack slots and phis; GOT calls and GOT-loaded
+globals; struct promotion via `VariableTable::applyImportedTypes`; the
+`summaryOf`/`CalleeSummaries` round trip) and `tests/emit/test_c_typed_return.cpp`
+(a call or `svc` result's own declared width; a function's own return type
+following an agreeing typed result, and staying put when the body
+disagrees). `samples/manifest.json`'s `sample_mega_dispatcher` — the
+`sub_199214`-shaped case this whole plan started from — decompiles cleanly
+with `--types android-ndk` added to its own `decompile_args` (not part of
+`samples/run.ps1`'s default flags, which score dispatcher-resolution shape
+rather than typing) and shows the promoted `struct timeval var_50`, the
+syscall result declared `int32_t`, and named `.tv_sec`/`.tv_usec` field
+access in place of the anonymous stack loads this plan opened with.

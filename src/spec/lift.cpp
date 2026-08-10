@@ -15,6 +15,8 @@
 #include <map>
 #include <set>
 
+#include "xdec/analysis/noreturn.h"
+
 namespace xdec::spec {
 
 Result<LiftedBlock> liftBasicBlock(const SpecEngine& engine,
@@ -122,8 +124,9 @@ namespace {
 /// liftBlocksInto (see the file header for the split).
 class Discovery {
  public:
-  Discovery(const SpecEngine& engine, const ByteReader& reader, il::Function& function)
-      : engine_(engine), reader_(reader), function_(function) {
+  Discovery(const SpecEngine& engine, const ByteReader& reader, il::Function& function,
+            const MemoryFacts& facts)
+      : engine_(engine), reader_(reader), function_(function), facts_(facts) {
     const SpecProgram& program = engine_.program();
     width_ = program.insnWidth / 8;
 
@@ -178,6 +181,15 @@ class Discovery {
             engine_.decode(std::span<const std::byte>{storage}.first(width_), at);
         const InsnFlow flow = engine_.probe(insn);
         at += width_;
+        if (flow.calls && flow.callTargetKnown &&
+            analysis::isNoreturnCallTarget(flow.callTarget, reader_, facts_)) {
+          // A call that is known to never return ends the block right here:
+          // its fall-through is not more of this function, it is whatever
+          // code happens to sit next in the image (see analysis/noreturn.h).
+          // Leaving it unscanned is what a real return address would also
+          // leave unscanned; nothing downstream needs to know why.
+          break;
+        }
         if (!flow.terminates()) {
           continue;
         }
@@ -262,10 +274,18 @@ class Discovery {
       const il::Block& built = function_.block(block);
       if (built.ops.empty() || !function_.op(built.ops.back()).isTerminator()) {
         const il::BlockId next = site.blockAt(end);
+        const uint64_t attributedTo = end >= width_ ? end - width_ : end;
         if (next.valid() && next != block) {
           // Attributed to the last instruction, like the fall-through edges
           // the engine itself emits.
-          function_.appendBranch(block, end >= width_ ? end - width_ : end, next);
+          function_.appendBranch(block, attributedTo, next);
+        } else {
+          // No block picks up where this one stopped: either the scan ended
+          // it on a known-noreturn call (see the check in scan() above) or it
+          // ran off mapped memory mid-block. Either way nothing legitimately
+          // follows, so the block gets a real terminator instead of silently
+          // trailing off without one.
+          function_.appendUnreachable(block, attributedTo);
         }
       }
     }
@@ -292,6 +312,7 @@ class Discovery {
   const SpecEngine& engine_;
   const ByteReader& reader_;
   il::Function& function_;
+  const MemoryFacts& facts_;
   unsigned width_ = 0;
 
   std::set<uint64_t> leaders_;
@@ -305,12 +326,12 @@ class Discovery {
 }  // namespace
 
 Result<LiftedFunction> liftFunction(const SpecEngine& engine, const ByteReader& reader,
-                                    uint64_t entry) {
+                                    uint64_t entry, const MemoryFacts& facts) {
   auto function =
       std::make_unique<il::Function>(engine.program().arch, engine.program().registers, entry);
   function->setMaturity(il::Maturity::Lifted);
 
-  Discovery discovery(engine, reader, *function);
+  Discovery discovery(engine, reader, *function, facts);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }
@@ -334,8 +355,9 @@ Result<LiftedFunction> liftFunction(const SpecEngine& engine, const ByteReader& 
 
 Result<LiftBlocksResult> liftBlocksInto(il::Function& function, const SpecEngine& engine,
                                         const ByteReader& reader,
-                                        std::span<const uint64_t> entries) {
-  Discovery discovery(engine, reader, function);
+                                        std::span<const uint64_t> entries,
+                                        const MemoryFacts& facts) {
+  Discovery discovery(engine, reader, function, facts);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }

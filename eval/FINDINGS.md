@@ -2,8 +2,12 @@
 
 用 Android NDK 把已知 C 源码编译成 `arm64-v8a` 动态库，再对 `eval_*` 符号逐个反编译，与 manifest 期望对比。
 
-**当前：baseline 36/36、typed 36/36 通过**（2026-08-05）。首次跑分 0/20，中途 7/20，
-基础语料修完 20/20，之后加入 syscall（6）、types（8）、tailcall（2）三类共 36 个函数。  
+**当前：baseline 96/96、typed 36/36 通过**（2026-08-06）。首次跑分 0/20，中途 7/20，
+基础语料修完 20/20，之后加入 syscall（6）、types（8）、tailcall（2）三类共 36 个函数——这 36 个
+两种模式都跑，是 typed 模式至今唯一的语料。2026-08-06 按「环境采集优先、零 CLI、一函数一 case」
+的方向扩到 96：新增的 60 个全部只标 `modes: ["baseline"]`，`--types`/`--syscall-table` 一律不加，
+靠 [`inferTargetProfile`](../src/binary/target_profile.cpp) 见到 AArch64 ELF 就自动挂
+`android-ndk` 类型 + `aarch64-linux` 系统调用表；typed 模式的原 36 个因此保持字节级不变。  
 基线分模式归档：`baseline.json` / `typed_baseline.json`，`run.ps1 [-Typed] -UpdateBaseline` 更新，
 `run.ps1 -Baseline <file>` 与指定基线对比。
 
@@ -49,14 +53,20 @@ cd d:\funtune\xdec\eval
 | signed | sign_extend_chain, cmp_signed | 有符号比较 |
 | nested | nested | 嵌套控制流 |
 | control | early_return, state_machine | 多 return / 状态机 |
-| syscall | svc_write, svc_gettimeofday, svc_getpid, svc_unknown, svc_nr_from_arg, svc_errno | `svc` 语义恢复：号码常量折叠、按真实 arity 裁参、未知号码降级、`-errno` 判定 |
+| syscall | svc_write, svc_gettimeofday, svc_getpid, svc_unknown, svc_nr_from_arg, svc_errno（原 6 个，两模式共测）+ svc_openat, svc_read, svc_close, svc_mmap, svc_clock_gettime, svc_ptrace, svc_getuid, svc_nanosleep, svc_gettimeofday_errno, svc_gettimeofday_libc（新 10 个，baseline only） | `svc` 语义恢复：号码常量折叠、按真实 arity 裁参、未知号码降级、`-errno` 判定；新增的十个把号码表覆盖到 openat/read/close/mmap/clock_gettime/ptrace/getuid/nanosleep，外加 `gettimeofday_errno`——`sub_199214` 那种 errno-store 语法糖，源头这次换成裸 `svc` 而不是 libc 调用，`gettimeofday_libc` 是同一操作走 libc 的对照组 |
+| env | property_get_model/sdk/serial, property_find, open_cmdline, read_maps/status/cpuinfo, access_root/data, readlink_exe, stat_libc, gettimeofday, clock_gettime, time, usleep, nanosleep, getpid, gettid, getuid, pthread_self, prctl, log_print/write, dlopen, dlsym, ptrace, syscall_getpid, mmap, getenv（30 个，baseline only） | 逆向里最常见的环境采集单函数调用：一个 case 只调一个 libc/API，逐个验证 PLT 桩解析、参数类型套用（`struct timeval*`、`struct stat*` 等）、`errno` 折叠不误伤 |
+| import | errno_call/fold/dispatch, stack_chk, abort, write_direct, got_indirect, snprintf, strlen, memcpy, strcmp, fopen（12 个，baseline only） | import 解析本身的机制：`errno` 折叠（含穿过一个真 `goto`+合并块的多分支形态）、`__stack_chk_fail`、直接 PLT 调用（非尾调用）、GOT 间接调用（非尾调用）、variadic 签名的天然限度 |
+| jni | find_class, get_object_class, get_method_id, call_object_method, call_int_method, new_string_utf, register_natives, exception_check（8 个，baseline only） | `JNIEnv` 虚表间接调用：`android-ndk.hdecl` 按真实 `jni.h`（ABI 自 1.2 冻结）登记了这 8 个成员的偏移，验证「基址解引用 + 固定偏移取函数指针 + `blr`」这条链路解得对，且不会被误判成尾调用（各 case 都在返回值上做了一次编译器无法证伪的哨兵比较，防止 `-O1` 把 `blr` 合并成 `br`） |
 | types | types_struct_arg, types_struct_field, types_enum_switch, types_typedef_chain, types_fn_ptr, types_return_struct, types_extern_global, types_void_ptr | 外部头文件类型导入：签名、字段名、枚举、typedef 链、函数指针 arity |
 | tailcall | tailcall_table, tailcall_import | 间接尾调用：经调用方指针数组、经 PLT/GOT 到别的模块（见 `docs/08-tailcall.md`） |
 
-源码：`corpus/source.c`、`corpus/source_syscall.c`（内联汇编 `svc`）、`corpus/source_types.c`、
-`corpus/source_tailcall.c`  
+源码：`corpus/source.c`、`corpus/source_syscall.c`（原 6 个 `svc` case，两模式共测）、
+`corpus/source_syscall_env.c`（新增 10 个 `svc` case，baseline only）、`corpus/source_env.c`、
+`corpus/source_import.c`、`corpus/source_jni.c`、`corpus/source_types.c`、`corpus/source_tailcall.c`  
 类型头：`corpus/types/eval_types.hdecl` —— 既是编译语料用的 C 头，也是反编译时 `--types` 导入的头，
-所以「真值」和「被测输入」不可能各自漂移。  
+所以「真值」和「被测输入」不可能各自漂移；`types/presets/android-ndk.hdecl` 同理，扩了
+`__system_property_get/find`、`getenv`、`readlink`、`stat`、`fopen` 系、以及真实布局的
+`struct JNINativeInterface`（8 个具名成员，其余按 `jni.h` 表序用等宽 `void*` 占位）。  
 期望：`manifest.json`
 
 ---
@@ -310,6 +320,47 @@ dispatcher 一解析开，合并点就出现「每个活寄存器一个 phi、�
 
 ---
 
+## 2026-08-06：环境采集优先扩容（36 → 96）
+
+按「启动参数尽可能少、case 尽可能多、优先环境采集」的方向分五个阶段把语料从 36 扩到 96，
+全部新 case 只标 `modes: ["baseline"]`，不新增任何 `decompile_args`，也没有往 typed 模式的
+`$TypedArgs` 里叠 `android-ndk`——原有 36 个 typed case 因此逐字节未变。
+
+- **Phase 0**：`android-ndk.hdecl` 补上 `__system_property_get/find`、`getenv`、`readlink`、
+  `stat`、`fopen` 系；`score.py` 加 `plt_sub_calls`/`max_plt_sub_calls` 和
+  `import_comments`/`min_import_comments` 两组指标，专门盯「PLT 桩解出来了没」。
+- **Phase 1**（`source_env.c`，30 个）：逆向里最常见的环境探针，一 case 一 API——系统属性、
+  `/proc` 与文件路径、时间/sleep、身份/线程、日志与 `dlopen`/`dlsym`、`ptrace`/裸
+  `syscall`/`mmap`。每个 case 都在调用结果上做一次真实运算（比较、算术）而非直接
+  `return call(...)`，否则 `-O1` 会把它折成尾调用，测的就变成 `recover-tailcall` 而不是
+  PLT 解析本身。
+- **Phase 2**（`source_import.c`，12 个）：import 解析机制本身——`errno` 折叠（含穿过一个真
+  `goto` 和共享合并块的多分支版本，对照 `docs/10-import-resolution.md` 里 `sub_199214` 的
+  形状）、`__stack_chk_fail`（为此在 `build.ps1` 全局开了 `-fstack-protector-strong`，验证过
+  不影响其余 case）、`abort`、非尾调用的直接 PLT 调用与 GOT 间接调用、`snprintf` 这类
+  variadic 签名的天然限度。
+- **Phase 3**（`source_syscall_env.c`，10 个）：裸 `svc` 覆盖到 `source_syscall.c` 原六个
+  之外的号码——`openat`（AArch64 没有裸 `open`，凡 `open` 落到内核都是这个号）、`read`、
+  `close`、`mmap`（六参数，验证 wrapper 链没有在 x0..x5 上漏参）、`clock_gettime`、`ptrace`、
+  `getuid`、`nanosleep`，以及旗舰 case `eval_svc_gettimeofday_errno`——`sub_199214` 的
+  errno-store 语法糖，这次源头换成裸 `svc` 而非 libc 调用，证明这条折叠对「值从系统调用直接来」
+  同样生效；`eval_svc_gettimeofday_libc` 是同一操作走 libc 的对照组，两者在 manifest 里相邻。
+- **Phase 4**（`source_jni.c`，8 个，优先级最低）：`JNIEnv` 虚表间接调用。没有真实 `jni.h`
+  可用（standalone NDK 工具链不带），所以 `source_jni.c` 自带一份本地类型定义，布局和
+  `android-ndk.hdecl` 新增的 `struct JNINativeInterface` 逐字节对齐——按真实 `jni.h` 表序
+  （ABI 自 1.2 冻结）用等宽 `void*` 占位，只给八个被测成员（`FindClass`=6/`0x30`、
+  `GetObjectClass`=31/`0xf8`、`GetMethodID`=33/`0x108`、`CallObjectMethod`=34/`0x110`、
+  `CallIntMethod`=49/`0x188`、`NewStringUTF`=167/`0x538`、`RegisterNatives`=215/`0x6b8`、
+  `ExceptionCheck`=228/`0x720`）具名。指针类返回值的 case 一开始都写成
+  `return x ? x : 0;`——语义上是恒等映射，`-O1` 认出来直接把 `blr` 折成 `br`，反而测成了
+  `recover-tailcall`；改成跟一个编译器无法证伪的哨兵比较（`(uintptr_t)x == (uintptr_t)-1`）
+  才稳定产出真正的间接调用。这批 case 不要求印出成员名——那需要 case 函数自己的签名被
+  某个 `--types` 头登记，而 zero-CLI 的 baseline 模式无从提供；这里锁的是偏移算术和间接调用
+  识别本身，`eval_jni.hdecl` 风格的具名调用留给以后接上 typed 模式再做。
+- **Phase 5**：`baseline.json` 用 `run.ps1 -UpdateBaseline` 重新生成（96/96），`typed_baseline.json`
+  未变（`run.ps1 -Typed` 仍 36/36 且 `fixed`/`regressed` 均为空），`xdec_tests.exe` 全量
+  455 个测试用例、121817 个断言在改动后仍然全过。
+
 ## 扩展语料
 
 在 `corpus/source*.c` 增加 `eval_*` 函数（`build.ps1` 按 `source*.c` 通配编译），
@@ -325,3 +376,330 @@ baseline 模式的数字；`svc` 计数与 `--types` 对签名的影响需要拿
 - 64 位乘法/highpart
 - 递归（fib）
 - setjmp/longjmp 边界
+
+## 2026-08-07：bc_lib OLLVM 反编译质量优化方案，Phase 0-5
+
+目标不是去混淆还原原始逻辑，是让 `afRDLog` 这类 OLLVM 平坦化函数的输出**完整、可审查**——
+state 变量、hub 循环、handler 分派看得出来。方案的 7 条主线（详见对话记录，未落盘为文件）
+分 Phase 0-5 实施，`samples/manifest.json` 的 `sample_afRDLog` 是每个 phase 都要跑一遍的 L2 门禁。
+
+### 结果总表（`sample_afRDLog` @ `0x841ac`，L2 baseline 见 `samples/baseline.json`）
+
+| 指标 | 方案起点（2026-08，见 `samples/manifest.json` 旧 `expect`） | Phase 0-5 后 | 说明 |
+|------|------|------|------|
+| 行数 | 10,770 | **8,207** | 主要来自声明分组（下） |
+| goto | 319 | 319 | 见下方「没动的地方」 |
+| switch | 2 | 2 | 同上 |
+| `/*undef*/` | 290（历史峰值；本次起点已是 16，Phase 1b 早前已落地） | 16 | 未再退化 |
+| encrypted dispatch call | 218（历史峰值；起点 80） | 80 | 运行时 base，见下 |
+| `state` 命名 | 正确 | 正确 | Phase 1a 已落地，本轮未改动 |
+| L0（96 eval）/ L1（libtarget 2 case） | 全过 | 全过 | 每个改动后都跑过一次 |
+
+### Phase 4：声明压缩 + 不透明谓词折叠 + switch 判别式注释
+
+**声明压缩**（`src/emit/c_printer.cpp`）：同类型的连续 `temp`/`tempNames`/`cseTemps` 声明
+合并到一行（每行最多 12 个名字），例如 `uint64_t t1, t2, t3;` 取代三行。这是本轮唯一移动了
+「行数」指标的改动：10,770 → 8,207（**-24%**）。
+
+**不透明谓词折叠**（新增 `algebra_idioms.cpp` 的 `matchCancelledSubtrahend`，接入
+`algebra.cpp::rewriteCompare`）：`(a + (k1 - x)) == (k2 - x)` 折成 `a == (k2 - k1)`，对 `!=`
+同理——减法里被减的 `x` 在等式两边严格相消，跟 `x` 是什么无关（对有序比较不成立：见
+`algebra_idioms.h` 里该函数自己的说明）。bc_lib 里这曾是 do-while 循环的判据本体：
+
+```c
+// 折叠前
+if (!(((t9 + (0x898048e0df683786 - t766)) == (0x898048e0df6837a1 - t766)))) { ... }
+// 折叠后
+if (!((t9 == 0x1b))) { ... }
+```
+
+行数指标没动（if 语句还是一行），但可读性是真实的——巨大的不相关常量消失了，循环判据变成
+一个能一眼看出边界的整数比较。71 处 `0x898048e0df683786` 常量的引用降到 29 处（还留着的是
+真正参与自增计算的，不是判据里的裸值）。回归测试：`tests/passes/test_algebra.cpp` →
+*algebra tier: a shared subtrahend cancels out of an equality*。
+
+**switch 判别式注释**（`src/emit/c_stmt.cpp::printSwitch`）：table-mode switch 的 case 标签
+本来只是表序数（`case 0:`），跟反汇编或图形视图对不上号，尤其是 `claimCaseBody` 把 handler
+内联进 case body 之后，序数对应哪个地址就无处可查。现在每个 table-mode case 都带上目标块地址：
+
+```c
+case 0: /* handler @0x1992ec */
+```
+
+### 没动的地方，以及为什么
+
+**goto/switch 没变**：afRDLog 的控制流是「多个分派点交织」的形态，不是单一 hub-and-spoke——
+多数 labeled block 有真实的多个前驱（`claimCaseBody` 正确拒绝内联），现有的 2 个 switch 已经是
+局部 compare-chain 的全部，不是平坦化的主干。Phase 3 的 hub 检测/`wrapAsLoop` 扩展对
+`sample_jni_onload`（单一 hub）有效（goto 6→5），对 afRDLog 无效——这不是本轮要修的缺口，
+是「多 hub 交织」需要更通用的分派检测，留给后续。
+
+**encrypted dispatch call 没变**：80 处里的 base 地址来自运行时解析的全局（写内存/GOT），
+`resolve_call.cpp` 的 `ImageEval` 只在整条链（base、index、编码目标、key）都能从**只读**内存
+证明时才静态求值——这是正确性要求，不是实现缺口，见 `tests/passes/test_resolve_call.cpp` 新增的
+*an encrypted dispatch table with a knowable base still resolves*（同形状但 base 可读时确实会解）。
+
+### Phase 5：driver discovery 硬上限
+
+`sub_627ac`（本方案最初发现的反面教材，见「afRDLog 回归」一节之前的分析）不是真函数入口，
+但没有 fence 时驱动会无差别地把发现的每个地址都当成新 entry 去 lift——第一轮就发现 1349 个，
+最终 44,786 行。Phase 0 已经给它加了「>512 个新地址且无 fence」的告警，但只是告警，仍会
+全部 lift。本轮加了 `DriverOptions::maxTotalEntries`（默认 512，与告警阈值同一个量级）：
+一旦本轮新地址会把累计 entry 数推过这个数，超出部分被跳过并降级告警（"hit the N-entry hard
+cap"），run 仍然完成——被跳过的分支永久留在未解析状态，最终 verify 阶段会因为大量 block
+不可达而诚实失败（`il/verify.cpp` 已有的 `unreachable from the entry` 检查，不是新逻辑）。
+
+`0x627ac` 实测：38,722 行降到 **586 行**（外加 exit 1——这是期望的：一个不是真函数入口的地址，
+现在快速诚实失败，而不是安静吐出四万行垂圾）。真实样本（afRDLog 只用 7 个 entry、
+`sample_jni_onload` 用 9 个）离 512 的上限有两个数量级的余量，不受影响——L0/L1/L2 全过。
+回归测试：`tests/decompile/test_driver.cpp` → *a run capped mid-round on total entries still
+finishes*（两个独立、都无需 discovery 就能触达的间接分支，同一轮各报一个新地址，验证上限
+准确只放行其中一个）。
+
+### 回归门禁
+
+`samples/manifest.json` 的 `sample_afRDLog` 阈值已按本轮实测收紧（`max_gotos` 340→330、
+`max_undef` 25→20、`max_unnamed` 5→4、`max_encrypted_dispatch_calls` 90→85），
+`samples/baseline.json` 已用 `-UpdateBaseline` 刷新。`eval/` 96 个 L0 case 与 `samples/` 的
+`sample_jni_onload`/`sample_mega_dispatcher`（L1）在每一步改动后都跑过，全程无回归；
+`xdec_tests.exe` 全量 459 个测试用例、131,054 个断言通过。
+
+## 2026-08-10：mega-block local-simplify hang（`bc_lib` `0x2a2428`）排查手册
+
+`0x2a2428` 是同一个 bc_lib 里另一段代码（用户经反偏移确认为核心算法的一部分），Binary Ninja
+能反编译，`xdec decompile`/`observe --to local`（及更高 maturity）却挂起数分钟到数十分钟，
+不产出任何 `.c`。这不是 discovery 爆炸类问题（对比 Phase 5 的 `sub_627ac`），排查方式也不同，
+记在这里备查。
+
+### 先确认不是 discovery/lift 问题
+
+```powershell
+xdec observe libsdk_bc_lib.so 0x2a2428 --rounds 1 --to lifted
+```
+
+若这一步在 1 秒内完成、`observe-2a2428/00-lifted.il` 里只有个位数 block（本例是 4 个），
+说明 lift 本身没问题——`0x2a2428..0x2a443c` 反汇编后 2055 条指令里只有 1 条分支
+（`b 0x2a52a4`），中间全是直线 MBA 运算，lift 把它们合成一个 ~5394-op 的巨大 basic block
+是**正确**的 CFG，不是切块失败。真正的问题在下一步。
+
+### 定位卡在哪个 pass、哪个子步骤
+
+```powershell
+$env:XDEC_LOG="pass=debug,local=debug,algebra=debug"
+xdec observe libsdk_bc_lib.so 0x2a2428 --rounds 1 --to local
+```
+
+三个类别配合看：
+
+| 类别 | 打印时机 | 用途 |
+|------|----------|------|
+| `pass=debug` | fixpoint pass 每轮迭代**完成后立即**打印（`manager.cpp`），单轮 ≥30s 额外 `WARN` | 判断卡在哪个 pass、第几轮迭代；`WARN` 直接给出 op 总数与最大单 block op 数 |
+| `local=debug` | `local-simplify` 每个子步骤（algebra/fold/flags/copy/loads/dce）**跑完立即**打印，≥256-op 的大 block 逐块打印 copy/loads/dce 耗时 | `local-simplify` 内部具体是哪一步（`local_simplify.cpp`） |
+| `algebra=debug` | `simplifyAlgebra` 每次调用打印 touched op 数、walk 次数、memo 命中、intern 次数、expr 池前后大小 | 判断是否是代数化简本身在膨胀表达式池（本例排除） |
+
+由于日志是子步骤**完成后**才打，hang 在某一步时，**最后一条日志就是上一个完成的步骤**，
+下一步没打印就是卡点。本例实测：
+
+```
+[debug pass]     local-simplify start 4 block(s) 5394 op(s) 6837 expr(s)
+[debug algebra] 1249 op(s) touched, 8895 simplify walk(s) (2059 memo hit(s)), 1242 intern(s), 6837 -> 8283 expr(s)
+[debug local]   algebra 3ms changed
+[debug local]   fold 1ms
+[debug local]   flags 1ms
+（10 分钟无更多输出 —— 卡在 b0 的 copyPropagateBlock）
+```
+
+`algebra`/`fold`/`flags` 全部 ≤4ms，说明代数化简与常量折叠不是瓶颈；下一步该打的
+`b0 @0x2a2428 ... op(s): copy ...ms` 始终没出现，说明卡在 `copyPropagateBlock`。
+
+### 用小规模入口做对照，确认复杂度曲线
+
+不用等大 block 跑完，从函数中段挑几个不同大小的入口分别计时，能看出复杂度是否超线性：
+
+```powershell
+foreach ($addr in @('0x2a4200','0x2a4100','0x2a4080')) {
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  xdec observe libsdk_bc_lib.so $addr --rounds 1 --to local | Out-Null
+  Write-Output "$addr -> $($sw.Elapsed.TotalSeconds)s"
+}
+```
+
+实测（同一份 bc_lib）：
+
+| 入口 op 数（约） | `local-simplify` 总耗时 |
+|------|------|
+| ~128 | 0.27s |
+| ~470 | 50s |
+| ~544 | 133s |
+| ~5394（完整 `0x2a2428`） | >10min（未收敛） |
+
+470→544 op（+16%）耗时从 50s 到 133s（+166%），远超线性，指向 `copyPropagateBlock`
+（[`copyprop.cpp`](../src/passes/copyprop.cpp)）对每个 op 的每个 operand 调用
+`ValueSubst::apply()` 做全树展开——直线代码里 subst 链随 op 数线性增长，每次展开
+都要重新走一遍累积的树，整体退化到 O(n²) 以上。`dceBlock`
+（[`dce.cpp`](../src/passes/dce.cpp)）对每个 op 做 `collectValueUses` 全块树遍历，
+同一类问题但量级较小（604 op 时 dce 758ms，copy 未到千级前不明显）。
+
+### 排查结论一览（判定树）
+
+1. `observe --to lifted` 秒级完成、block 数正常 → 排除 discovery/lift
+2. `pass=debug` 显示卡在哪个 pass 的第几轮迭代（若单轮 ≥30s 会自动 `WARN` 报最大 block
+   op 数，不用等 hang 完再猜）
+3. 若卡在 `local-simplify`：看 `local=debug` 最后一条子步骤日志，通常是 `copy` 或 `dce`
+4. 若卡在 `ssa-optimize`：看 `optimize=debug`（`ssa_optimize.cpp` 已有 flags/sccp/
+   algebra/phis/dce 五段计时，同样的判定法）
+5. 排除代数膨胀：`algebra=debug` 的 expr 池前后大小若没有数量级增长，说明不是规则
+   互相触发的化简爆炸，而是遍历算法本身的复杂度问题
+
+### 结论
+
+超大直线 MBA block（无内部分支，5000+ IL op）触发了 `local-simplify` 里 `copyprop`/`dce`
+两个 block-local 变换的超线性复杂度，这是**性能 bug**，不是这类输入本身反编译不出来——
+Binary Ninja 能处理同一段代码，说明它的等价变换没有这个复杂度陷阱。
+
+### 修复：快修 + 根治（2026-08-10 落地）
+
+**快修**（[`transform.h`](../src/passes/transform.h) 的 `kMegaBlockOpThreshold`，
+[`local_simplify.cpp`](../src/passes/local_simplify.cpp)）：block op 数超过阈值时，
+`local-simplify` 跳过该 block 的 `copyPropagateBlock`/`forwardRedundantLoads`，只保留
+`dceBlock`。这一项独立就把 `0x2a2428` 的 `local-simplify` 从 >10 分钟压到 20ms，是最先
+落地、验证问题定位是否准确的一步。
+
+**根治，两处独立的复杂度源**：
+
+1. **`copyprop.cpp` 的 `BlockProp::write`**：`copyPropagateBlock` 会把每次写寄存器时
+   完全替换过的表达式树整个记进 `contents`，下一次这个值被其它写用到时，又把这整棵树
+   嵌进新树里重新 `intern`——直线代码里这棵树跟着 op 数线性变大，是 O(n²) 的来源。修法是
+   `boundedExprNodeCount` 在 `write()` 时给树size封顶（`kMaxTrackedExprNodes = 64`），
+   超过阈值就放弃精确跟踪（等价于现有"不确定的部分写"分支，直接 `contents.erase`）——
+   丢的只是"跨越一个已经很大的中间值"的传播机会，正确性不受影响（未被内联的 Value 仍然
+   是 DAG 里合法的叶子，指向仍然存活的 ReadReg）。
+2. **`dce.cpp` 的 `collectValueUses` 与 `ssa_optimize.cpp` 的 `collectUsed`**：两处都是
+   对表达式 DAG 的递归遍历，只在碰到 `Value` 叶子时去重，同一个被多处引用的复合子表达式
+   （代数化简后极常见）会被从每个引用处重新完整遍历一次——DAG 越"钻石"，这个重复就越接近
+   组合爆炸而不是单纯冗余。修法是加一个按 `ExprId` 记的 `visitedExprs` 集合，进入非叶子
+   节点前先查重；因为表达式是无环的，先标记再递归是安全的（不会漏掉任何一次首次访问）。
+
+**效果**（`bc_lib` `0x2a2428`，参数一致，仅改这次修复涉及的四个文件）：
+
+| 阶段 | 之前 | 之后 |
+|------|------|------|
+| `local-simplify`（大 block skip 生效） | >10 分钟未收敛 | 20ms |
+| 完整 `xdec decompile ... 0x2a2428`（发现到 163 个额外 block，共 169 个） | 从未产出 | 4.8s，退出码 0，5595 行 C |
+| `copyPropagateBlock` 在原始 5394-op block 上单独跑（结构修后，不跳过） | （原来会是主因） | ~3-17ms/轮，且反而把 block 从 5394 op 精简到 993 op |
+
+结构修（size-capped copyprop + 记忆化 dce/collectUsed）落地后，`local-simplify` 已经能在
+不跳过 `copyPropagateBlock` 的情况下正常处理这个 block（见上表第三行），于是
+`kMegaBlockOpThreshold` 从"主要防线"降级为兜底 fuse，数值从最初的 512 上调到 16384——
+留给未跑过的更极端输入一层保险，而不再是日常路径依赖它。
+
+**回归**：`xdec_tests.exe` 462 个用例（新增 3 个覆盖直线累加链 + 跨 mega-block 阈值 +
+共享子表达式 DCE 的用例）、131,069 个断言全过；`eval/` baseline 96/96、typed 36/36 无回归；
+`samples/` 的 `sample_jni_onload`/`sample_mega_dispatcher`/`sample_afRDLog` 无回归，新增
+`sample_core_mba`（`0x2a2428`，L2，`straight-mba` 类别）4/4 通过，基线已用 `-UpdateBaseline`
+刷新。
+
+## 2026-08-10：dispatcher handler 内联之后的 `tN = tM` 拷贝噪声（Live Register Frame，F0-F4）
+
+162 个 case 内联进 `switch`、共享 tail 收敛成一份 epilogue 之后，`0x2a2428` 仍有
+`t8 = t0; ...; t15 = t7;`（case 末尾）与 `t0 = t8; ...; t7 = t15;`（epilogue 内）两种
+八行一组的拷贝，约占输出总行数的 23%。最初按寄存器编号猜测这是 OLLVM 常见的
+"x0-x7 活跃寄存器 / x8-x15 影子备份" 两组寄存器банк，但对 [`ssa_construct.cpp`](../src/passes/ssa_construct.cpp)
+的 phi 加 `reg:xN` 注解后实测发现：hub 和 merge 两处的 phi 标注的是**同一批寄存器**
+（都是 x0-x7），不存在真正的影子寄存器组——这只是同一个寄存器在 hub、merge 两个
+phi 汇合点上的"两级接力"：每个 handler 把值写到 merge 的 phi（对应输出里的
+`t8..t15`），merge 再把它接回 hub 的 phi（`t0..t7`），`printEdge`（[`c_stmt.cpp`](../src/emit/c_stmt.cpp)）
+把这两级 phi 的每条边都如实打印成一行赋值，于是每个 handler 都反复重复同一份"保存/
+恢复"协议。
+
+**F0**（[`live_register_frame.h/.cpp`](../src/analysis/live_register_frame.cpp)）：
+`matchLiveRegisterFrame` 扫描 hub 的每个带 `reg:xN` 注解的 phi，在 merge 里找同一寄存器
+的第二个 phi，配对进 `LiveRegisterFrame::slots`；`classifyHandlerExit` 判定某个 handler
+在 merge 侧的 phi 操作数是否等于 hub 侧 phi 的结果值本身（`Passthrough`/`Partial`/
+`Return` 三态）。
+
+**F1**（`c_stmt.cpp` 的 `printEdge`/`printFrameSeed`）：进入带 frame 的 switch 前，先把
+`shadow[i] = live[i]` 打印一次（`printFrameSeed`），建立"没被哪个 handler 改动的 slot，
+shadow 值仍等于 live 值"这一不变量；随后每个 handler 落到 merge 的边拷贝，凡是
+`classifyHandlerExit` 判定为 unchanged 的 slot 一律跳过。`0x2a2428` 从 5303 行降到 4107 行。
+
+**F2**（[`variables.cpp`](../src/analysis/variables.cpp)）：给 dispatcher 函数里配对出的
+hub phi/merge phi 分别起 `xN_live`/`xN_exit` 语义名，取代无意义的 `tN` 序号，可读性收益，
+不改变行数。
+
+**F3**：原计划的"IL 层 shadow phi 消除 pass"建立在错误的双寄存器组假设上，重新定性后
+改为一个更小但同样成立的加固——`unanimousPassthroughSlots`：如果某个寄存器 slot 在
+*所有*落到 merge 的 handler 上都是 unchanged（不只是某一个 handler），那么 merge 侧的
+phi 值处处等于 hub 侧 phi 值本身，seed 拷贝和 epilogue 里对应的 restore 拷贝都可以整体
+省略，不只是省略某个 handler 的一行。`0x2a2428` 的 8 个寄存器没有一个满足"全体一致"
+（case 1 就单独打破了每个 slot 的一致性），所以这一步在这个样本上是零行变化——用
+`fc /b` 逐字节比对 F2/F3 两版输出完全一致验证过；这是分析给出的正确判断，不是遗漏，
+留给别的、handler 更少或某些寄存器确实从未被任何 handler 触碰的 dispatcher 函数。
+
+**F4**（[`structure.cpp`](../src/emit/structure.cpp) 的 `tryDispatcherLoop`）：guard 越界出口
+（`b3`）自己也直接汇入 `merge`，而不是真正离开循环——这正是它会落进 `naturalLoop` 的
+`loop.blocks` 里的原因（反向从 latch=`merge` 沿 predecessors 走到 `b3` 时不需要经过
+`header`），也正是原先 `!loop.blocks.contains(headerExit)` 判定失败、整个函数拿不到
+`while (true)` 包装的原因。修法是把 `b3` 当成一个私有 handler，复用
+`claimDispatcherCaseBody`（新增 `appendBreak` 参数，这里传 `false`：guard 分支不在
+switch 里，`break;` 会错误地跳出外层 `while`，而不是像 case 里那样落到 epilogue）内联
+进 guard 的 `if` 分支，dispatch/switch 挪进 `else` 分支（越界状态不能再跑一遍基于垃圾
+下标的 switch），共享 tail 从 switch 自己的 epilogue 挪到 `if`/`else` 之后统一打印一次。
+`0x2a2428` 最终 0 goto、0 label，整个函数是一个 `while (true) { if (guard) {...} else
+{...switch...} ; tail }`，4106 行。
+
+**回归**：`test_live_register_frame.cpp`（新增 unanimous slot 用例）、`test_structure.cpp`
+（新增两个 `tryDispatcherLoop` 用例：普通守卫退出、三向汇合守卫退出）纳入
+`xdec_tests.exe`，476 个用例、131,173 个断言全过；`eval/` 96/96、`samples/` 4/4 无回归。
+`samples/manifest.json` 的 `sample_core_mba` 阈值按本轮实测收紧：新增 `max_lines: 4200`、
+`min_loops_while_true: 1`，`max_gotos` 10→2。
+
+## 2026-08-10：语义 helper 头文件化与短名（`xdec_helpers.h`）
+
+`0x2a2428` 的 F4 输出里，`__xdec_rotr32` 出现约 586 次、`__builtin_bswap32` 约 64 次，
+每次调用都比等价的算术表达式长一截，而且每个反编译出的 `.c` 文件的 preamble 都要
+重复一份完全相同的 `static inline uint32_t __xdec_rotr32(...) { ... }` 定义——同一个
+`xdec` 进程、同一份逻辑，被打印了 N 次。
+
+按「能在 C 里无歧义、可移植地定义的 → 短名 + 头文件里给真身；语义依赖目标/embedder
+的 → 保留 `xdec_` 前缀、头文件里只给声明」拆成两类，新增
+[`include/xdec/xdec_helpers.h`](../include/xdec/xdec_helpers.h)：
+
+- **真身**（`static inline`，与目标无关，任何输入下都对）：`rotr8/16/32/64`、
+  `rotl8/16/32/64`、`bswap16/32/64`、`popcount64`、`cc_{ge,lt,gt,le,vs,vc}{8,16,32,64}`
+  （溢出精确条件码，逻辑照搬 `c_helpers.cpp` 原来的 `conditionHelper`/`rotateHelper`，
+  现在只有头文件这一份 source of truth）。
+- **仅声明**（原来只在用到时打一行注释，现在是头文件里的真实原型）：
+  `xdec_clz/ctz/brev{8,16,32,64}`、`xdec_mulhi{u,s}{8,16,32,64}`、`xdec_flagbit`、
+  `xdec_flagcond_stub`、`xdec_f{add,sub,mul,div}{32,64}`、`xdec_fneg{32,64}`。
+- **不变**（不进头文件，原样保留双下划线）：`__xdec_intrin_*`（每条指令一个不同的名字，
+  没有固定原型可声明）、`__xdec_syscall`（这行声明本来就在 `c_helpers.cpp` 里按需打印，
+  早于这次改动）、`__xdec_unimplemented`（从来没在任何输出里被声明过）。
+
+顺手修了一个潜伏的小 bug：浮点 stub 的 helper key 原来拼成 `"f" + "fadd32"` =
+`"ffadd32"`，但调用点打印的是 `__xdec_fadd32`——key 和实际调用名对不上，只是从未
+影响过输出（`helperDeclarations` 里两处判断都只看前缀 `"f"`，凑巧都能命中）。这次连
+带 key 一起改成与调用名一致的 `"fadd32"`。
+
+`c_flags.cpp` 的 `ccHelper` 顺带补了一层防御：条件码只有 `ge/lt/gt/le/vs/vc` 六种在
+头文件里有定义，如果 `Always`/`Never` 真的以某种方式流到这里（正常不会——它们不依赖
+标志位，理论上会在更早的阶段被折叠掉），现在会退回复用已有的 `xdec_flagcond_stub`
+埋点而不是拼出一个头文件里根本不存在的函数名。
+
+`COptions` 新增 `helpersHeader`（默认 `"xdec_helpers.h"`，空串表示不 include）；
+`xdec decompile` 新增 `--helpers-header <path|none>`；`src/tools/CMakeLists.txt` 给
+`xdec` target 挂了个 `POST_BUILD` 步骤，把头文件拷到 `bin/xdec.exe` 旁边，反编译出的
+`.c` 不用额外配置 include path 就能直接编译。
+
+**回归**：`test_c_expr.cpp`/`test_c_printer.cpp` 里断言旧名字/内联定义的用例改成断言
+新短名 + `#include`；新增 `tests/emit/test_c_helpers_header.cpp`（7 个用例：无 helper
+不 include、rotate/bswap/embedder stub 各自触发 include、单独的 syscall 不触发、
+`helpersHeader` 可改路径、可清空禁用）。`xdec_tests.exe` 483 个用例、131,190 个断言
+全过；`eval/` baseline 96/96、typed 36/36、`samples/` 4/4 全部用 `-UpdateBaseline`
+刷新（純粹是 helper 拼写/preamble 形状变化，非语义回归）。`eval/score.py` 的
+`intrinsics` 计数从数 `__xdec_` 改成数 `xdec_`（排除 `#include "xdec_helpers.h"` 这行
+本身），这样 rotr/bswap/cc_* 不再被算进"还依赖 embedder"的计数——它们现在是完整定义，
+真正还依赖 embedder 的只剩 `xdec_` 前缀的 stub 加 `syscall`/`intrin`。
+`samples/score.py` 的 `__xdec_` 前缀过滤（防止 helper 定义被误认成目标函数）不用改：
+helper 现在只有声明和 `#include`，不再有带函数体的内联定义，这条防线本来就用不上了，
+留着无害。

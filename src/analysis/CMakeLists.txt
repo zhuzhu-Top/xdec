@@ -1,15 +1,24 @@
 xdec_add_library(xdec_analysis
   SOURCES
     call_target.cpp
+    dispatcher_shape.cpp
     dominators.cpp
+    expr_reuse.cpp
     image_eval.cpp
     index_bound.cpp
+    import_callee.cpp
     jump_table.cpp
+    live_register_frame.cpp
     loops.cpp
+    noreturn.cpp
+    plt_stub.cpp
     profile.cpp
+    reachability.cpp
     scc.cpp
     stack_frame.cpp
+    typed_variables.cpp
     variables.cpp
   DEPS
     xdec_il
-    xdec_support)
+    xdec_support
+    xdec_types)

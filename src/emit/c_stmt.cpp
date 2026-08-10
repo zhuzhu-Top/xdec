@@ -6,35 +6,15 @@
 #include <set>
 #include <vector>
 
+#include "xdec/analysis/import_callee.h"
+#include "xdec/analysis/noreturn.h"
+#include "xdec/il/expr_roots.h"
 #include "xdec/passes/recover_syscall.h"
 #include "xdec/types/syscall_table.h"
 
 namespace xdec::emit {
 
 namespace {
-
-/// Every Value leaf under `root`, iteratively: expression trees here are DAGs
-/// deep enough that recursion is a stack-overflow risk on obfuscated input.
-void collectValueLeaves(const il::Function& function, il::ExprId root,
-                        std::set<uint32_t>& out) {
-  std::vector<il::ExprId> stack{root};
-  std::set<uint32_t> seen;
-  while (!stack.empty()) {
-    const il::ExprId id = stack.back();
-    stack.pop_back();
-    if (!seen.insert(id.index()).second) {
-      continue;
-    }
-    const il::Expr& expr = function.expr(id);
-    if (expr.op == il::ExprOp::Value) {
-      out.insert(static_cast<uint32_t>(expr.immediate));
-      continue;
-    }
-    for (unsigned index = 0; index < expr.operandCount; ++index) {
-      stack.push_back(expr.operands[index]);
-    }
-  }
-}
 
 /// The low `width` bits as a C constant, in a form that works past 64 bits.
 [[nodiscard]] std::string lowMask(uint32_t width, const std::string& type) {
@@ -44,35 +24,8 @@ void collectValueLeaves(const il::Function& function, il::ExprId root,
   return std::format("0x{:x}", (uint64_t{1} << width) - 1);
 }
 
-/// Every expression `printOp` will hand to the expression printer for `op`,
-/// so a block's ops can be counted for shared subexpressions before any of
-/// them is printed. Mirrors printOp's own dispatch; an op this misses just
-/// never gets to share across statements, so erring towards including one
-/// costs nothing beyond a wasted count.
-void addExprRoots(const il::Function& function, const il::Op& op,
-                  std::vector<il::ExprId>& roots) {
-  const auto operands = function.operands(op);
-  switch (op.code) {
-    case il::OpCode::Load:
-      if (!operands.empty()) {
-        roots.push_back(operands[0]);
-      }
-      break;
-    case il::OpCode::Store:
-    case il::OpCode::Call:
-    case il::OpCode::Intrinsic:
-      roots.insert(roots.end(), operands.begin(), operands.end());
-      break;
-    case il::OpCode::WriteReg:
-    case il::OpCode::Return:
-      if (!operands.empty()) {
-        roots.push_back(operands[0]);
-      }
-      break;
-    default:
-      break;
-  }
-}
+using il::addExprRoots;
+using il::collectValueLeaves;
 
 }  // namespace
 
@@ -126,7 +79,26 @@ std::string StmtPrinter::assignedInt(il::ExprId id, std::string& out) {
 void StmtPrinter::printStmt(const StmtPtr& stmt, std::string& out) {
   switch (stmt->kind) {
     case StmtKind::Sequence:
-      for (const StmtPtr& item : stmt->items) {
+      // A resolved computed branch always lowers to exactly this pair,
+      // consecutive and over the same block (see structure.cpp's
+      // IndirectBranch case): the block's own straight-line ops, then the
+      // switch built from its terminator. They print together on every
+      // path that reaches either, so counting the switch's discriminant
+      // into the block's CSE scope up front is safe -- unlike an if/while
+      // condition, which stays a scope of its own (see c_expr.h) because an
+      // untaken arm must not read a name only the other arm assigned.
+      for (std::size_t index = 0; index < stmt->items.size(); ++index) {
+        const StmtPtr& item = stmt->items[index];
+        if (item->kind == StmtKind::Block && index + 1 < stmt->items.size()) {
+          const StmtPtr& next = stmt->items[index + 1];
+          if (next->kind == StmtKind::Switch && next->block == item->block &&
+              next->cond.valid()) {
+            printBlock(*item, out, {next->cond});
+            printSwitch(*next, out, /*openScope=*/false);
+            ++index;
+            continue;
+          }
+        }
         printStmt(item, out);
       }
       break;
@@ -155,6 +127,13 @@ void StmtPrinter::printStmt(const StmtPtr& stmt, std::string& out) {
       // whatever branched here, exactly as they would be before a goto.
       consumePending(stmt->block, out);
       line(out, "continue;");
+      break;
+    case StmtKind::Break:
+      // No pending edge to consume: unlike a goto or continue, a dispatcher
+      // case's `Break` names no block of its own -- the code it hands
+      // control to (the switch's epilogue) prints right where the switch
+      // itself sits, not somewhere this statement has to point at.
+      line(out, "break;");
       break;
   }
 }
@@ -285,22 +264,45 @@ void StmtPrinter::printDoWhile(const Stmt& stmt, std::string& out) {
   last_ = latch;
 }
 
-void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out) {
+void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out, bool openScope) {
   if (stmt.block.valid()) {
     consumePending(stmt.block, out);
-    if (ctx_.structured.isLabeled(stmt.block)) {
-      // A compare-chain switch replaces its dispatcher blocks, so a handler
-      // branching back to the dispatcher lands on this label.
+    // A compare-chain switch replaces its dispatcher block outright (no
+    // separate `Block` stmt precedes it), so a handler branching back to the
+    // dispatcher needs this label. A resolved computed branch's switch is
+    // different: `emitRegion` always prints that block's own straight-line
+    // ops as a `Block` stmt right before this one, which already wrote the
+    // same label if the block needed one -- `last_ == stmt.block` says so,
+    // and printing it again here would be the one label appearing twice.
+    if (ctx_.structured.isLabeled(stmt.block) && last_ != stmt.block) {
       out += std::format("{}:\n", label(stmt.block));
     }
   }
   pending_ = il::BlockId{};
 
+  // Saved/restored (rather than simply cleared on the way out) so that a
+  // handler ending in its own nested resolved switch, if that one somehow
+  // matched a frame of its own, cannot leave this switch's remaining case
+  // bodies printing without the suppression they are entitled to.
+  const std::optional<ActiveFrame> enclosingFrame = activeFrame_;
+  if (stmt.frame) {
+    // Only `shape.merge` is read by either analysis call below (see
+    // `classifyHandlerExit`), so the rest of the shape -- not something a
+    // `Stmt` keeps around once structuring is done -- can stay unset.
+    const analysis::DispatcherShape shape{il::BlockId{}, stmt.mergeBlock, il::BlockId{}};
+    const std::vector<bool> unanimous =
+        analysis::unanimousPassthroughSlots(ctx_.function, shape, *stmt.frame);
+    printFrameSeed(*stmt.frame, unanimous, out);
+    activeFrame_ = ActiveFrame{stmt.mergeBlock, *stmt.frame, unanimous};
+  }
+
   const bool enumerated = stmt.tableMode || !stmt.caseValues.empty();
   if (!enumerated) {
     // Nothing matched a table or a chain: an honest compare sequence over the
     // computed target, which at least names every successor.
-    expressions_.beginScope({stmt.cond});
+    if (openScope) {
+      expressions_.beginScope({stmt.cond});
+    }
     const std::string target = assignedText(stmt.cond, out);
     bool first = true;
     for (std::size_t index = 0; index < stmt.cases.size(); ++index) {
@@ -325,16 +327,31 @@ void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out) {
     if (!first) {
       line(out, "}");
     }
+    if (stmt.epilogue) {
+      pending_ = il::BlockId{};
+      printStmt(stmt.epilogue, out);
+    }
+    if (stmt.frame) {
+      activeFrame_ = enclosingFrame;
+    }
     return;
   }
 
-  expressions_.beginScope({stmt.cond});
+  if (openScope) {
+    expressions_.beginScope({stmt.cond});
+  }
   const std::string discriminant = assignedText(stmt.cond, out);
   line(out, std::format("switch ({}) {{", discriminant));
   ++indent_;
   for (std::size_t index = 0; index < stmt.cases.size(); ++index) {
     if (stmt.tableMode) {
-      line(out, std::format("case {}:", index));
+      // The case label is the table's ordinal, not anything a disassembler
+      // would show at this address; whether or not `claimCaseBody` inlined
+      // the handler below (in which case no `goto` prints its address at
+      // all), naming the target here is what lets a reader match this case
+      // up against the jump table or the graph view in another tool.
+      line(out, std::format("case {}: /* handler @0x{:x} */", index,
+                            ctx_.function.block(stmt.cases[index]).va));
     } else {
       line(out, std::format("case 0x{:x}:", stmt.caseValues[index]));
     }
@@ -368,9 +385,283 @@ void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out) {
   }
   --indent_;
   line(out, "}");
+  // The dispatcher shape's shared tail (see analysis::DispatcherShape),
+  // structured once here instead of once per `goto`. Every case a `Break`
+  // closes falls into it exactly where it now prints: right after the
+  // switch, at the switch's own indentation.
+  if (stmt.epilogue) {
+    pending_ = il::BlockId{};
+    printStmt(stmt.epilogue, out);
+  }
+  if (stmt.frame) {
+    activeFrame_ = enclosingFrame;
+  }
 }
 
-void StmtPrinter::printBlock(const Stmt& stmt, std::string& out) {
+void StmtPrinter::printFrameSeed(const analysis::LiveRegisterFrame& frame,
+                                 const std::vector<bool>& unanimous, std::string& out) {
+  for (std::size_t slot = 0; slot < frame.slots.size(); ++slot) {
+    if (slot < unanimous.size() && unanimous[slot]) {
+      continue;
+    }
+    const analysis::LiveRegisterSlot& registerSlot = frame.slots[slot];
+    const il::ValueId liveValue = ctx_.function.op(registerSlot.livePhiAtHub).result;
+    const il::ValueId shadowValue = ctx_.function.op(registerSlot.shadowPhiAtMerge).result;
+    const analysis::Variable* liveVar = ctx_.variables.tempFor(liveValue);
+    const analysis::Variable* shadowVar = ctx_.variables.tempFor(shadowValue);
+    if (liveVar == nullptr || shadowVar == nullptr) {
+      continue;
+    }
+    line(out, std::format("{} = {};", shadowVar->name, liveVar->name));
+  }
+}
+
+il::OpId deadJumpTableLoad(const il::Function& function, il::BlockId block, bool tableMode,
+                          il::ExprId cond) {
+  if (!tableMode || !block.valid()) {
+    return {};
+  }
+  const auto& ops = function.block(block).ops;
+  if (ops.empty()) {
+    return {};
+  }
+  const il::Op& terminator = function.op(ops.back());
+  if (terminator.code != il::OpCode::IndirectBranch) {
+    return {};
+  }
+  const auto termOperands = function.operands(terminator);
+  if (termOperands.empty()) {
+    return {};
+  }
+  const il::Expr& targetExpr = function.expr(termOperands[0]);
+  if (targetExpr.op != il::ExprOp::Value) {
+    return {};
+  }
+  const il::ValueId target{static_cast<uint32_t>(targetExpr.immediate)};
+
+  il::OpId candidate{};
+  for (const il::OpId opId : ops) {
+    if (const il::Op& op = function.op(opId); op.code == il::OpCode::Load && op.result == target) {
+      candidate = opId;
+      break;
+    }
+  }
+  if (!candidate.valid()) {
+    return {};
+  }
+
+  // The switch's own discriminant is the terminator's replacement; if it
+  // still reaches `target` (an obfuscator's index computation folded back
+  // through the loaded target rather than staying a separate value), the
+  // load is not vestigial after all.
+  std::set<uint32_t> reached;
+  il::collectValueLeaves(function, cond, reached);
+  if (reached.contains(target.index())) {
+    return {};
+  }
+  // Nor may any other op in the block still read it.
+  for (const il::OpId opId : ops) {
+    if (opId == candidate) {
+      continue;
+    }
+    std::vector<il::ExprId> roots;
+    addExprRoots(function, function.op(opId), roots);
+    for (const il::ExprId root : roots) {
+      il::collectValueLeaves(function, root, reached);
+    }
+    if (reached.contains(target.index())) {
+      return {};
+    }
+  }
+  return candidate;
+}
+
+namespace {
+
+/// Whether `va` names the syscall-error accessor a header declared under --
+/// `__errno_location` on Android, the one name `printOp`'s Store-idiom fold
+/// (see `foldableErrnoCall`) knows to look for. Reads exactly the two
+/// resolvers `CContext::calleeName` does, in the same order, so a call this
+/// finds foldable is one that would otherwise have printed under this exact
+/// name (see c_context.h's `calleeName` and `binder_` for why the two must
+/// agree).
+[[nodiscard]] bool namesErrnoLocation(const COptions& options, uint64_t va) {
+  if (options.symbols) {
+    if (const SymbolRef symbol = options.symbols(va); symbol.exact() && symbol.isFunction) {
+      return symbol.name == "__errno_location";
+    }
+  }
+  if (options.names) {
+    const types::BoundName named = options.names(va);
+    return !named.empty() && named.isFunction && named.name == "__errno_location";
+  }
+  return false;
+}
+
+/// The call `foldableErrnoCall` (in `block`) folds into a later Store, when
+/// this store is that fold's target: `*(width*)(t) = -(x)` where `t` is that
+/// call's own (untrimmed) result. Nullopt for every other Store, including
+/// one whose address is not a plain value at all.
+[[nodiscard]] std::optional<il::ValueId> importAccessorStoreValue(const il::Function& function,
+                                                                  const il::Op& store) {
+  const auto operands = function.operands(store);
+  if (function.expr(operands[1]).op != il::ExprOp::Neg) {
+    return std::nullopt;
+  }
+  const il::Expr& addressExpr = function.expr(operands[0]);
+  if (addressExpr.op != il::ExprOp::Value) {
+    return std::nullopt;
+  }
+  return il::ValueId{static_cast<uint32_t>(addressExpr.immediate)};
+}
+
+/// A call to the errno accessor whose only reader, in `block`, is a Store
+/// matching `*(width*)(errno_location()) = -(x)` (see
+/// `importAccessorStoreValue`): the shape `sub_199214`-like syscall wrappers
+/// leave behind once the accessor's name resolves (see nameResolverOf in
+/// xdec_main.cpp), and `printOp`'s Store case folds into one line (see
+/// docs/10-import-resolution.md). Invalid when the block matches no such
+/// pair, so nothing is marked dead and the ordinary two-statement form
+/// prints, same as before this fold existed.
+[[nodiscard]] il::OpId foldableErrnoCall(const il::Function& function, il::BlockId block,
+                                        const COptions& options) {
+  if (!block.valid()) {
+    return {};
+  }
+  const auto& ops = function.block(block).ops;
+  for (const il::OpId opId : ops) {
+    const il::Op& op = function.op(opId);
+    if (op.code != il::OpCode::Store) {
+      continue;
+    }
+    const std::optional<il::ValueId> value = importAccessorStoreValue(function, op);
+    if (!value.has_value() || !function.hasValue(*value)) {
+      continue;
+    }
+    const il::OpId definition = function.value(*value).definition;
+    if (!definition.valid()) {
+      continue;
+    }
+    const il::Op& call = function.op(definition);
+    // Already trimmed to no arguments: the accessor takes none, and folding
+    // a call that still carries the convention's full register set would
+    // silently drop them rather than say so.
+    if (call.code != il::OpCode::Call || function.operands(call).size() != 1) {
+      continue;
+    }
+    uint64_t address = 0;
+    if (!function.asConstant(function.operands(call)[0], address) ||
+        !namesErrnoLocation(options, address)) {
+      continue;
+    }
+    // No other op *anywhere in the function* may still read the call's
+    // result -- not just this block. A dispatcher's merge point is exactly
+    // the case that makes this matter: the call's result sits in x0, the
+    // same register the ABI carries a live argument in, so a Phi at some
+    // successor block's head (see edgeCopies) can read this value on this
+    // very edge, and Phi operands do not live in this block's own `ops`. Only
+    // when nothing anywhere still needs it does folding away its temporary
+    // cost nothing.
+    std::set<uint32_t> reached;
+    for (const il::BlockId other_block : function.blockHandles()) {
+      for (const il::OpId other : function.block(other_block).ops) {
+        if (other == opId || other == definition) {
+          continue;
+        }
+        const il::Op& otherOp = function.op(other);
+        // addExprRoots does not know Phi's shape (its "operands" are one
+        // value per incoming edge, not an expression tree to walk into), so
+        // a Phi reading this value would otherwise pass right through this
+        // scan unseen -- exactly the shape a dispatcher merge takes.
+        if (otherOp.code == il::OpCode::Phi) {
+          for (const il::ExprId edgeValue : function.operands(otherOp)) {
+            collectValueLeaves(function, edgeValue, reached);
+          }
+          continue;
+        }
+        std::vector<il::ExprId> roots;
+        addExprRoots(function, otherOp, roots);
+        for (const il::ExprId root : roots) {
+          collectValueLeaves(function, root, reached);
+        }
+      }
+    }
+    if (reached.contains(value->index())) {
+      continue;
+    }
+    return definition;
+  }
+  return {};
+}
+
+void collectDeadOpsInto(const il::Function& function, const Stmt& stmt, const COptions& options,
+                        std::unordered_set<uint32_t>& dead) {
+  switch (stmt.kind) {
+    case StmtKind::Sequence:
+      for (std::size_t index = 0; index < stmt.items.size(); ++index) {
+        const Stmt& item = *stmt.items[index];
+        if (item.kind == StmtKind::Block && index + 1 < stmt.items.size()) {
+          const Stmt& next = *stmt.items[index + 1];
+          if (next.kind == StmtKind::Switch && next.block == item.block && next.cond.valid()) {
+            if (const il::OpId dead_load =
+                    deadJumpTableLoad(function, item.block, next.tableMode, next.cond);
+                dead_load.valid()) {
+              dead.insert(dead_load.index());
+            }
+          }
+        }
+        collectDeadOpsInto(function, item, options, dead);
+      }
+      break;
+    case StmtKind::Block:
+      if (const il::OpId dead_call = foldableErrnoCall(function, stmt.block, options);
+          dead_call.valid()) {
+        dead.insert(dead_call.index());
+      }
+      break;
+    case StmtKind::If:
+      if (stmt.thenArm) {
+        collectDeadOpsInto(function, *stmt.thenArm, options, dead);
+      }
+      if (stmt.elseArm) {
+        collectDeadOpsInto(function, *stmt.elseArm, options, dead);
+      }
+      break;
+    case StmtKind::While:
+    case StmtKind::DoWhile:
+      if (stmt.body) {
+        collectDeadOpsInto(function, *stmt.body, options, dead);
+      }
+      break;
+    case StmtKind::Switch:
+      for (const StmtPtr& body : stmt.caseBodies) {
+        if (body) {
+          collectDeadOpsInto(function, *body, options, dead);
+        }
+      }
+      if (stmt.defaultBody) {
+        collectDeadOpsInto(function, *stmt.defaultBody, options, dead);
+      }
+      if (stmt.epilogue) {
+        collectDeadOpsInto(function, *stmt.epilogue, options, dead);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+}  // namespace
+
+std::unordered_set<uint32_t> collectDeadOps(const il::Function& function, const Stmt& root,
+                                            const COptions& options) {
+  std::unordered_set<uint32_t> dead;
+  collectDeadOpsInto(function, root, options, dead);
+  return dead;
+}
+
+void StmtPrinter::printBlock(const Stmt& stmt, std::string& out,
+                              const std::vector<il::ExprId>& extraRoots) {
   // The incoming edge's copies precede the label: they belong to one
   // predecessor, and a label is where every other predecessor arrives.
   consumePending(stmt.block, out);
@@ -385,12 +676,25 @@ void StmtPrinter::printBlock(const Stmt& stmt, std::string& out) {
   // often recompute the exact same subexpression in several sibling
   // statements (see c_expr.h), and those statements always run together, so
   // naming it once here is safe and keeps the redundant statements short.
+  // `extraRoots` (a paired switch's discriminant; see the Sequence case in
+  // printStmt) join the count before any op prints, so a value shared with
+  // that discriminant is recognised as shared from its first use here
+  // rather than only once the switch reaches it in a scope of its own.
   std::vector<il::ExprId> roots;
   for (const il::OpId opId : block.ops) {
+    if (ctx_.deadOps.contains(opId.index())) {
+      continue;
+    }
     addExprRoots(ctx_.function, ctx_.function.op(opId), roots);
   }
   expressions_.beginScope(roots);
+  if (!extraRoots.empty()) {
+    expressions_.extendScope(extraRoots);
+  }
   for (const il::OpId opId : block.ops) {
+    if (ctx_.deadOps.contains(opId.index())) {
+      continue;
+    }
     printOp(opId, out);
   }
   last_ = stmt.block;
@@ -406,6 +710,33 @@ void StmtPrinter::printBlock(const Stmt& stmt, std::string& out) {
 // Ops
 // ---------------------------------------------------------------------------
 
+bool StmtPrinter::printFoldedImportStore(const il::Op& op, std::string& out) {
+  const std::optional<il::ValueId> value = importAccessorStoreValue(ctx_.function, op);
+  if (!value.has_value() || !ctx_.function.hasValue(*value)) {
+    return false;
+  }
+  const il::OpId definition = ctx_.function.value(*value).definition;
+  // `foldableErrnoCall` is the only thing that ever marks a Call dead, so
+  // finding this store's address value defined by a dead op *is* finding the
+  // pairing it matched -- nothing else could have put a Call's index there.
+  if (!definition.valid() || !ctx_.deadOps.contains(definition.index())) {
+    return false;
+  }
+  const il::Op& call = ctx_.function.op(definition);
+  if (call.code != il::OpCode::Call) {
+    return false;
+  }
+  uint64_t address = 0;
+  if (!ctx_.function.asConstant(ctx_.function.operands(call)[0], address)) {
+    return false;
+  }
+  const std::string callee = ctx_.calleeName(address);
+  ctx_.callees.emplace(address, callee);
+  const auto operands = ctx_.function.operands(op);
+  line(out, std::format("*{}() = {};", callee, assignedText(operands[1], out)));
+  return true;
+}
+
 void StmtPrinter::printOp(il::OpId opId, std::string& out) {
   const il::Op& op = ctx_.function.op(opId);
   // Ahead of the statement, on its own line: what a pass established about this
@@ -413,8 +744,15 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
   // dispatch, say. It goes before rather than trailing because the statements
   // these land on are the long ones, and a comment at the end of a 300-column
   // line is a comment nobody reads.
-  if (const std::string_view note = ctx_.function.noteOn(opId); !note.empty()) {
-    line(out, std::format("/* {} */", note));
+  //
+  // A Phi's own note (ssa_construct.cpp's "reg:xN", currently the only kind
+  // placed on one) is bookkeeping for analysis to find that phi again --
+  // there is no statement here for it to sit next to, since a phi's value
+  // prints on the edges that feed it, never at its own definition site.
+  if (op.code != il::OpCode::Phi) {
+    if (const std::string_view note = ctx_.function.noteOn(opId); !note.empty()) {
+      line(out, std::format("/* {} */", note));
+    }
   }
   const auto operands = ctx_.function.operands(op);
   switch (op.code) {
@@ -426,6 +764,9 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       break;
     }
     case il::OpCode::Store: {
+      if (printFoldedImportStore(op, out)) {
+        break;
+      }
       // The lvalue first, always: it can hoist a temporary of its own, and one
       // hoisted under a guard would be missing on the path that skips it.
       const std::string lvalue = memoryLvalue(operands[0], op.type.bits(), out);
@@ -589,7 +930,8 @@ void StmtPrinter::printCall(const il::Op& op, std::string& out) {
   std::string args;
   for (std::size_t index = 1; index <= argCount; ++index) {
     args += index == 1 ? "" : ", ";
-    args += exprText(operands[index], out);
+    std::string address = ctx_.addressOfLocal(operands[index]);
+    args += address.empty() ? exprText(operands[index], out) : address;
   }
   const std::string suffix = trimmed ? " /* + unknown arg(s) */" : "";
   const std::string* temp = ctx_.tempFor(op.result);
@@ -598,13 +940,29 @@ void StmtPrinter::printCall(const il::Op& op, std::string& out) {
   if (ctx_.function.asConstant(operands[0], address)) {
     const std::string callee = ctx_.calleeName(address);
     ctx_.callees.emplace(address, callee);
-    line(out, std::format("{}{}({}){};", assignee, callee, args, suffix));
+    // Same annotation the syscall path prints for a noreturn number (see
+    // printSyscall): a reader who has just read `abort()` or
+    // `__stack_chk_fail()` should not have to also know each one's contract
+    // to see why nothing here worries about what follows on this path.
+    const std::string_view note =
+        analysis::isKnownNoreturnSymbol(callee) ? " /* does not return */" : "";
+    line(out, std::format("{}{}({}){}{};", assignee, callee, args, suffix, note));
     return;
   }
   const std::string prototype = calleeCast(ctx_.calleeType(operands[0]), argCount,
                                            temp != nullptr);
   const std::string target = exprInt(operands[0], out);
-  line(out, std::format("{}(({}){})({}){};", assignee, prototype, target, args, suffix));
+  // The cast above already carries the callee's prototype when a header
+  // covers it (see CContext::calleeType); what it cannot carry is the
+  // callee's *name*, since the target stays a computed expression either
+  // way. Naming it in a comment is the conservative half of Phase 3.2 (see
+  // docs/10-import-resolution.md): a reader gets `write` for free without
+  // this becoming a claim that the call is direct when the code shows that
+  // it is not.
+  const std::optional<std::string> imported =
+      analysis::importNameThroughSlot(ctx_.function, ctx_.options.memory, operands[0]);
+  const std::string note = imported.has_value() ? std::format(" /* import: {} */", *imported) : "";
+  line(out, std::format("{}(({}){})({}){};{}", assignee, prototype, target, args, suffix, note));
 }
 
 /// The function-pointer type a computed call is cast through.
@@ -680,9 +1038,14 @@ bool StmtPrinter::printSyscall(const il::Op& op, std::string& out) {
   const std::size_t count =
       info == nullptr ? available : std::min<std::size_t>(available, info->argCount);
   std::vector<std::string> args;
+  std::vector<bool> addressed;
   args.reserve(count);
+  addressed.reserve(count);
   for (std::size_t index = 0; index < count; ++index) {
-    args.push_back(exprText(operands[passes::kSyscallFirstArgOperand + index], out));
+    const il::ExprId operand = operands[passes::kSyscallFirstArgOperand + index];
+    std::string address = ctx_.addressOfLocal(operand);
+    addressed.push_back(!address.empty());
+    args.push_back(address.empty() ? exprText(operand, out) : std::move(address));
   }
   const std::string numberText =
       known ? std::string{} : exprText(operands[passes::kSyscallNumberOperand], out);
@@ -697,7 +1060,9 @@ bool StmtPrinter::printSyscall(const il::Op& op, std::string& out) {
     callee = std::format("sys_{}", info->name);
     for (std::size_t index = 0; index < args.size(); ++index) {
       arguments += index == 0 ? "" : ", ";
-      arguments += info->hasSignature() && index < info->argTypes.size()
+      // An already-named address needs no cast: the declaration it points at
+      // (see applyImportedTypes) is why the address is nameable at all.
+      arguments += !addressed[index] && info->hasSignature() && index < info->argTypes.size()
                        ? std::format("({}){}", info->argTypes[index], args[index])
                        : args[index];
     }
@@ -727,7 +1092,21 @@ std::string StmtPrinter::memoryLvalue(il::ExprId address, uint32_t width,
                                       std::string& out, il::ValueId result) {
   const analysis::AddressInfo info = ctx_.frame.classify(address);
   if (info.kind == analysis::AddressKind::StackSlot) {
+    if (std::string field = ctx_.localFieldAccess(info.delta, width); !field.empty()) {
+      return field;
+    }
     if (const analysis::Variable* local = ctx_.variables.localAt(info.delta)) {
+      if (local->aliasBase.has_value()) {
+        // An aliased local has no declaration of its own (see
+        // c_printer.cpp's declarations), so an access at some other width
+        // than the field it stands for has to be reached through the base
+        // struct's address rather than by name.
+        const analysis::Variable* base = ctx_.variables.localAt(*local->aliasBase);
+        if (base != nullptr) {
+          return std::format("(*({}*)((uint8_t*)&{} + {}))", intType(width), base->name,
+                             info.delta - *local->aliasBase);
+        }
+      }
       if (local->type.pointerDepth == 0 && local->type.width == width) {
         return local->name;
       }
@@ -830,9 +1209,63 @@ std::vector<StmtPrinter::EdgeCopy> StmtPrinter::edgeCopies(il::BlockId from,
 }
 
 void StmtPrinter::printEdge(il::BlockId from, il::BlockId to, std::string& out) {
-  const std::vector<EdgeCopy> copies = edgeCopies(from, to);
+  std::vector<EdgeCopy> copies = edgeCopies(from, to);
   if (copies.empty()) {
     return;
+  }
+  // A handler's own save into the active frame's merge: whichever slots
+  // `classifyHandlerExit` says this handler leaves alone already hold the
+  // right value there, seeded by `printFrameSeed` before the switch and
+  // never touched by any other case's own copies (each is its own C
+  // assignment statement, guarded by its own `case`). Printing them again
+  // here would say nothing the reader does not already know from every
+  // other passthrough handler saying the same thing.
+  if (activeFrame_ && to == activeFrame_->merge) {
+    const analysis::DispatcherShape shape{il::BlockId{}, activeFrame_->merge, il::BlockId{}};
+    const analysis::HandlerFrameExit exit =
+        analysis::classifyHandlerExit(ctx_.function, from, shape, activeFrame_->frame);
+    if (exit.kind != analysis::HandlerExitKind::Return) {
+      const auto isSuppressed = [&](const EdgeCopy& copy) {
+        for (std::size_t slot = 0; slot < activeFrame_->frame.slots.size(); ++slot) {
+          if (!exit.unchanged[slot]) {
+            continue;
+          }
+          const il::OpId shadowPhi = activeFrame_->frame.slots[slot].shadowPhiAtMerge;
+          if (copy.destination == ctx_.function.op(shadowPhi).result) {
+            return true;
+          }
+        }
+        return false;
+      };
+      copies.erase(std::remove_if(copies.begin(), copies.end(), isSuppressed), copies.end());
+      if (copies.empty()) {
+        return;
+      }
+    }
+  }
+  // The frame's own restore, back out of the merge into the hub: a
+  // `unanimous` slot's shadow phi is, by construction, always exactly the
+  // live phi's own value (every handler that reaches merge proved as much),
+  // so this copy is `live[i] = live[i]` on every single call -- not merely
+  // redundant with something else printed nearby, but never anything other
+  // than a no-op, on any path, seeded or not.
+  if (activeFrame_ && from == activeFrame_->merge) {
+    const auto isIdentityRestore = [&](const EdgeCopy& copy) {
+      for (std::size_t slot = 0; slot < activeFrame_->unanimous.size(); ++slot) {
+        if (!activeFrame_->unanimous[slot]) {
+          continue;
+        }
+        const il::OpId livePhi = activeFrame_->frame.slots[slot].livePhiAtHub;
+        if (copy.destination == ctx_.function.op(livePhi).result) {
+          return true;
+        }
+      }
+      return false;
+    };
+    copies.erase(std::remove_if(copies.begin(), copies.end(), isIdentityRestore), copies.end());
+    if (copies.empty()) {
+      return;
+    }
   }
   // Parallel semantics: a source reading a DIFFERENT copy's destination on
   // this same edge must read the value from before the edge, so that
@@ -872,13 +1305,44 @@ void StmtPrinter::printEdge(il::BlockId from, il::BlockId to, std::string& out) 
     roots.push_back(copy.source);
   }
   expressions_.beginScope(roots);
-  for (const EdgeCopy& copy : copies) {
+  // A dispatcher merge with several argument-register phis often finds this
+  // predecessor never set up more than one or two of them (see
+  // ssa_construct.cpp's own note on why the edge contributes Undef here
+  // rather than the value being wrong): one `/*undef*/0` line per register
+  // says the same thing seven times over. A run of them that are not
+  // `conflicting` -- and an Undef source, having no leaves of its own, never
+  // is -- collapses into one chained assignment instead, with the same value
+  // (0) landing in the same destinations either way.
+  const auto isUndef = [this](const EdgeCopy& copy) {
+    return ctx_.function.expr(copy.source).op == il::ExprOp::Undef;
+  };
+  const auto isConflicting = [&conflicting](const EdgeCopy& copy) {
+    return std::find(conflicting.begin(), conflicting.end(), &copy) != conflicting.end();
+  };
+  for (std::size_t index = 0; index < copies.size();) {
+    if (isUndef(copies[index]) && !isConflicting(copies[index])) {
+      std::size_t end = index + 1;
+      while (end < copies.size() && isUndef(copies[end]) && !isConflicting(copies[end])) {
+        ++end;
+      }
+      std::string assignees;
+      std::string names;
+      for (std::size_t i = index; i < end; ++i) {
+        assignees += copies[i].name + " = ";
+        names += (i == index ? "" : ", ") + copies[i].name;
+      }
+      line(out, std::format("{}0; /* {}: never set up on this edge */", assignees, names));
+      index = end;
+      continue;
+    }
+    const EdgeCopy& copy = copies[index];
     const auto assign = [&copy](const std::string& arm) {
       return std::format("{} = {};", copy.name, arm);
     };
     if (!printSelectAssign(copy.source, out, assign)) {
       line(out, assign(assignedText(copy.source, out)));
     }
+    ++index;
   }
   if (scoped) {
     ctx_.snapshots.clear();
@@ -918,7 +1382,8 @@ il::BlockId StmtPrinter::firstBlockOf(const Stmt* stmt) const {
     case StmtKind::If:
       return il::BlockId{};  // the head block precedes the if, not inside it
     case StmtKind::Continue:
-      return il::BlockId{};  // it jumps to a loop header it does not begin with
+    case StmtKind::Break:
+      return il::BlockId{};  // neither begins with a block of its own
   }
   return il::BlockId{};
 }

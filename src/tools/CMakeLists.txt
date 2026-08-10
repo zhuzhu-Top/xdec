@@ -19,3 +19,12 @@ xdec_add_executable(xdec
 # executable instead.
 target_compile_definitions(xdec PRIVATE
   XDEC_SPEC_DIR="${CMAKE_SOURCE_DIR}/specs")
+
+# Decompiled output defaults to `#include "xdec_helpers.h"` (see
+# emit/c_printer.h). Copying it beside the built xdec.exe is what lets a user
+# take generated .c straight to a compiler with no extra setup.
+add_custom_command(TARGET xdec POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "${CMAKE_SOURCE_DIR}/include/xdec/xdec_helpers.h"
+    "$<TARGET_FILE_DIR:xdec>/xdec_helpers.h"
+  COMMENT "Copying xdec_helpers.h next to xdec")

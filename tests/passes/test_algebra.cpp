@@ -360,6 +360,108 @@ TEST_CASE("idiom tier: the identities behind the new rules hold", "[passes][alge
   }
 }
 
+TEST_CASE("algebra tier: the cmn/cset errno idiom (carry-compare folding)",
+          "[passes][algebra]") {
+  Fixture f;
+  // What fold.cpp's `rewriteAdd` leaves behind for `cset hi`/`cset ls` after a
+  // `cmn a, #C`: an And/Or of two comparisons against the same recomputed
+  // sum. `matchCarryCompare`/`matchCarryCompareOr` collapse each back to the
+  // one comparison a `cmp`-based reader would have written. Checked at both
+  // widths the syscall-error check actually occurs at (32-bit registers, and
+  // the rare 64-bit one), and at a handful of additive constants — including
+  // 1, which puts the bound at all-ones and exercises the wraparound.
+  for (const unsigned width : {32u, 64u}) {
+    const Type t = Type::integer(width);
+    for (const uint64_t added : {uint64_t{1}, uint64_t{0x1000}, uint64_t{0xff}}) {
+      const uint64_t bound = Fixture::zeroExtendFor(width, 0 - added);
+      INFO(std::format("width = {} added = 0x{:x} bound = 0x{:x}", width, added, bound));
+
+      // hi: (a+C <u a) & (a+C != 0)  ==  bound <u a
+      checkEquivalent(f, [&](Function& fn, uint64_t x, uint64_t) {
+        const ExprId a = fn.constant(t, x);
+        const ExprId sum = fn.binary(ExprOp::Add, a, fn.constant(t, added));
+        return fn.binary(ExprOp::And, fn.binary(ExprOp::CmpLtU, sum, a),
+                         fn.binary(ExprOp::CmpNe, sum, fn.constant(t, 0)));
+      }, [&](Function& fn, uint64_t x, uint64_t) {
+        return fn.binary(ExprOp::CmpLtU, fn.constant(t, bound), fn.constant(t, x));
+      }, width);
+
+      // ls: (a <=u a+C) | (a+C == 0)  ==  a <=u bound
+      checkEquivalent(f, [&](Function& fn, uint64_t x, uint64_t) {
+        const ExprId a = fn.constant(t, x);
+        const ExprId sum = fn.binary(ExprOp::Add, a, fn.constant(t, added));
+        return fn.binary(ExprOp::Or, fn.binary(ExprOp::CmpLeU, a, sum),
+                         fn.binary(ExprOp::CmpEq, sum, fn.constant(t, 0)));
+      }, [&](Function& fn, uint64_t x, uint64_t) {
+        return fn.binary(ExprOp::CmpLeU, fn.constant(t, x), fn.constant(t, bound));
+      }, width);
+    }
+  }
+}
+
+TEST_CASE("algebra tier: a shared subtrahend cancels out of an equality",
+          "[passes][algebra]") {
+  Fixture f;
+  // `(a + (k1 - x)) == (k2 - x)` is `a == (k2 - k1)`, whatever `x` is: an
+  // opaque predicate's favourite way to hide a fixed comparison behind an
+  // in-flight value nobody expects to cancel. Checked with `x` genuinely
+  // random (not just the two constants) since the whole claim is that its
+  // value never matters.
+  for (const unsigned width : {32u, 64u}) {
+    const Type t = Type::integer(width);
+    for (const auto [k1, k2] :
+        {std::pair{uint64_t{0x898048e0df683786}, uint64_t{0x898048e0df6837a1}},
+         std::pair{uint64_t{0}, uint64_t{5}}, std::pair{uint64_t{5}, uint64_t{0}}}) {
+      INFO(std::format("width = {} k1 = 0x{:x} k2 = 0x{:x}", width, k1, k2));
+      const uint64_t bound = Fixture::zeroExtendFor(width, k2 - k1);
+
+      // x binds the second random leaf; a binds the first.
+      checkEquivalent(f, [&](Function& fn, uint64_t a, uint64_t x) {
+        const ExprId sub = fn.binary(ExprOp::Sub, fn.constant(t, k1), fn.constant(t, x));
+        const ExprId sum = fn.binary(ExprOp::Add, fn.constant(t, a), sub);
+        const ExprId rhs = fn.binary(ExprOp::Sub, fn.constant(t, k2), fn.constant(t, x));
+        return fn.binary(ExprOp::CmpEq, sum, rhs);
+      }, [&](Function& fn, uint64_t a, uint64_t) {
+        return fn.binary(ExprOp::CmpEq, fn.constant(t, a), fn.constant(t, bound));
+      }, width);
+
+      // The operand order the obfuscator actually emits (sub first in the
+      // add) collapses the same way, and so does `!=`.
+      checkEquivalent(f, [&](Function& fn, uint64_t a, uint64_t x) {
+        const ExprId sub = fn.binary(ExprOp::Sub, fn.constant(t, k1), fn.constant(t, x));
+        const ExprId sum = fn.binary(ExprOp::Add, sub, fn.constant(t, a));
+        const ExprId rhs = fn.binary(ExprOp::Sub, fn.constant(t, k2), fn.constant(t, x));
+        return fn.binary(ExprOp::CmpNe, sum, rhs);
+      }, [&](Function& fn, uint64_t a, uint64_t) {
+        return fn.binary(ExprOp::CmpNe, fn.constant(t, a), fn.constant(t, bound));
+      }, width);
+    }
+  }
+
+  // Structural: with `a` and `x` both left as unanalysable entry leaves (not
+  // constants an earlier fold could have collapsed on its own), the pass
+  // still reduces the whole comparison to `a == (k2 - k1)` -- proving the
+  // rule fires on the shape itself, not merely on the values it happened to
+  // be checked with above.
+  SECTION("fires with both sides symbolic, not just constant-folded away") {
+    const Type t = Type::integer(64);
+    const ExprId a = f.function.entryReg(f.function.registers().find("x0"));
+    const ExprId x = f.function.entryReg(f.function.registers().find("x1"));
+    const ExprId sum = f.function.binary(
+        ExprOp::Add, a, f.function.binary(ExprOp::Sub, f.function.constant(t, 0x30), x));
+    const ExprId rhs = f.function.binary(ExprOp::Sub, f.function.constant(t, 0x1b), x);
+    const ExprId id = f.function.binary(ExprOp::CmpEq, sum, rhs);
+    const ExprId out = xdec::passes::simplifyAlgebra(f.function, id);
+    const il::Expr& expr = f.function.expr(out);
+    REQUIRE(expr.op == ExprOp::CmpEq);
+    CHECK(expr.operands[0] == a);
+    uint64_t bound = 0;
+    REQUIRE(f.function.asConstant(expr.operands[1], bound));
+    // 0x1b - 0x30, wrapped to 64 bits.
+    CHECK(bound == Fixture::zeroExtendFor(64, uint64_t{0x1b} - uint64_t{0x30}));
+  }
+}
+
 // The evaluator every rule above is checked against, on the one family whose
 // operands are wider than its result. A comparison is a boolean, so folding it
 // by its own width compares bit zero of each side and calls 4 == 6 true --
@@ -650,6 +752,54 @@ TEST_CASE("structural: the rewrite produces the promised shape", "[passes][algeb
     const il::Expr& out = f.function.expr(xdec::passes::simplifyAlgebra(f.function, id));
     REQUIRE(out.op == ExprOp::CmpEq);
     CHECK(f.function.expr(out.operands[0]).op == ExprOp::Shl);
+  }
+
+  SECTION("the cmn/cset hi idiom collapses to one unsigned comparison") {
+    // sub_199214's own shape once fold.cpp's Add-flag folding has run:
+    // (x+0x1000 <u x) & (x+0x1000 != 0), the `cmn w8, #0x1000; cset w8, hi`
+    // pair -- must fold to `0xfffff000 <u x`, matching IDA's `x > 0xfffff000`.
+    const Type t32 = Type::integer(32);
+    const ExprId x32 = f.function.cast(ExprOp::Trunc, t32, x);
+    const ExprId sum = f.function.binary(ExprOp::Add, x32, f.function.constant(t32, 0x1000));
+    const ExprId id = f.function.binary(
+        ExprOp::And, f.function.binary(ExprOp::CmpLtU, sum, x32),
+        f.function.binary(ExprOp::CmpNe, sum, f.function.constant(t32, 0)));
+    const il::Expr& out = f.function.expr(xdec::passes::simplifyAlgebra(f.function, id));
+    REQUIRE(out.op == ExprOp::CmpLtU);
+    uint64_t bound = 0;
+    REQUIRE(f.function.asConstant(out.operands[0], bound));
+    CHECK(bound == 0xfffff000);
+    CHECK(out.operands[1] == x32);
+  }
+
+  SECTION("the cmn/cset ls idiom collapses to one unsigned comparison") {
+    const Type t32 = Type::integer(32);
+    const ExprId x32 = f.function.cast(ExprOp::Trunc, t32, x);
+    const ExprId sum = f.function.binary(ExprOp::Add, x32, f.function.constant(t32, 0x1000));
+    const ExprId id = f.function.binary(
+        ExprOp::Or, f.function.binary(ExprOp::CmpLeU, x32, sum),
+        f.function.binary(ExprOp::CmpEq, sum, f.function.constant(t32, 0)));
+    const il::Expr& out = f.function.expr(xdec::passes::simplifyAlgebra(f.function, id));
+    REQUIRE(out.op == ExprOp::CmpLeU);
+    CHECK(out.operands[0] == x32);
+    uint64_t bound = 0;
+    REQUIRE(f.function.asConstant(out.operands[1], bound));
+    CHECK(bound == 0xfffff000);
+  }
+
+  SECTION("mismatched sums on the two sides do not fire the carry-compare fold") {
+    // The two comparisons must share the exact same recomputed sum -- a
+    // coincidental pair that merely looks alike (different additive
+    // constants, so different hash-consed nodes) is not this idiom and must
+    // be left as the And it is.
+    const Type t32 = Type::integer(32);
+    const ExprId x32 = f.function.cast(ExprOp::Trunc, t32, x);
+    const ExprId sum1 = f.function.binary(ExprOp::Add, x32, f.function.constant(t32, 1));
+    const ExprId sum2 = f.function.binary(ExprOp::Add, x32, f.function.constant(t32, 2));
+    const ExprId id = f.function.binary(
+        ExprOp::And, f.function.binary(ExprOp::CmpLtU, sum1, x32),
+        f.function.binary(ExprOp::CmpNe, sum2, f.function.constant(t32, 0)));
+    CHECK(f.function.expr(xdec::passes::simplifyAlgebra(f.function, id)).op == ExprOp::And);
   }
 
   SECTION("a flag condition over a literal bundle folds to the boolean") {

@@ -69,6 +69,15 @@ class WordMemory {
 }
 /// `blr x<rn>`: a call through whatever the register holds.
 [[nodiscard]] constexpr uint32_t blr(unsigned rn) { return 0xd63f0000U | (rn << 5U); }
+/// `movz x<rd>, #imm16`: builds a small constant, standing in for the
+/// `adrp`+`add` pair real code uses to materialize a GOT slot's address.
+[[nodiscard]] constexpr uint32_t movz(unsigned rd, uint16_t imm16) {
+  return 0xd2800000U | (static_cast<uint32_t>(imm16) << 5U) | rd;
+}
+/// `ldr x<rt>, [x<rn>]`: reads the pointer a GOT slot holds.
+[[nodiscard]] constexpr uint32_t ldr(unsigned rt, unsigned rn) {
+  return 0xf9400000U | (rn << 5U) | rt;
+}
 constexpr uint32_t kRet = 0xd65f03c0U;
 
 /// The function at 0x1000 is `entry`; 0x2000 is `callee`. Anything else is
@@ -98,9 +107,11 @@ constexpr uint32_t kRet = 0xd65f03c0U;
 }
 
 /// Lifts at 0x1000, runs the stock pipeline with the given header imported (or
-/// none), and returns how many arguments the one call op came out with.
+/// none) and the given loader facts (or none), and returns how many
+/// arguments the one call op came out with.
 [[nodiscard]] std::size_t argCount(const WordMemory& memory,
-                                   const TypeDatabase* database) {
+                                   const TypeDatabase* database,
+                                   xdec::MemoryFacts memoryFacts = {}) {
   auto lifted = xdec::spec::liftFunction(engine(), memory.reader(), 0x1000);
   const std::string liftError = lifted ? std::string{} : lifted.error().format();
   INFO(liftError);
@@ -111,6 +122,7 @@ constexpr uint32_t kRet = 0xd65f03c0U;
   xdec::passes::registerBuiltinPasses(registry);
   xdec::pass::Manager manager;
   manager.setImage(memory.reader());
+  manager.setMemoryFacts(std::move(memoryFacts));
   manager.setTypeDatabase(database);
   manager.setNames(names());
   auto ran = manager.runTo(*function, registry, Maturity::Vars);
@@ -203,6 +215,43 @@ TEST_CASE("an untyped indirect call keeps every argument", "[passes][apply-types
   WordMemory memory;
   memory.put(0x1000, blr(0));
   memory.put(0x1004, kRet);
+
+  const TypeDatabase database = parse("int callee(void *dst, unsigned long n);");
+  CHECK(argCount(memory, &database) == 8);
+}
+
+// A call through a GOT/import slot: x8 holds an address (0x3000) nothing in
+// the image defines, but the loader fills that slot from an import named
+// "callee" -- the same shape a PLT/GOT call to a libc function takes in a
+// real PIE .so once adrp+ldr has computed the slot's address.
+TEST_CASE("a call through a GOT slot is trimmed to the imported symbol's arity",
+          "[passes][apply-types]") {
+  WordMemory memory;
+  memory.put(0x1000, movz(8, 0x3000));
+  memory.put(0x1004, ldr(8, 8));
+  memory.put(0x1008, blr(8));
+  memory.put(0x100c, kRet);
+
+  const TypeDatabase database = parse("int callee(void *dst, unsigned long n);");
+  xdec::MemoryFacts facts;
+  facts.loader = [](uint64_t va) {
+    xdec::LoaderValue value;
+    if (va == 0x3000) {
+      value.importName = "callee";
+    }
+    return value;
+  };
+  CHECK(argCount(memory, &database, facts) == 2);
+}
+
+// The same shape with no loader facts at all: the slot's address is known but
+// nothing says what fills it, so nothing may be concluded from it.
+TEST_CASE("a GOT call keeps every argument without loader facts", "[passes][apply-types]") {
+  WordMemory memory;
+  memory.put(0x1000, movz(8, 0x3000));
+  memory.put(0x1004, ldr(8, 8));
+  memory.put(0x1008, blr(8));
+  memory.put(0x100c, kRet);
 
   const TypeDatabase database = parse("int callee(void *dst, unsigned long n);");
   CHECK(argCount(memory, &database) == 8);

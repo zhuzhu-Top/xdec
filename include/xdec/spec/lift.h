@@ -73,9 +73,17 @@ struct LiftedFunction {
 /// The function comes back at Maturity::Lifted: blocks carry addresses and
 /// terminators, but no promise of CFG completeness until the unresolved edges
 /// are resolved.
+///
+/// `facts` is how the scan learns a direct call never returns (a PLT stub
+/// bound to `__stack_chk_fail` and the like -- see analysis/noreturn.h): its
+/// fall-through is then left unscanned rather than treated as the start of
+/// more of this function. Default-constructed facts answer "don't know" for
+/// everything, which keeps every caller that has no image to ask exactly
+/// today's behaviour.
 [[nodiscard]] Result<LiftedFunction> liftFunction(const SpecEngine& engine,
                                                   const ByteReader& reader,
-                                                  uint64_t entry);
+                                                  uint64_t entry,
+                                                  const MemoryFacts& facts = {});
 
 /// Incremental discovery into an existing function: scans and elaborates
 /// basic blocks starting at `entries`, splicing them into `function` next to
@@ -97,6 +105,7 @@ struct LiftBlocksResult {
 [[nodiscard]] Result<LiftBlocksResult> liftBlocksInto(il::Function& function,
                                                       const SpecEngine& engine,
                                                       const ByteReader& reader,
-                                                      std::span<const uint64_t> entries);
+                                                      std::span<const uint64_t> entries,
+                                                      const MemoryFacts& facts = {});
 
 }  // namespace xdec::spec

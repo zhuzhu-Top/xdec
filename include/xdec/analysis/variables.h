@@ -23,8 +23,11 @@
 
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/il/function.h"
+#include "xdec/types/binder.h"
 
 namespace xdec::analysis {
+
+class TypedVariables;
 
 enum class VarKind : uint8_t { Argument, Local, Temp };
 
@@ -51,6 +54,23 @@ struct Variable {
   int64_t stackDelta = 0;
   /// Temp: the phi value backing this variable.
   il::ValueId value{};
+  /// What a call or syscall this variable was passed to (or, for a temp, was
+  /// assigned from) said its type was — see TypedVariables. Unset is the
+  /// default and the common case: most variables have no such evidence, and
+  /// `type` above is everything there is to say about them. Set only through
+  /// applyImportedTypes, and only where it does not contradict `type` (see
+  /// types::TypeBinder::consistent).
+  std::optional<types::TypeId> importedType;
+
+  /// Local only: this slot is one field of the struct promoted at
+  /// `*aliasBase` (another Local's stackDelta), named `aliasField` --
+  /// `var_50.tv_usec` rather than a second, disconnected `var_48`. Set only
+  /// when applyImportedTypes finds an *exact* offset-and-width field match, so
+  /// an aliased local is never a guess about which field a read landed on. An
+  /// aliased local is never declared on its own (see c_printer.cpp's
+  /// declarations) and every access to it resolves through the base instead.
+  std::optional<int64_t> aliasBase;
+  std::string aliasField;
 };
 
 class VariableTable {
@@ -59,6 +79,16 @@ class VariableTable {
   /// beyond (EntryReg leaves and stack-slot shapes must already exist).
   [[nodiscard]] static VariableTable recover(const il::Function& function,
                                              const StackFrame& frame);
+
+  /// Layers TypedVariables evidence over the CType-inferred variables: an
+  /// argument, local or temp with type evidence from a call/syscall site (see
+  /// analysis::TypedVariables) is annotated with the imported TypeId,
+  /// filtered through `binder.consistent` for arguments and temps so that
+  /// contradicting machine evidence is never overridden. A stack local goes
+  /// through a size check instead of `consistent` (see the .cpp): its `type`
+  /// is the widest single access, which is honest for a scalar but not
+  /// comparable to a struct's size the way a scalar's own inferred width is.
+  void applyImportedTypes(const TypedVariables& typed, const types::TypeBinder& binder);
 
   [[nodiscard]] const Variable* argumentFor(il::RegId root) const;
   [[nodiscard]] const Variable* localAt(int64_t delta) const;

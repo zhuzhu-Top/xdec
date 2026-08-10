@@ -2,6 +2,7 @@
 #include "c_flags.h"
 
 #include <format>
+#include <string_view>
 
 #include "c_expr.h"
 
@@ -9,15 +10,36 @@ namespace xdec::emit {
 
 namespace {
 
-/// The overflow-exact conditions go to a generated helper: N and V from a
-/// subtraction cannot be spelled as one C comparison without repeating the
-/// operands, and repeating them would double any side-effect-free but large
-/// expression at every use.
+/// The overflow-exact conditions go to xdec_helpers.h's `cc_<cond><width>`:
+/// N and V from a subtraction cannot be spelled as one C comparison without
+/// repeating the operands, and repeating them would double any
+/// side-effect-free but large expression at every use.
+///
+/// The header only defines the six conditions real code actually asks for
+/// here (ge/lt/gt/le/vs/vc — see printFlagCond's Sub/Logical/Add cases).
+/// Always/Never reaching this point would mean a condition that does not
+/// depend on flags at all showed up as one anyway: nothing upstream should
+/// produce that, so rather than call a function the header does not
+/// declare, it falls back to the same labelled stub an entirely unmodelled
+/// flagOp gets below.
 [[nodiscard]] std::string ccHelper(CContext& context, il::ConditionCode code,
                                    unsigned width, const std::string& a,
                                    const std::string& b) {
-  context.helpers.insert(std::format("cc_{}_{}", il::toString(code), width));
-  return std::format("__xdec_cc_{}_{}({}, {})", il::toString(code), width, a, b);
+  const std::string_view name = il::toString(code);
+  constexpr std::string_view kKnown[] = {"ge", "lt", "gt", "le", "vs", "vc"};
+  bool known = false;
+  for (const std::string_view candidate : kKnown) {
+    if (candidate == name) {
+      known = true;
+      break;
+    }
+  }
+  if (!known) {
+    context.helpers.insert("flagcond_stub");
+    return std::format("xdec_flagcond_stub(/*{}*/ {}, {})", name, a, b);
+  }
+  context.helpers.insert(std::format("cc_{}{}", name, width));
+  return std::format("cc_{}{}({}, {})", name, width, a, b);
 }
 
 }  // namespace
@@ -130,7 +152,7 @@ std::string printFlagCond(CContext& context, ExprPrinter& expressions,
       }
     default:
       context.helpers.insert("flagcond_stub");
-      return std::format("__xdec_flagcond_stub(/*{}*/ {}, {})",
+      return std::format("xdec_flagcond_stub(/*{}*/ {}, {})",
                          il::toString(code), a, b);
   }
 }

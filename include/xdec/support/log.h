@@ -6,6 +6,7 @@
 // variable, e.g. XDEC_LOG=binary=debug,lift=trace or XDEC_LOG=trace for all.
 #pragma once
 
+#include <cstdint>
 #include <format>
 #include <string>
 #include <string_view>

@@ -709,6 +709,17 @@ std::string TypeDatabase::keyOf(const TypeEntry& entry) {
   return key;
 }
 
+std::optional<TypeId> TypeDatabase::findPointerTo(TypeId pointee) const {
+  TypeEntry probe;
+  probe.kind = TypeKind::Pointer;
+  probe.element = pointee;
+  const auto found = interned_.find(keyOf(probe));
+  if (found == interned_.end()) {
+    return std::nullopt;
+  }
+  return found->second;
+}
+
 TypeId TypeDatabase::intern(TypeEntry entry) {
   const std::string key = keyOf(entry);
   const auto found = interned_.find(key);

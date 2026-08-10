@@ -165,6 +165,32 @@ comparison's result is one bit, so `4 == 6` folded to true. Fixed in
 `il/ceval.cpp`, pinned by *the constant evaluator compares whole operands, not
 result widths*.
 
+## The errno check, spelled as a flag test
+
+The same test has a second obfuscated spelling that has nothing to do with
+shifting: ARM's `cmn w8, #0x1000` / `cset w8, hi` computes the errno bound with
+the flags unit instead of a compare instruction, because `cmn` is an alias for
+an `adds` whose result is thrown away. `fold.cpp`'s lazy-flag folding already
+turns that pair into pure comparisons — the `UnsignedGreater` condition over an
+`Add` flag bundle becomes `(a+C <u a) & (a+C != 0)` — which is *correct* the
+moment it is built, but reads nothing like the one comparison a `cmp`-based
+disassembly would show.
+
+`matchCarryCompare`/`matchCarryCompareOr` (`passes/algebra_idioms.h`) close
+that gap the same way `matchShiftedCompare` closes the shifted one: unsigned
+overflow of `a + C` happens exactly at `a >= -C`, and requiring the sum
+nonzero excludes the boundary where it wraps to zero, leaving `a >u -C` — so
+`(a+C <u a) & (a+C != 0)` folds to one comparison against `-C`, and the `ls`
+mirror (`(a <=u a+C) | (a+C == 0)`) folds to `a <=u -C`. Applied to
+`sub_199214`'s own dispatcher state, `_cse0 + 0x1000` and the OR-of-two-
+comparisons disappear entirely, leaving `!(_cse0 <= 0xfffff000)` — the same
+bound IDA's `(unsigned int)v13 > 0xFFFFF000` names, spelled as a negated `<=`
+because this IL has no `>` operator of its own. Proven the same way as every
+other idiom here: `tests/passes/test_algebra.cpp`'s carry-compare cases, both
+structurally (the fold fires and produces the promised shape) and against the
+random-binding oracle (both spellings agree at every trial, at 32 and 64
+bits).
+
 The other half of the plan's idiom work — a combined comment for the
 release-monitor-plus-counter-reset gate that precedes these probes — is not
 done. It needs the production sample to say what shape is actually worth

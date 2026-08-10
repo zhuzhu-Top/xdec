@@ -2,7 +2,14 @@
 
 #include <algorithm>
 #include <format>
+#include <optional>
+#include <set>
 #include <unordered_set>
+
+#include "xdec/analysis/dispatcher_shape.h"
+#include "xdec/analysis/live_register_frame.h"
+#include "xdec/analysis/typed_variables.h"
+#include "xdec/types/database.h"
 
 namespace xdec::analysis {
 
@@ -264,6 +271,37 @@ il::ExprId addressBase(const il::Function& function, il::ExprId address) {
   return bits;
 }
 
+/// A stack slot's dispatcher-state signal: how many distinct small integers
+/// (an enum-sized range, not data) it is ever seen being assigned. A
+/// flattening obfuscator threads its state through a slot like this one --
+/// stored fresh before nearly every computed branch, each site a different
+/// literal -- so a slot with many such literals is that thread made visible,
+/// even though nothing here follows the branches to prove it. Constants are
+/// collected through one level of `Select` so the common `cond ? a : b` a
+/// two-way dispatch leaves behind counts as two candidate states rather than
+/// none. Values above a small-enum range are ignored: a hash, address, or
+/// counter stored to the same slot elsewhere must not read as a state.
+constexpr uint64_t kStateConstantMax = 0xff;
+constexpr std::size_t kStateConstantThreshold = 4;
+
+void collectSmallConstants(const il::Function& function, il::ExprId id,
+                           std::set<uint64_t>& out, unsigned depth = 0) {
+  if (!id.valid() || depth > 3) {
+    return;
+  }
+  const il::Expr& expr = function.expr(id);
+  if (expr.op == il::ExprOp::Const) {
+    if (expr.immediate <= kStateConstantMax) {
+      out.insert(expr.immediate);
+    }
+    return;
+  }
+  if (expr.op == il::ExprOp::Select) {
+    collectSmallConstants(function, expr.operand(1), out, depth + 1);
+    collectSmallConstants(function, expr.operand(2), out, depth + 1);
+  }
+}
+
 /// How many bits of a value the function itself sets.
 ///
 /// SSA over machine registers gives every value the width of the register that
@@ -452,6 +490,7 @@ VariableTable VariableTable::recover(const il::Function& function,
 
   // Locals: one per observed stack-slot delta, widest access wins.
   std::map<int64_t, uint32_t> slotWidths;
+  std::map<int64_t, std::set<uint64_t>> slotConstants;
   for (const il::OpId opId : scan.memoryOps_) {
     const il::Op& op = function.op(opId);
     const auto operands = function.operands(op);
@@ -461,12 +500,44 @@ VariableTable VariableTable::recover(const il::Function& function,
     }
     uint32_t& width = slotWidths[info.delta];
     width = std::max(width, op.type.bits());
+    if (op.code == il::OpCode::Store) {
+      collectSmallConstants(function, operands[1], slotConstants[info.delta]);
+    }
+  }
+  // At most one slot per function is promoted to `state`: a second slot that
+  // also happens to collect several small literals is far more likely to be
+  // an ordinary counter or flags word than a second dispatcher, and handing
+  // out the same name twice would be a worse reading than not promoting it.
+  // Among the slots that qualify, the one with the most distinct literals is
+  // kept rather than the first one found by ascending delta: a flattening
+  // obfuscator's real dispatcher slot collects roughly one value per state the
+  // function has, so the widest spread of small integers is the strongest
+  // signal available without following the branches themselves. (A read
+  // requirement was tried here and dropped: the reference dispatcher this
+  // heuristic is tuned against, samples/manifest.json's sample_jni_onload,
+  // keeps its state value live in a register/phi between the spill and its
+  // use in the table address, so the slot that carries it is store-only --
+  // excluding store-only slots throws away exactly the case this exists for.)
+  std::optional<int64_t> stateDelta;
+  std::size_t stateDeltaCount = 0;
+  for (const auto& [delta, constants] : slotConstants) {
+    if (constants.size() < kStateConstantThreshold) {
+      continue;
+    }
+    if (constants.size() > stateDeltaCount) {
+      stateDeltaCount = constants.size();
+      stateDelta = delta;
+    }
   }
   for (const auto& [delta, width] : slotWidths) {
     Variable var;
     var.kind = VarKind::Local;
-    var.name = delta <= 0 ? std::format("var_{:x}", -delta)
-                          : std::format("starg_{:x}", delta);
+    if (stateDelta.has_value() && delta == *stateDelta) {
+      var.name = "state";
+    } else {
+      var.name = delta <= 0 ? std::format("var_{:x}", -delta)
+                            : std::format("starg_{:x}", delta);
+    }
     var.stackDelta = delta;
     var.type.width = std::max(width, 8u);
     table.localByDelta_[delta] = static_cast<uint32_t>(table.locals_.size());
@@ -598,7 +669,121 @@ VariableTable VariableTable::recover(const il::Function& function,
     }
   }
 
+  // A flattening dispatcher's own argument-register relay (see
+  // analysis::LiveRegisterFrame): the two phis a register gets, one merging
+  // every handler's exit value and one merging that against the function's
+  // entry, read as two arbitrary temporaries otherwise -- `x{N}_live` (what
+  // this iteration's handler sees) and `x{N}_exit` (what it leaves there)
+  // says which register and which of the two phis this is, the same way
+  // `state` already says which stack slot drives the dispatch. Found by a
+  // fresh scan rather than threaded in from structuring: this runs before
+  // structureFunction does, and the shape is cheap enough to look for again
+  // without waiting for it.
+  for (const il::BlockId blockId : function.blockHandles()) {
+    const auto& ops = function.block(blockId).ops;
+    if (ops.empty()) {
+      continue;
+    }
+    const il::Op& terminator = function.op(ops.back());
+    if (terminator.code != il::OpCode::IndirectBranch) {
+      continue;
+    }
+    const auto targets = function.targets(terminator);
+    if (targets.empty()) {
+      continue;
+    }
+    const auto shape = matchDispatcherShape(function, blockId, targets);
+    if (!shape.has_value()) {
+      continue;
+    }
+    const auto dispatcherFrame = matchLiveRegisterFrame(function, *shape);
+    if (!dispatcherFrame.has_value()) {
+      continue;
+    }
+    for (const LiveRegisterSlot& slot : dispatcherFrame->slots) {
+      const int index = argumentIndex(function, slot.reg);
+      if (index < 0) {
+        continue;
+      }
+      if (const auto found =
+              table.tempByValue_.find(function.op(slot.livePhiAtHub).result.index());
+          found != table.tempByValue_.end()) {
+        table.temps_[found->second].name = std::format("x{}_live", index);
+      }
+      if (const auto found =
+              table.tempByValue_.find(function.op(slot.shadowPhiAtMerge).result.index());
+          found != table.tempByValue_.end()) {
+        table.temps_[found->second].name = std::format("x{}_exit", index);
+      }
+    }
+  }
+
   return table;
+}
+
+void VariableTable::applyImportedTypes(const TypedVariables& typed,
+                                       const types::TypeBinder& binder) {
+  const types::TypeDatabase& database = binder.database();
+  for (Variable& arg : args_) {
+    const std::optional<types::TypeId> found = typed.forArgument(arg.argRoot);
+    if (found.has_value() && binder.consistent(*found, arg.type.width, arg.type.pointerDepth)) {
+      arg.importedType = *found;
+    }
+  }
+  for (Variable& temp : temps_) {
+    const std::optional<types::TypeId> found = typed.forValue(temp.value);
+    if (found.has_value() && binder.consistent(*found, temp.type.width, temp.type.pointerDepth)) {
+      temp.importedType = *found;
+    }
+  }
+  // Locals are ordered by ascending stackDelta (see recover(), which builds
+  // them from a std::map keyed the same way). That is what makes a struct's
+  // extent checkable against its neighbours: `struct timeval` claims 16
+  // bytes at `sp-0x50`, and `sp-0x48` -- eight bytes in, already its own
+  // Local because something loads it directly -- has to be accounted for
+  // rather than silently overwritten. It is, when it lands on an exact field
+  // (see absorb() below); otherwise the promotion is skipped rather than
+  // printing a struct with an unexplained hole in it.
+  for (std::size_t index = 0; index < locals_.size(); ++index) {
+    Variable& local = locals_[index];
+    const std::optional<types::TypeId> found = typed.forStackSlot(local.stackDelta);
+    if (!found.has_value()) {
+      continue;
+    }
+    const std::optional<uint64_t> size = database.sizeOf(*found);
+    if (!size.has_value() || *size * 8 < local.type.width) {
+      continue;  // narrower than what was actually read: the header disagrees
+    }
+    const int64_t base = local.stackDelta;
+    const int64_t end = base + static_cast<int64_t>(*size);
+    std::size_t last = index;
+    bool coversCleanly = true;
+    while (last + 1 < locals_.size() && locals_[last + 1].stackDelta < end) {
+      const Variable& sibling = locals_[last + 1];
+      const types::TypeDatabase::FieldPath field =
+          database.fieldAt(*found, static_cast<uint64_t>(sibling.stackDelta - base));
+      if (!field.found() || field.remainder != 0 ||
+          database.sizeOf(field.type).value_or(0) * 8 != sibling.type.width) {
+        coversCleanly = false;
+        break;
+      }
+      ++last;
+    }
+    if (!coversCleanly) {
+      continue;
+    }
+    for (std::size_t absorbed = index + 1; absorbed <= last; ++absorbed) {
+      const types::TypeDatabase::FieldPath field = database.fieldAt(
+          *found, static_cast<uint64_t>(locals_[absorbed].stackDelta - base));
+      std::string path;
+      for (const std::string& name : field.names) {
+        path += path.empty() ? name : "." + name;
+      }
+      locals_[absorbed].aliasBase = base;
+      locals_[absorbed].aliasField = std::move(path);
+    }
+    local.importedType = *found;
+  }
 }
 
 const Variable* VariableTable::argumentFor(il::RegId root) const {

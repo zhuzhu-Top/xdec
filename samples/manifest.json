@@ -16,11 +16,12 @@
       "category": "dispatcher",
       "binary": "libtarget",
       "address": "0xe4c8c",
-      "comment": "OLLVM-flattened JNI_OnLoad: a state variable (var_178) is threaded through if-chains and a table load (g_1e14d0 base + state*8) that picks the next block. No 'rounds' key, so it runs at the harness default of 8 -- pinned, which makes it a wall rather than a budget, so a regression in rounds-per-level fails the case instead of quietly costing time. It needed 24 before Phase A2 and takes 8 now (7 rounds of discovery, one to confirm the fixpoint): carrying a branch's candidate set with its discovery lets the round that lifts a level also open it. fold-resolved-branch (Phase A1) turned every single-target resolved branch into a plain fallthrough, which is most of why gotos/ifs are this low; the remaining ones are the genuine 3-way switch, its own back edge, and one dead-end self-loop the obfuscator pads with. The 13 remaining ternaries are the ones Phase A4 deliberately left: a select nested inside an address computation or hoisted to a shared temporary is not a statement, and rewriting it as one would invent control flow the code does not have.",
+      "comment": "OLLVM-flattened JNI_OnLoad: a state variable (named 'state', see analysis/variables.cpp's dispatcher-state promotion) is threaded through if-chains and a table load (g_1e14d0 base + state*8) that picks the next block. Before boundOnIndex learned to read a branchless clamp (a select whose own condition, or whose arm's own width, proves it -- see analysis/index_bound.cpp's localBound/armBound), 15 of this table's 16 targets stayed unresolved: only the state transitions a *branch* happened to guard were provable, so most of the state machine was invisible and the metrics below looked deceptively small. All 16 branches now resolve -- verified by hand against the raw g_1e14d0 bytes, every one matches -- so the shape below is the whole real state machine: 4 switches (one per place a clamped state selects the next block), 16 labelled blocks, and the goto/undef counts that come from copying live registers across every one of those edges. That copying (a case's t8..t15 = a0..a7 chain, mostly /*undef*/ because a state transition rarely uses all eight) is exactly what Phase 1a/1b's dispatcher-loop structurizer exists to fold into a single 'while(state) switch(state)' with real variables instead of a labelled goto per edge -- shrinking this further is that work, not a fix to this analysis.",
       "expect": {
-        "max_gotos": 7,
+        "max_gotos": 55,
         "min_switches": 1,
-        "max_ternaries": 13
+        "max_ternaries": 26,
+        "max_undef": 120
       }
     },
     {
@@ -29,12 +30,43 @@
       "binary": "libtarget",
       "address": "0x199214",
       "decompile_args": ["--allow-unresolved"],
-      "comment": "The same obfuscator turned up to a size nothing resolves whole: 320 blocks behind one entry, and ~300 of its computed branches are 'ldr xT,[x26,xI,lsl#3]; br xT' where x26 never narrows to one value, so the table shape never matches and the value set stays top. The driver still reaches a real fixpoint in 4 rounds -- this is not a round-budget case -- and until Phase A3 the run then failed the Resolved gate and produced nothing at all for 320 understood blocks. --allow-unresolved seals each unanswerable branch as an opaque terminator naming the expression it could not evaluate, so the case now scores what was recovered and tracks the holes as a number. Lowering max_unresolved_branches is the measure of progress on data-dependent brind resolution; raising it is a regression.",
+      "comment": "Not actually a mega dispatcher: this is a small 4-way syscall helper (gettimeofday, by its shape) whose CFG the lifter used to bleed into hundreds of unrelated blocks two different ways -- 'bl __stack_chk_fail@plt' was scanned as a returning call instead of ending the block (see analysis/noreturn.h), and a branchless clamp ('cmp x, #3; csel x, replacement, x, gt') that bounds one of its four indirect-branch indices was invisible to boundOnIndex, so the enumerator fell back to reading hundreds of table slots as if the index were unbounded. Fixing both drops this from 320 blocks / ~97k lines to the real function: 7 blocks, a 3-way switch, a stack-canary check that correctly ends in __builtin_unreachable(), and a clean return. The thresholds below are pinned close to that shape on purpose -- this case exists specifically to catch either bleed-through or bound over-estimation coming back.",
       "expect": {
-        "max_unresolved_branches": 301,
-        "max_undef": 28,
+        "max_unresolved_branches": 0,
+        "max_undef": 10,
         "min_switches": 1,
-        "max_ternaries": 3623
+        "max_ternaries": 4
+      }
+    },
+    {
+      "name": "sample_core_mba",
+      "category": "straight-mba",
+      "binary": "bc_lib",
+      "address": "0x2a2428",
+      "decompile_args": ["--allow-unresolved"],
+      "comment": "L2: a real, unmodified app's core algorithm entry -- a straight-line MBA block of ~5400 IL ops with no internal branch (the round-1 lifted shape), dispatched into ~163 more such blocks by a byte-indexed jump table once the driver resolves it over several rounds. Registered per the mega-block local-simplify fix (see eval/FINDINGS.md's 2026-08-10 note): before that fix, decompiling this address hung indefinitely in copyPropagateBlock/dceBlock's unbounded expression-tree growth and never produced output at all, so 'exits 0 within the round budget' is itself most of what this case is guarding. --allow-unresolved is defensive -- at the default round budget every branch this dispatcher has resolves cleanly, but a lower round cap would not finish resolving before hitting the driver's cap. Per the 2026-08-10 dispatcher-handler-inlining fix (see eval/FINDINGS.md): 161 of the 162 cases share one tail block (restore live registers, jump back to the dispatch loop) that analysis::matchDispatcherShape now recognises, so the structurizer inlines each case up to that shared tail (see structure.cpp's claimDispatcherCaseBody) and prints the tail once as the switch's own epilogue instead of once per case. Per the Live Register Frame plan (F0-F4, same FINDINGS.md date): the ~1200 lines of `tN = tM` noise in that tail turned out to be phi edge copies relaying x0-x7 through the merge block's own second phi site, not a real x0-x7/x8-x15 shadow bank -- analysis/live_register_frame.h models that relay directly, and c_stmt.cpp's printEdge uses it to print a handler's save copy only where classifyHandlerExit says the handler actually changed something (a one-time seed ahead of the switch establishes the invariant that makes skipping the rest safe). F4 then extended tryDispatcherLoop to recognise the guard's own out-of-range arm as one more private handler feeding the same merge block (exactly what put it inside the natural loop's own block set in the first place, tripping the older 'genuine exit' assumption) and inline it as the loop's `if`/`else` rather than a label outside it. That closes the three-way convergence noted below: goto count is now 0 and the whole function is one `while (true)`. The thresholds below keep light slack over that shape, not a target -- tighten them (and samples/baseline.json via -UpdateBaseline) per samples/README.md's 'increment slowly' rule.",
+      "expect": {
+        "max_gotos": 2,
+        "min_switches": 1,
+        "max_unresolved_branches": 0,
+        "max_lines": 4200,
+        "min_loops_while_true": 1
+      }
+    },
+    {
+      "name": "sample_afRDLog",
+      "category": "ollvm-mega",
+      "binary": "bc_lib",
+      "address": "0x841ac",
+      "comment": "L2: a real, unmodified app's largest OLLVM-flattened JNI function (afRDLog @ its ELF symbol, [0x841ac, 0x93e98), 724/724 lifted PCs inside the symbol -- the boundary is correct, see eval/FINDINGS.md for why the nearby 0x627ac is not a usable entry instead). Registered per the bc_lib OLLVM optimization plan as the L2 gate every phase of that plan is measured against; there is no ground truth here, only shape. Phases 0-5 of that plan have landed (state slot ID, undef-copy coalescing, hub/switch structuring, the cancelled-subtrahend and declaration-grouping readability passes, and the driver's discovery hard cap); see eval/FINDINGS.md for the per-phase before/after. The thresholds below are the 2026-08 post-phase-5 shape with light slack, not a target -- tighten them (and samples/baseline.json via -UpdateBaseline) as further work lands, per samples/README.md's 'increment slowly' rule.",
+      "rounds": 8,
+      "expect": {
+        "max_gotos": 330,
+        "min_switches": 2,
+        "max_undef": 20,
+        "max_unnamed": 4,
+        "max_encrypted_dispatch_calls": 85,
+        "min_state_named": 1
       }
     }
   ]

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "xdec/analysis/import_callee.h"
 #include "xdec/il/function.h"
 #include "xdec/types/binder.h"
 #include "xdec/types/database.h"
@@ -19,17 +20,6 @@ namespace {
 /// argument registers (see the Call case in il/verify.cpp).
 constexpr std::size_t kCallTargetOperand = 0;
 constexpr std::size_t kCallFirstArgOperand = 1;
-
-/// Which parameter an entry register is, under the AArch64 convention, or -1.
-/// The same rule analysis::VariableTable applies when it names arguments, and
-/// the two have to agree: this pass exists to change what that one counts.
-[[nodiscard]] int argumentIndex(const il::Function& function, il::RegId root) {
-  const std::string_view name = function.registers().nameOf(root);
-  if (name.size() == 2 && name[0] == 'x' && name[1] >= '0' && name[1] <= '7') {
-    return name[1] - '0';
-  }
-  return -1;
-}
 
 class ApplyTypes final : public pass::FunctionPass {
  public:
@@ -68,7 +58,7 @@ class ApplyTypes final : public pass::FunctionPass {
         if (function.op(opId).code != il::OpCode::Call) {
           continue;
         }
-        changed |= applyOne(function, binder, self, opId);
+        changed |= applyOne(function, binder, self, context.memoryFacts(), opId);
       }
     }
     return changed;
@@ -76,14 +66,14 @@ class ApplyTypes final : public pass::FunctionPass {
 
  private:
   static bool applyOne(il::Function& function, const types::TypeBinder& binder,
-                       const types::TypeEntry* self, il::OpId opId) {
+                       const types::TypeEntry* self, const MemoryFacts& memory, il::OpId opId) {
     const auto operands = function.operands(function.op(opId));
     if (operands.size() <= kCallFirstArgOperand) {
       return false;  // already trimmed, or lifted without the convention
     }
 
     const types::TypeEntry* callee =
-        calleeOf(function, binder, self, operands[kCallTargetOperand]);
+        analysis::resolveCallee(function, binder, self, memory, operands[kCallTargetOperand]);
     if (callee == nullptr || callee->variadic) {
       return false;
     }
@@ -104,30 +94,6 @@ class ApplyTypes final : public pass::FunctionPass {
                              operands.begin(),
                              operands.begin() + static_cast<std::ptrdiff_t>(keep)));
     return true;
-  }
-
-  /// The function type behind a call target, from the two kinds of evidence
-  /// there are: a symbol at a constant address, and the declared type of a
-  /// parameter the target was read from.
-  [[nodiscard]] static const types::TypeEntry* calleeOf(
-      const il::Function& function, const types::TypeBinder& binder,
-      const types::TypeEntry* self, il::ExprId target) {
-    uint64_t address = 0;
-    if (function.asConstantThroughCasts(target, address)) {
-      return binder.prototypeAt(address);
-    }
-    if (self == nullptr) {
-      return nullptr;
-    }
-    const il::Expr& expr = function.expr(target);
-    if (expr.op != il::ExprOp::EntryReg) {
-      return nullptr;
-    }
-    const int index = argumentIndex(function, il::RegId{static_cast<uint32_t>(expr.immediate)});
-    if (index < 0 || static_cast<std::size_t>(index) >= self->params.size()) {
-      return nullptr;
-    }
-    return binder.pointeeFunction(self->params[static_cast<std::size_t>(index)].type);
   }
 
   /// Notes accumulate across passes, so a fixpoint re-run must not repeat one.

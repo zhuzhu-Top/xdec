@@ -22,8 +22,11 @@
 
 #include "xdec/support/json.h"
 #include "xdec/support/result.h"
+#include "xdec/types/type.h"
 
 namespace xdec::types {
+
+class TypeDatabase;
 
 struct SyscallInfo {
   uint32_t number = 0;
@@ -39,6 +42,16 @@ struct SyscallInfo {
   /// `exit`, `exit_group`, `rt_sigreturn`: control does not come back, so the
   /// emitter must not print an assignment of the result.
   bool noreturn = false;
+
+  /// `argTypes`/`returnType` resolved against an imported TypeDatabase (see
+  /// SyscallTable::resolveTypes), for passes that need an actual TypeId
+  /// rather than a spelling to cast argument text with — propagate-types in
+  /// particular. Invalid when no database was resolved against, or when the
+  /// spelling named something the database never declared (a header-less run,
+  /// or a tag like `struct timeval` no imported header defines): the table's
+  /// spelling still prints in a comment, but nothing here can type it.
+  std::vector<TypeId> argTypeIds;
+  TypeId returnTypeId;
 
   [[nodiscard]] bool hasSignature() const noexcept { return !argTypes.empty(); }
 };
@@ -63,6 +76,14 @@ class SyscallTable {
   [[nodiscard]] std::size_t size() const noexcept { return byNumber_.size(); }
   [[nodiscard]] bool empty() const noexcept { return byNumber_.empty(); }
   [[nodiscard]] const std::string& arch() const noexcept { return arch_; }
+
+  /// Resolves every entry's `argTypes`/`returnType` spellings into `database`,
+  /// filling in `argTypeIds`/`returnTypeId`. A no-op until this runs — the
+  /// table on its own only ever held spellings, precisely so it could load
+  /// (and this class stay independent of TypeDatabase) whether or not a
+  /// `--types` header was given; a caller wires the two together once both are
+  /// loaded, the same way TypeBinder connects a TypeDatabase to an image.
+  void resolveTypes(const TypeDatabase& database);
 
  private:
   std::map<uint32_t, SyscallInfo> byNumber_;

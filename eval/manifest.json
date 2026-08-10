@@ -53,7 +53,7 @@
       "name": "eval_rotr32",
       "category": "basic",
       "source": "uint32_t eval_rotr32(uint32_t x, unsigned n)",
-      "comment": "A rotate is emitted as the __xdec_rotr32 helper, which is the honest spelling of one: C has no rotate operator, and open-coding the shift pair would be longer and no clearer.",
+      "comment": "A rotate is emitted as the rotr32 helper (defined once in xdec_helpers.h), which is the honest spelling of one: C has no rotate operator, and open-coding the shift pair would be longer and no clearer.",
       "expect": {
         "max_gotos": 0,
         "patterns": [
@@ -664,6 +664,139 @@
       }
     },
     {
+      "name": "eval_svc_openat",
+      "category": "syscall",
+      "source": "long eval_svc_openat(const char* path, long flags) -- svc #0, x8=56",
+      "comment": "aarch64 has no bare __NR_open; every open a reversed binary makes is this number with AT_FDCWD folded in, so this is the raw form the env-collection cases' libc open() calls resolve to underneath.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_openat("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_read",
+      "category": "syscall",
+      "source": "long eval_svc_read(long fd, void* buf, unsigned long n) -- svc #0, x8=63",
+      "comment": "Three arguments, the same shape as write with the direction reversed -- the pair that between them cover the two syscalls every /proc read in source_env.c goes through.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_read("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_close",
+      "category": "syscall",
+      "source": "long eval_svc_close(long fd) -- svc #0, x8=57",
+      "comment": "A single descriptor argument, so five of six registers come off the call -- the trim check for a different arity than getpid's zero.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_close("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_mmap",
+      "category": "syscall",
+      "source": "void* eval_svc_mmap(void* addr, unsigned long len, long prot, long flags, long fd, long off) -- svc #0, x8=222",
+      "comment": "Six arguments, the widest register set a syscall uses on this ABI -- the case that proves the wrapper chain carries x0..x5 through without dropping the last one.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_mmap("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_clock_gettime",
+      "category": "syscall",
+      "source": "long eval_svc_clock_gettime(long clk_id, void* ts) -- svc #0, x8=113",
+      "comment": "The anti-debug timing probe's raw form: an int and a pointer, same two-argument shape as gettimeofday but a different number and a different struct.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_clock_gettime("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_ptrace",
+      "category": "syscall",
+      "source": "long eval_svc_ptrace(long request, long pid, void* addr, void* data) -- svc #0, x8=117",
+      "comment": "The anti-debugger's own syscall, spelled without the libc wrapper a tracer could breakpoint; the table lists it by arity only, so no argument gets a type it was never given.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_ptrace("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_getuid",
+      "category": "syscall",
+      "source": "long eval_svc_getuid(void) -- svc #0, x8=174",
+      "comment": "No arguments, same trim as getpid but a different number -- the check that the table is actually being read per-number rather than a name assumed from arity alone.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_getuid("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_nanosleep",
+      "category": "syscall",
+      "source": "long eval_svc_nanosleep(const void* req, void* rem) -- svc #0, x8=101",
+      "comment": "The raw form of the sleep an anti-emulation probe times; two pointer arguments the table already knows the struct for.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_nanosleep("
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_gettimeofday_errno",
+      "category": "syscall",
+      "source": "int eval_svc_gettimeofday_errno(void* tv, void* tz) -- svc #0, x8=169, then errno store",
+      "comment": "The sub_199214 shape, but the value entering the errno store is a raw syscall's own result rather than a libc call's: this is the case that proves the errno-fold idiom applies to a recovered `sys_gettimeofday(...)` exactly as it does to any other call.",
+      "modes": ["baseline"],
+      "expect": {
+        "min_ifs": 1,
+        "max_gotos": 0,
+        "max_svc_intrinsics": 0,
+        "patterns": [
+          "sys_gettimeofday(",
+          "__errno_location()"
+        ]
+      }
+    },
+    {
+      "name": "eval_svc_gettimeofday_libc",
+      "category": "syscall",
+      "source": "int eval_svc_gettimeofday_libc(void* tv, void* tz) -- the same operation through libc's own gettimeofday()",
+      "comment": "The counterpart to eval_svc_gettimeofday_errno: the identical operation, called the ordinary way, so the raw-syscall form and the PLT-resolved form sit side by side under the same category.",
+      "modes": ["baseline"],
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "gettimeofday("
+        ]
+      }
+    },
+    {
       "name": "eval_tailcall_table",
       "category": "tailcall",
       "source": "int32_t eval_tailcall_table(const EvalTailOp* ops, int32_t index, int32_t a, int32_t b) -- returns ops[index](a, b)",
@@ -692,6 +825,660 @@
         "forbid_patterns": [
           "L_0x[0-9a-f]+:[\\s\\S]*L_0x[0-9a-f]+:"
         ]
+      }
+    },
+    {
+      "name": "eval_env_property_get_model",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_property_get_model(void) -- __system_property_get(\"ro.product.model\", buf)",
+      "comment": "The device-fingerprint read every anti-emulator check starts with. baseline is scored, not typed: TargetProfile's android-ndk preset resolves the name with no --types argument.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__system_property_get("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_property_get_sdk",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_property_get_sdk(void) -- __system_property_get(\"ro.build.version.sdk\", buf)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__system_property_get("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_property_get_serial",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_property_get_serial(void) -- __system_property_get(\"ro.serialno\", buf)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__system_property_get("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_property_find",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_property_find(void) -- __system_property_find(\"ro.product.brand\") != NULL",
+      "comment": "The pointer-returning half of the property API, and an opaque struct (prop_info) declared only as a forward tag -- every call site only tests the pointer, never a field, so that is all the header needs to say.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__system_property_find("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_open_cmdline",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_open_cmdline(void) -- open(\"/proc/self/cmdline\", O_RDONLY)",
+      "comment": "open is variadic in the header (the mode argument), so apply-types cannot trim the registers after it the way it trims a fixed-arity import -- they surface as this function's own parameters instead. That is a real, load-bearing limitation of variadic-call arity recovery, not a defect in this case, so the signature is left unchecked here rather than pinned to an artifact.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["open(", "close("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_read_maps",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_read_maps(void) -- open+read \"/proc/self/maps\", then close",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "min_ifs": 1,
+        "patterns": ["open(", "read(", "close("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_read_status",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_read_status(void) -- open+read \"/proc/self/status\", then close",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "min_ifs": 1,
+        "patterns": ["open(", "read(", "close("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_read_cpuinfo",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_read_cpuinfo(void) -- open+read \"/proc/cpuinfo\", then close",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "min_ifs": 1,
+        "patterns": ["open(", "read(", "close("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_access_root",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_access_root(void) -- access(\"/\", F_OK) == 0",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["access("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_access_data",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_access_data(void) -- access(\"/data\", R_OK) == 0",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["access("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_readlink_exe",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_readlink_exe(void) -- readlink(\"/proc/self/exe\", buf, sizeof(buf))",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["readlink("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_stat_libc",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_stat_libc(void) -- stat(\"/system/lib64/libc.so\", &st) == 0",
+      "comment": "struct stat is forward-declared only, the same opaque-tag pattern as prop_info above: the call only tests the return value, never a field of the buffer.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["stat("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_gettimeofday",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_gettimeofday(void) -- gettimeofday(&tv, NULL)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["gettimeofday("],
+        "type_spelling": ["struct timeval*"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_clock_gettime",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_clock_gettime(void) -- clock_gettime(CLOCK_REALTIME, &ts)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["clock_gettime("],
+        "type_spelling": ["struct timespec*"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_time",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_time(void) -- time(NULL)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["time("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_usleep",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_usleep(void) -- usleep(1000)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["usleep("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_nanosleep",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_nanosleep(void) -- nanosleep(&req, NULL)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["nanosleep("],
+        "type_spelling": ["struct timespec*"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_getpid",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_getpid(void) -- getpid()",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["getpid("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_gettid",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_gettid(void) -- gettid()",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["gettid("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_getuid",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_getuid(void) -- getuid() >= 10000",
+      "comment": "Android's app-UID boundary check: the comparison against a fixed threshold instead of a plain identity return is what keeps -O1 from folding this into a tail call through the PLT stub (see the corpus file's header comment).",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["getuid("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_pthread_self",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_pthread_self(void) -- pthread_self() != 0",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["pthread_self("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_prctl",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_prctl(void) -- prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["prctl("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_log_print",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_log_print(void) -- __android_log_print(ANDROID_LOG_INFO, \"xdec\", \"probe %d\", 1)",
+      "comment": "Variadic like open above: the format argument's trailing registers surface as this function's own parameters rather than being trimmed, so the signature is left unchecked.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__android_log_print("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_log_write",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_log_write(void) -- __android_log_write(ANDROID_LOG_INFO, \"xdec\", \"probe\")",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__android_log_write("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_dlopen",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_dlopen(void) -- dlopen(\"liblog.so\", RTLD_NOW) != NULL",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["dlopen("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_dlsym",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_dlsym(void) -- dlopen then dlsym(handle, \"__android_log_print\")",
+      "expect": {
+        "max_gotos": 0,
+        "min_ifs": 1,
+        "max_plt_sub_calls": 0,
+        "patterns": ["dlopen(", "dlsym("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_ptrace",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_ptrace(void) -- ptrace(PTRACE_TRACEME, 0, NULL, NULL)",
+      "comment": "The classic anti-debug probe. The clamp idiom (rc < 0 ? -1 : 0) is computed entirely in 64-bit registers with no narrowing instruction after it -- ptrace itself returns long -- so baseline's recovered return width is 64 bits even though the C source declared int32_t; the same 'nothing here narrows it' limitation eval_types_fn_ptr's baseline case already documents for a tail call.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["ptrace("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "64", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_syscall_getpid",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_syscall_getpid(void) -- syscall(SYS_getpid)",
+      "comment": "syscall(long, ...) is variadic, same arity-recovery limitation as open and __android_log_print above: unchecked signature.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["syscall("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_env_mmap",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_mmap(void) -- mmap(NULL, 4096, PROT_READ, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) != MAP_FAILED",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["mmap("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_env_getenv",
+      "category": "env",
+      "modes": ["baseline"],
+      "source": "int32_t eval_env_getenv(void) -- getenv(\"PATH\") != NULL",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["getenv("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": [] }
+      }
+    },
+    {
+      "name": "eval_import_errno_call",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_errno_call(void) -- return errno; (a read, not the store idiom)",
+      "comment": "errno expands to *__errno_location(); this is the read half, kept separate from the write idiom eval_import_errno_fold covers so a regression in one cannot hide behind the other.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__errno_location("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_import_errno_fold",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_errno_fold(long raw_ret) -- errno = -raw_ret; return -1; (single guard)",
+      "comment": "The idiom docs/10-import-resolution.md's foldableErrnoCall exists for: *__errno_location() = -ret; as one statement, not two, because nothing else in this function reads the call's result.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["*__errno_location() = "],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "64", "params": ["64"] }
+      }
+    },
+    {
+      "name": "eval_import_errno_dispatch",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_errno_dispatch(int32_t op, long a, long b) -- a 3-arm switch, one arm through the errno store, all sharing one goto-reached exit",
+      "comment": "The sub_199214 shape with a real goto between the store and the label the other arms share -- load-bearing for the fold applying correctly once a merge sits nearby, not for the decline itself (that is pinned deterministically at the IL level in tests/emit/test_c_import_call.cpp, where register allocation is under the test's control).",
+      "expect": {
+        "max_gotos": 1,
+        "max_plt_sub_calls": 0,
+        "patterns": ["*__errno_location() = "],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": ["32", "64", "64"] }
+      }
+    },
+    {
+      "name": "eval_import_stack_chk",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_stack_chk(const char* src) -- copies into and sums a local buffer, -fstack-protector-strong",
+      "comment": "The first of the two names analysis/noreturn.cpp's PLT-stub decoding was written to recognise (docs/10-import-resolution.md). eval/build.ps1 builds the whole corpus with -fstack-protector-strong for this case's sake; no other case in the corpus has a local array, so nothing else grew a canary.",
+      "expect": {
+        "max_gotos": 5,
+        "min_loops": 2,
+        "max_plt_sub_calls": 0,
+        "patterns": ["__stack_chk_fail(", "does not return"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": ["ptr"] }
+      }
+    },
+    {
+      "name": "eval_import_abort",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "void eval_import_abort(int32_t code) -- abort() when code < 0",
+      "comment": "The second name on the noreturn list: a guarded call, not a canary, so the only import in the corpus that resolves with no header entry backing the arity trim at all -- abort's prototype is void(void), the same as every other noreturn name here.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["abort(", "does not return"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": ["32"] }
+      }
+    },
+    {
+      "name": "eval_import_write_direct",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_write_direct(void) -- write(1, \"x\", 1), not in tail position",
+      "comment": "Shape A on its own, deliberately not a tail call: eval_tailcall_import (source_tailcall.c) is Shape C, which reduces to Shape A or B once recover-tailcall rewrites the branch, but never exercises a direct, ordinary call the way a real probe reads.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["write("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_import_got_indirect",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_got_indirect(void) -- calls getpid through a volatile function-pointer global initialised to it",
+      "comment": "Shape B, and -- unlike eval_tailcall_import, whose Shape B is always also a tail call -- not one: an ordinary indirect call in the middle of a function that does something with the result afterwards, the shape a real function pointer to an import actually has.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "min_import_comments": 1,
+        "patterns": ["g_getpid_fn", "/* import: getpid */"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_import_snprintf",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_snprintf(void) -- snprintf(buf, sizeof(buf), \"%d\", 42)",
+      "comment": "Variadic like open and __android_log_print in source_env.c: the format argument's trailing registers surface as this function's own parameters, so the signature is left unchecked.",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["snprintf("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_import_strlen",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_strlen(const char* s) -- strlen(s) >= 8",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["strlen("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": ["64"] }
+      }
+    },
+    {
+      "name": "eval_import_memcpy",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_memcpy(void* dst, const void* src, size_t n) -- memcpy(dst, src, n); return n; (the call's own result is unused)",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["memcpy("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": ["64", "64", "64"] }
+      }
+    },
+    {
+      "name": "eval_import_strcmp",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_strcmp(const char* a, const char* b) -- strcmp(a, b) == 0",
+      "expect": {
+        "max_gotos": 0,
+        "max_plt_sub_calls": 0,
+        "patterns": ["strcmp("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "8", "params": ["64", "64"] }
+      }
+    },
+    {
+      "name": "eval_import_fopen",
+      "category": "import",
+      "modes": ["baseline"],
+      "source": "int32_t eval_import_fopen(void) -- fopen(\"/proc/self/status\", \"r\"), fread, fclose",
+      "comment": "FILE declared as an opaque forward tag, the same pattern as struct stat and prop_info in source_env.c: every call only passes the handle through, never reads a field of it.",
+      "expect": {
+        "max_gotos": 0,
+        "min_ifs": 2,
+        "max_plt_sub_calls": 0,
+        "patterns": ["fopen(", "fread(", "fclose(", "__stack_chk_fail("],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "signature": { "return": "32", "params": [] }
+      }
+    },
+    {
+      "name": "eval_jni_find_class",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jclass eval_jni_find_class(JNIEnv* env, const char* name) -- (*env)->FindClass(env, name)",
+      "comment": "The JNIEnv vtable call every native library's JNI_OnLoad makes first. android-ndk.hdecl carries the real jni.h table (frozen since 1.2), so the two loads this compiles to -- env's vtable pointer, then the vtable's slot 6 -- must show the real offset, 0x30, not a value invented for this corpus. Naming the call FindClass(...) itself needs the case's own signature, which zero-CLI baseline cannot supply (see docs/10-import-resolution.md); what this and its seven siblings pin is the offset math and the indirect-call recognition underneath that name.",
+      "expect": {
+        "patterns": ["+ 0x30)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_get_object_class",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jclass eval_jni_get_object_class(JNIEnv* env, jobject obj) -- (*env)->GetObjectClass(env, obj)",
+      "comment": "Slot 31, 0xf8 -- the call every method that only has a jobject (no class handle yet) makes before it can look anything up on it.",
+      "expect": {
+        "patterns": ["+ 0xf8)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_get_method_id",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jmethodID eval_jni_get_method_id(JNIEnv* env, jclass clazz, const char* name, const char* sig) -- (*env)->GetMethodID(env, clazz, name, sig)",
+      "comment": "Slot 33, 0x108 -- four real arguments, so this is also the arity check: nothing here is a variadic call, and none of the eight registers may be dropped or invented.",
+      "expect": {
+        "patterns": ["+ 0x108)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_call_object_method",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jobject eval_jni_call_object_method(JNIEnv* env, jobject obj, jmethodID methodID) -- (*env)->CallObjectMethod(env, obj, methodID)",
+      "comment": "Slot 34, 0x110, immediately after GetMethodID's slot -- the pair every reflective call site uses back to back, so a wrong offset on either one would put them one call apart from where GetMethodID landed.",
+      "expect": {
+        "patterns": ["+ 0x110)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_call_int_method",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jint eval_jni_call_int_method(JNIEnv* env, jobject obj, jmethodID methodID) -- (*env)->CallIntMethod(env, obj, methodID)",
+      "comment": "Slot 49, 0x188 -- fifteen slots past CallObjectMethod, the same family with a different result width, and the one case in this group whose post-call comparison survives on its own (an int comparison, not a pointer identity) rather than needing the all-ones sentinel.",
+      "expect": {
+        "patterns": ["+ 0x188)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_new_string_utf",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jstring eval_jni_new_string_utf(JNIEnv* env, const char* bytes) -- (*env)->NewStringUTF(env, bytes)",
+      "comment": "Slot 167, 0x538 -- the widest gap in this group's padding (117 slots), the check that a long run of unnamed members does not throw off the count for everything declared after it.",
+      "expect": {
+        "patterns": ["+ 0x538)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_register_natives",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jint eval_jni_register_natives(JNIEnv* env, jclass clazz, const JNINativeMethod* methods, jint n) -- (*env)->RegisterNatives(env, clazz, methods, n)",
+      "comment": "Slot 215, 0x6b8 -- the call that binds native functions to Java method names explicitly, bypassing the export-table lookup JNI_OnLoad's implicit registration would otherwise need; a common anti-static-analysis move on its own.",
+      "expect": {
+        "patterns": ["+ 0x6b8)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
+      }
+    },
+    {
+      "name": "eval_jni_exception_check",
+      "category": "jni",
+      "modes": ["baseline"],
+      "source": "jboolean eval_jni_exception_check(JNIEnv* env) -- (*env)->ExceptionCheck(env)",
+      "comment": "Slot 228, 0x720 -- no arguments past env, the same arity-zero trim eval_svc_getpid checks for a syscall, here for a vtable call instead.",
+      "expect": {
+        "patterns": ["+ 0x720)", "indirect call:"],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("]
       }
     }
   ]

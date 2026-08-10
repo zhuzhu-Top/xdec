@@ -1,6 +1,8 @@
 // The idiom matchers (see the header for what belongs here and what does not).
 #include "algebra_idioms.h"
 
+#include <optional>
+
 #include "xdec/support/bits.h"
 
 namespace xdec::passes {
@@ -94,7 +96,84 @@ struct Pair {
   }
 }
 
+/// The shared shape behind both carry-compare idioms: one operand is
+/// `cmpOp(sum, other)` or `cmpOp(other, sum)` (either position — the two
+/// callers need opposite ones, see their own comments) and the sibling
+/// operand is `eqOp(sum, 0)`, where `sum` is exactly `other + C` for some
+/// nonzero constant `C`. `other` is what fold.cpp's `rewriteAdd` called `a`;
+/// `C` is what it called `b`.
+struct CarryBound {
+  il::ExprId other;
+  uint64_t bound = 0;
+  il::Type type;
+};
+
+[[nodiscard]] std::optional<CarryBound> matchCarryBound(const il::Function& function,
+                                                        il::ExprId cmpId, il::ExprId eqId,
+                                                        il::ExprOp cmpOp, il::ExprOp eqOp) {
+  const il::Expr& cmp = function.expr(cmpId);
+  if (cmp.op != cmpOp || cmp.operandCount != 2) {
+    return std::nullopt;
+  }
+  const Pair eq = operandsOf(function, eqId, eqOp);
+  if (!eq) {
+    return std::nullopt;
+  }
+  const Konst zero = constantOf(function, eq.rhs);
+  if (!zero || zero.value != 0) {
+    return std::nullopt;
+  }
+  for (const int arm : {0, 1}) {
+    if (cmp.operands[arm] != eq.lhs) {
+      continue;
+    }
+    const il::ExprId sumId = cmp.operands[arm];
+    const il::ExprId other = cmp.operands[arm ^ 1];
+    const il::Expr& sum = function.expr(sumId);
+    if (sum.op != il::ExprOp::Add || sum.operandCount != 2 || sum.operands[0] != other) {
+      continue;
+    }
+    if (!sum.type.isScalarInteger() || sum.type.bits() == 0) {
+      continue;
+    }
+    const Konst added = constantOf(function, sum.operands[1]);
+    if (!added || added.value == 0) {
+      continue;
+    }
+    const unsigned width = sum.type.bits();
+    const uint64_t bound = zeroExtend(0 - added.value, width);
+    return CarryBound{other, bound, sum.type};
+  }
+  return std::nullopt;
+}
+
 }  // namespace
+
+il::ExprId matchCarryCompare(il::Function& function, const il::Expr& andExpr) {
+  // hi: `(sum <u a) & (sum != 0)`, sum's cmp puts sum first.
+  for (const int arm : {0, 1}) {
+    if (const auto match = matchCarryBound(function, andExpr.operands[arm],
+                                           andExpr.operands[arm ^ 1], il::ExprOp::CmpLtU,
+                                           il::ExprOp::CmpNe)) {
+      return function.binary(il::ExprOp::CmpLtU, function.constant(match->type, match->bound),
+                             match->other);
+    }
+  }
+  return {};
+}
+
+il::ExprId matchCarryCompareOr(il::Function& function, const il::Expr& orExpr) {
+  // ls: `(a <=u sum) | (sum == 0)`, sum's cmp puts sum second.
+  for (const int arm : {0, 1}) {
+    if (const auto match = matchCarryBound(function, orExpr.operands[arm],
+                                           orExpr.operands[arm ^ 1], il::ExprOp::CmpLeU,
+                                           il::ExprOp::CmpEq)) {
+      return function.binary(il::ExprOp::CmpLeU, match->other,
+                             function.constant(match->type, match->bound));
+    }
+  }
+  return {};
+}
 
 il::ExprId matchSignExtend(il::Function& function, const il::Expr& orExpr) {
   const unsigned width = orExpr.type.bits();
@@ -351,6 +430,40 @@ il::ExprId matchShiftedCompare(il::Function& function, const il::Expr& cmpExpr) 
   const il::ExprId narrowed = function.cast(il::ExprOp::Trunc, type, shifted.lhs);
   return mirrored ? function.binary(cmpExpr.op, other, narrowed)
                   : function.binary(cmpExpr.op, narrowed, other);
+}
+
+il::ExprId matchCancelledSubtrahend(il::Function& function, const il::Expr& cmpExpr) {
+  if (cmpExpr.op != il::ExprOp::CmpEq && cmpExpr.op != il::ExprOp::CmpNe) {
+    return {};
+  }
+  for (const int arm : {0, 1}) {
+    const il::ExprId sumId = cmpExpr.operands[arm];
+    const Pair sum = operandsOf(function, sumId, il::ExprOp::Add);
+    const Pair sub = operandsOf(function, cmpExpr.operands[arm ^ 1], il::ExprOp::Sub);
+    if (!sum || !sub) {
+      continue;
+    }
+    for (const bool subIsLhs : {true, false}) {
+      const il::ExprId a = subIsLhs ? sum.rhs : sum.lhs;
+      const Pair inner =
+          operandsOf(function, subIsLhs ? sum.lhs : sum.rhs, il::ExprOp::Sub);
+      if (!inner || inner.rhs != sub.rhs) {
+        continue;  // the subtracted value must be the very same node on both sides
+      }
+      const Konst k1 = constantOf(function, inner.lhs);
+      const Konst k2 = constantOf(function, sub.lhs);
+      if (!k1 || !k2) {
+        continue;
+      }
+      const unsigned width = function.expr(sumId).type.bits();
+      if (width == 0) {
+        continue;
+      }
+      const uint64_t folded = zeroExtend(k2.value - k1.value, width);
+      return function.binary(cmpExpr.op, a, function.constant(function.expr(sumId).type, folded));
+    }
+  }
+  return {};
 }
 
 }  // namespace xdec::passes

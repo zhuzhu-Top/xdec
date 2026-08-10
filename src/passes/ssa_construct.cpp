@@ -164,8 +164,14 @@ class SsaBuilder {
           }
           const il::Type type = function_.registers()[root].type();
           const il::ValueId merged = function_.prependPhi(join, function_.block(join).va, type);
-          phiSites_[join].push_back({root, function_.value(merged).definition});
+          const il::OpId definition = function_.value(merged).definition;
+          phiSites_[join].push_back({root, definition});
           phiValues_[{join, root}] = merged;
+          // Which register this phi merges, so a later analysis (see
+          // analysis::matchLiveRegisterFrame) can find a specific one at a
+          // specific block directly instead of re-deriving it from variable
+          // naming order, which carries no such guarantee.
+          function_.annotate(definition, std::format("reg:{}", function_.registers().nameOf(root)));
           // The phi is itself a definition of the register in that block.
           if (everOnWorklist.insert(join).second) {
             worklist.push_back(join);

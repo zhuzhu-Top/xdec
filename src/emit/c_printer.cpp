@@ -65,7 +65,7 @@ class Assembler {
           default:
             continue;
         }
-        if (!op.result.valid()) {
+        if (!op.result.valid() || ctx_.deadOps.contains(opId.index())) {
           continue;
         }
         ctx_.tempNames[op.result.index()] = std::format(
@@ -135,8 +135,10 @@ class Assembler {
     }
 
     const std::optional<analysis::CType>& returned = ctx_.variables.returnType();
-    std::string out = std::format("{} {}(", returned ? returned->format() : "void",
-                                  name());
+    const types::TypeId typedReturn = ctx_.functionReturnType();
+    const std::string returnSpelling =
+        typedReturn.valid() ? ctx_.spell(typedReturn) : (returned ? returned->format() : "void");
+    std::string out = std::format("{} {}(", returnSpelling, name());
     for (std::size_t index = 0; index < byIndex.size(); ++index) {
       out += index == 0 ? "" : ", ";
       if (byIndex[index] == nullptr) {
@@ -213,6 +215,22 @@ class Assembler {
                 return lhs->stackDelta > rhs->stackDelta;
               });
     for (const analysis::Variable* local : locals) {
+      // An aliased local is a field of the struct declared at its base delta
+      // (see applyImportedTypes) and gets no declaration of its own.
+      if (local->aliasBase.has_value()) {
+        continue;
+      }
+      // A local a call or syscall site typed outranks the CType inference
+      // below: `struct timeval var_10` says what the sixteen bytes at this
+      // slot actually are, where `uint64_t var_10` is only ever the width of
+      // the widest single access into them (see applyImportedTypes).
+      if (local->importedType.has_value()) {
+        appendLine(out, 1,
+                   std::format("{}; // sp{:+}",
+                               ctx_.spellDeclaration(*local->importedType, local->name),
+                               local->stackDelta));
+        continue;
+      }
       appendLine(out, 1, std::format("{} {}; // sp{:+}", local->type.format(),
                                      local->name, local->stackDelta));
     }
@@ -228,8 +246,36 @@ class Assembler {
                              intType(variable.width), variable.name, entry,
                              il::toString(ctx_.function.registers()[root].regClass)));
     }
+    // Plain scalar temps -- the overwhelming majority on a large flattened
+    // function -- gain nothing from one declaration per line: the type is
+    // all that would otherwise repeat. A run of adjacent temps sharing a type
+    // is comma-joined onto one line instead; order is untouched, so this
+    // changes how many lines the declarations take and nothing else. Typed
+    // (imported/aliased) declarations keep their own line, each spelled
+    // differently by `spellDeclaration` and rare enough not to matter.
+    std::string pendingType;
+    std::vector<std::string> pendingNames;
+    const auto flushGroup = [&] {
+      if (pendingNames.empty()) {
+        return;
+      }
+      std::string names = pendingNames.front();
+      for (std::size_t index = 1; index < pendingNames.size(); ++index) {
+        names += ", " + pendingNames[index];
+      }
+      appendLine(out, 1, std::format("{} {};", pendingType, names));
+      pendingNames.clear();
+    };
+    constexpr std::size_t kMaxPerLine = 12;
+    const auto addPlain = [&](std::string type, std::string name) {
+      if (type != pendingType || pendingNames.size() >= kMaxPerLine) {
+        flushGroup();
+        pendingType = std::move(type);
+      }
+      pendingNames.push_back(std::move(name));
+    };
     for (const analysis::Variable& temp : ctx_.variables.temps()) {
-      appendLine(out, 1, std::format("{} {};", temp.type.format(), temp.name));
+      addPlain(temp.type.format(), temp.name);
     }
     for (const auto& [valueIndex, temp] : ctx_.tempNames) {
       // An imported type wins over the measured width here, and only here: the
@@ -238,19 +284,20 @@ class Assembler {
       // something the body then uses as a pointer.
       if (const types::TypeId declared = ctx_.typeOfValue(il::ValueId{valueIndex});
           declared.valid()) {
+        flushGroup();
         appendLine(out, 1, std::format("{};", ctx_.spellDeclaration(declared, temp)));
         continue;
       }
       const uint32_t width = ctx_.function.value(il::ValueId{valueIndex}).type.bits();
-      appendLine(out, 1, std::format("{} {};", intType(width == 0 ? 64 : width),
-                                     temp));
+      addPlain(intType(width == 0 ? 64 : width), temp);
     }
     // Subexpressions ExprPrinter promoted out of duplicated text: same
     // declare-once shape as the temps above, just named by CSE order rather
     // than by the op that defines them.
     for (const auto& [name, width] : ctx_.cseTemps) {
-      appendLine(out, 1, std::format("{} {};", intType(width == 0 ? 64 : width), name));
+      addPlain(intType(width == 0 ? 64 : width), name);
     }
+    flushGroup();
     if (!out.empty()) {
       out += '\n';
     }
@@ -361,7 +408,7 @@ class Assembler {
     }
     externs += syscallDeclarations();
     externs += globalDeclarations();
-    const std::string helpers = helperDeclarations(ctx_.helpers);
+    const std::string helpers = helperDeclarations(ctx_.helpers, ctx_.options.helpersHeader);
     // Definitions last to build and first to print: everything above may have
     // been what mentioned a type, and C needs the definition before the use.
     out += typeDefinitions();

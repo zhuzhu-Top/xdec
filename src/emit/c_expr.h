@@ -65,6 +65,17 @@ class ExprPrinter {
   // before the code that first needs it — the same shape any other
   // decompiler emits a temporary in, not a C local declared mid-expression.
   void beginScope(const std::vector<il::ExprId>& roots);
+
+  /// Adds `moreRoots` to the scope `beginScope` most recently opened,
+  /// without forgetting anything it already counted or materialized. For a
+  /// caller whose statements are two `printBlock`/`printSwitch`-shaped runs
+  /// that always execute together (a resolved computed branch's own block
+  /// immediately followed by the switch built from its terminator): a value
+  /// referenced once in each run is referenced twice in their shared scope,
+  /// so it is recognised as shared and materialized exactly once, in
+  /// whichever run reaches it first, rather than a second time when the
+  /// other run's `assignedText`/`exprText` reaches the same ExprId.
+  void extendScope(const std::vector<il::ExprId>& moreRoots);
   [[nodiscard]] std::vector<std::string> takePendingDecls();
 
   [[nodiscard]] CContext& context() noexcept { return ctx_; }

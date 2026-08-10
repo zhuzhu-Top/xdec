@@ -22,13 +22,17 @@
 #include <vector>
 
 #include "xdec/binary/image.h"
+#include "xdec/binary/target_profile.h"
 #include "xdec/pass/manager.h"
 #include "xdec/pass/observe.h"
 #include "xdec/pass/registry.h"
 #include "xdec/analysis/dominators.h"
+#include "xdec/analysis/expr_reuse.h"
 #include "xdec/analysis/loops.h"
+#include "xdec/analysis/plt_stub.h"
 #include "xdec/analysis/profile.h"
 #include "xdec/analysis/stack_frame.h"
+#include "xdec/analysis/typed_variables.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/decompile/driver.h"
 #include "xdec/emit/c_printer.h"
@@ -116,6 +120,9 @@ int usage() {
   printLine("      options: -o <file.c> --rounds <n> --no-annotate --allow-unresolved");
   printLine("               --types <header|preset> (repeatable)");
   printLine("               --syscall-table <file|name|none> (default aarch64-linux)");
+  printLine("               --reuse-report (count same-block subexpression duplication)");
+  printLine("               --dump-il (print the IL after all passes, before structuring)");
+  printLine("               --helpers-header <path|none> (default xdec_helpers.h)");
   printLine("  exec <binary> <workload>         execute blocks against scripted states");
   printLine("  memdump <binary> <out>           dump the relocated memory view for emulators");
   printLine("  decode                           decode hex words from stdin (fuzzer iface)");
@@ -124,7 +131,7 @@ int usage() {
   printLine("  coverage <binary> [rows]         report what the spec does not decode");
   printLine("  log-categories                   list logging categories");
   printLine("");
-  printLine("Set XDEC_LOG=<category>=<level> for diagnostics, e.g. XDEC_LOG=binary=debug.");
+  printLine("Set XDEC_LOG=<category>=<level> for diagnostics, e.g. XDEC_LOG=pass=debug,local=debug.");
   printLine("Set XDEC_SPEC=<file.xspec> to override the architecture spec.");
   return 2;
 }
@@ -178,18 +185,50 @@ xdec::Result<std::unique_ptr<BinaryImage>> open(std::string_view path) {
   };
 }
 
+/// The import a fixed address reaches when no symbol names it directly: the
+/// callee behind a standard AArch64 PLT stub's GOT indirection (see
+/// analysis/plt_stub.h), aliased to the header's own spelling of it when
+/// `profile` says the loader's name and the header's differ -- Bionic's
+/// `__errno` GOT entry versus the NDK header's `__errno_location`. Nullopt
+/// when `va` is not a recognised PLT stub, or its GOT slot names nothing.
+[[nodiscard]] std::optional<std::string> pltImportAt(const xdec::ByteReader& reader,
+                                                     const xdec::MemoryFacts& facts,
+                                                     const xdec::binary::TargetProfile& profile,
+                                                     uint64_t va) {
+  std::optional<std::string> name = xdec::analysis::importNameForPltStub(va, reader, facts);
+  if (!name.has_value()) {
+    return std::nullopt;
+  }
+  const auto alias = profile.symbolAliases.find(*name);
+  return alias == profile.symbolAliases.end() ? name : std::optional<std::string>{alias->second};
+}
+
 /// The same table, as the passes ask about it (see pass::Context::setNames):
 /// exact starts only, because a name is being used to find a declaration and a
-/// symbol that merely covers an address declares nothing about it.
-[[nodiscard]] xdec::pass::NameAt nameResolverOf(const BinaryImage& image) {
-  return [&image](uint64_t va) {
+/// symbol that merely covers an address declares nothing about it -- with one
+/// addition beyond the symbol table itself: a PLT stub's address is not named
+/// by any symbol in a stripped binary, but the stub's own bytes and the
+/// relocation its GOT slot carries are just as exact a fact about what starts
+/// there (see pltImportAt). This is what turns `sub_1d28a0` into
+/// `__errno_location` everywhere a name feeds a prototype lookup -- the
+/// direct call's own binding, apply-types' arity trim, typed-variables'
+/// return type -- from the one place names are resolved.
+[[nodiscard]] xdec::pass::NameAt nameResolverOf(const BinaryImage& image,
+                                                const xdec::ByteReader& reader,
+                                                const xdec::MemoryFacts& facts,
+                                                const xdec::binary::TargetProfile& profile) {
+  return [&image, &reader, &facts, &profile](uint64_t va) {
     xdec::pass::SymbolName out;
     const xdec::binary::Symbol* symbol = image.symbolContaining(va);
-    if (symbol == nullptr || symbol->va != va) {
+    if (symbol != nullptr && symbol->va == va) {
+      out.name = symbol->name;
+      out.isFunction = symbol->kind == xdec::binary::SymbolKind::Function;
       return out;
     }
-    out.name = symbol->name;
-    out.isFunction = symbol->kind == xdec::binary::SymbolKind::Function;
+    if (const std::optional<std::string> imported = pltImportAt(reader, facts, profile, va)) {
+      out.name = *imported;
+      out.isFunction = true;
+    }
     return out;
   };
 }
@@ -799,6 +838,10 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
   driverOptions.maxRounds = rounds;
   driverOptions.extendWhileProving = !roundsPinned;
   driverOptions.memory = memoryFactsOf(image);
+  if (const xdec::binary::Symbol* symbol = image.symbolAt(address);
+      symbol != nullptr && symbol->size != 0) {
+    driverOptions.fence = {address, address + symbol->size};
+  }
   auto result = xdec::decompile::decompile(engine, reader, address, registry, driverOptions);
   if (!result) {
     return reportError(result.error());
@@ -831,6 +874,36 @@ xdec::Result<xdec::types::TypeDatabase> loadTypes(std::span<const std::string> s
   return database;
 }
 
+/// Whether an address's first instruction disassembles like the start of an
+/// AArch64 function: a stack frame going up (`sub sp`, a `stp`/`str` saving
+/// callee-saved registers) or one of the landing-pad no-ops (BTI/PAC, or this
+/// project's own obfuscator's `mov x17, x17` / `mov x16, x16`) that precede
+/// one. Best-effort and deliberately permissive -- it exists to catch the
+/// class of mistake decompiling `sub_627ac` in bc_lib made (an address pulled
+/// from the middle of another function's jump table, decompiled as if it were
+/// its own entry, which then discovers that whole table as if it were free
+/// code -- see samples/manifest.json's sample_afRDLog comment for the real
+/// entry), not to reject every real prologue this short list does not cover.
+[[nodiscard]] bool looksLikePrologue(const xdec::spec::SpecEngine& engine,
+                                     const BinaryImage& image, uint64_t address) {
+  const unsigned width = engine.program().insnWidth / 8;
+  std::vector<std::byte> buffer(width);
+  if (!image.read(address, buffer)) {
+    return true;  // unreadable is a different problem, not this check's to report
+  }
+  const auto insn = engine.decode(buffer, address);
+  if (!insn.valid) {
+    return true;
+  }
+  const std::string text = engine.disassemble(insn);
+  static constexpr std::string_view kPrologueShapes[] = {
+      "sub sp, sp", "stp x29",      "stp x28",      "str d",   "stp d",
+      "mov x17, x17", "mov x16, x16", "paciasp",      "pacibsp", "bti ",
+  };
+  return std::ranges::any_of(
+      kPrologueShapes, [&](std::string_view shape) { return text.find(shape) != std::string::npos; });
+}
+
 /// The full pipeline: discover and lift, resolve, recover variables,
 /// structure, emit C. This is the deliverable every other command builds
 /// towards.
@@ -843,12 +916,18 @@ int commandDecompile(std::string_view path, uint64_t address,
   bool roundsPinned = false;
   bool annotate = true;
   bool allowUnresolved = false;
+  bool reuseReport = false;
+  bool dumpIl = false;
   std::vector<std::string> typeSources;
   // On by default, because a syscall's number means the same thing in every
   // AArch64 Linux binary and leaving it unnamed helps nobody. `--syscall-table
   // none` is there for the case the default is wrong -- a different kernel ABI
   // -- where a plausible name would be worse than a number.
   std::string syscallSource{xdec::types::SyscallTable::defaultName()};
+  // What the preamble `#include`s for rotate/bswap/popcount/cc_* (see
+  // xdec_helpers.h). `none` suppresses the include for a caller who wants
+  // those names some other way -- inlined, or from a different path.
+  std::string helpersHeader{"xdec_helpers.h"};
   for (std::size_t i = 0; i < options.size(); ++i) {
     const std::string_view option = options[i];
     const auto value = [&]() -> std::string_view {
@@ -871,11 +950,18 @@ int commandDecompile(std::string_view path, uint64_t address,
       annotate = false;
     } else if (option == "--allow-unresolved") {
       allowUnresolved = true;
+    } else if (option == "--reuse-report") {
+      reuseReport = true;
+    } else if (option == "--dump-il") {
+      dumpIl = true;
     } else if (option == "--types") {
       typeSources.emplace_back(value());
     } else if (option == "--syscall-table") {
       const std::string_view text = value();
       syscallSource = text == "none" ? std::string{} : std::string{text};
+    } else if (option == "--helpers-header") {
+      const std::string_view text = value();
+      helpersHeader = text == "none" ? std::string{} : std::string{text};
     } else {
       print("error: unknown decompile option '{}'", option);
       return 1;
@@ -894,6 +980,19 @@ int commandDecompile(std::string_view path, uint64_t address,
   const xdec::spec::SpecEngine& engine = *engineOrError.value();
   const xdec::spec::ByteReader reader =
       [&image](uint64_t va, std::span<std::byte> out) { return image.read(va, out); };
+
+  // What the platform implies, applied wherever the user did not already say
+  // something more specific: `--types`/`--syscall-table` are still there for
+  // when the inference is wrong, but the common case -- an AArch64 .so, this
+  // project's only supported target today -- no longer needs either flag
+  // (see xdec/binary/target_profile.h).
+  const xdec::binary::TargetProfile profile = xdec::binary::inferTargetProfile(image);
+  if (typeSources.empty()) {
+    typeSources = profile.typePresets;
+  }
+  if (syscallSource == xdec::types::SyscallTable::defaultName() && !profile.syscallTable.empty()) {
+    syscallSource = profile.syscallTable;
+  }
 
   xdec::types::TypeDatabase types;
   if (!typeSources.empty()) {
@@ -928,6 +1027,12 @@ int commandDecompile(std::string_view path, uint64_t address,
       syscalls = std::move(*loaded);
     }
   }
+  // Both loaded independently (the syscall table has no reason to depend on
+  // whether a header was given, see SyscallTable::resolveTypes), so the link
+  // between them is made here, once, rather than by either constructor.
+  if (!typeSources.empty() && !syscalls.empty()) {
+    syscalls.resolveTypes(types);
+  }
 
   xdec::pass::Registry registry;
   xdec::passes::registerBuiltinPasses(registry);
@@ -941,7 +1046,23 @@ int commandDecompile(std::string_view path, uint64_t address,
   driverOptions.memory = memoryFactsOf(image);
   driverOptions.types = typeSources.empty() ? nullptr : &types;
   driverOptions.syscalls = syscalls.empty() ? nullptr : &syscalls;
-  driverOptions.names = nameResolverOf(image);
+  driverOptions.names = nameResolverOf(image, reader, driverOptions.memory, profile);
+  if (const xdec::binary::Symbol* symbol = image.symbolAt(address);
+      symbol != nullptr && symbol->size != 0) {
+    driverOptions.fence = {address, address + symbol->size};
+  } else if (!looksLikePrologue(engine, image, address)) {
+    // No symbol to fence discovery with, and the entry itself does not look
+    // like a function start either: exactly the shape that let sub_627ac
+    // silently balloon into 1349 discovered addresses and 44k lines. Warn,
+    // rather than fail -- an unusual but real entry (a hand-written
+    // trampoline, a prologue-less leaf) is still worth decompiling, just not
+    // silently mistaken for one when it might not be.
+    print("warning: {:#x} has no symbol and its first instruction does not look like a "
+          "function prologue; if this address is inside another function's body (a "
+          "jump-table target, say) rather than a real entry, discovery has no function "
+          "size to stay inside and this run may pull in unrelated code",
+          address);
+  }
   auto result = xdec::decompile::decompile(engine, reader, address, registry, driverOptions);
   if (!result) {
     return reportError(result.error());
@@ -950,11 +1071,49 @@ int commandDecompile(std::string_view path, uint64_t address,
   print("driver: {} round(s), {} extra entrie(s), {} block(s) total{}", result->report.rounds,
         result->report.extraEntries.size(), function.blockCount(),
         result->report.converged ? "" : " (round cap reached; coverage may be partial)");
+  if (reuseReport) {
+    const xdec::analysis::ExpressionReuseReport reuse =
+        timed("reuse-report", [&] { return xdec::analysis::analyzeExpressionReuse(function); });
+    print("reuse: {} exact duplicate(s), {} structural duplicate(s)",
+          reuse.count(xdec::analysis::ReuseKind::ExactDuplicate),
+          reuse.count(xdec::analysis::ReuseKind::StructuralDuplicate));
+    if (!reuse.findings.empty()) {
+      print("{}", reuse.format(function));
+    }
+  }
+  if (dumpIl) {
+    print("{}", xdec::il::print(function));
+  }
 
   const xdec::analysis::StackFrame frame =
       timed("stack-frame", [&] { return xdec::analysis::StackFrame::compute(function); });
-  const xdec::analysis::VariableTable variables = timed(
+  xdec::analysis::VariableTable variables = timed(
       "vars", [&] { return xdec::analysis::VariableTable::recover(function, frame); });
+  // Outlives this block -- COptions::typedVariables below borrows it, so it
+  // has to still be alive at emission, not just while applyImportedTypes
+  // runs. Default-constructed (every lookup unset) when neither a header nor
+  // a syscall table was given, the same "no evidence" shape TypedVariables
+  // itself returns for that case.
+  xdec::analysis::TypedVariables typedVariables;
+  // Built unconditionally: CContext's own binder and calleeName (below) reuse
+  // this exact resolver, so a callee named through a PLT stub's import (see
+  // nameResolverOf) resolves the same way whether or not a header ended up
+  // loaded.
+  const xdec::types::NameAt namesForTypes = [&](uint64_t va) {
+    const xdec::pass::SymbolName symbol = driverOptions.names(va);
+    return xdec::types::BoundName{symbol.name, symbol.isFunction};
+  };
+  if (driverOptions.types != nullptr || driverOptions.syscalls != nullptr) {
+    typedVariables = timed("typed-variables", [&] {
+      return xdec::analysis::TypedVariables::recover(function, frame, driverOptions.types,
+                                                      driverOptions.syscalls, namesForTypes, {},
+                                                      driverOptions.memory, &profile);
+    });
+    if (driverOptions.types != nullptr) {
+      const xdec::types::TypeBinder binder(*driverOptions.types, namesForTypes);
+      variables.applyImportedTypes(typedVariables, binder);
+    }
+  }
   const xdec::analysis::Dominators dominators =
       timed("dominators", [&] { return xdec::analysis::Dominators::compute(function); });
   const xdec::analysis::PostDominators postDominators = timed(
@@ -970,6 +1129,10 @@ int commandDecompile(std::string_view path, uint64_t address,
   cOptions.addresses = addressDescriberOf(image);
   cOptions.types = driverOptions.types;
   cOptions.syscalls = driverOptions.syscalls;
+  cOptions.typedVariables = &typedVariables;
+  cOptions.names = namesForTypes;
+  cOptions.memory = driverOptions.memory;
+  cOptions.helpersHeader = helpersHeader;
   const std::string text = timed("print", [&] {
     return xdec::emit::printFunction(function, variables, frame, structured, cOptions);
   });

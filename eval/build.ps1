@@ -41,6 +41,7 @@ $Sources | ForEach-Object { Write-Host "  $($_.Name)" }
 & $Clang `
   -shared -fPIC `
   "-$Opt" -g `
+  -fstack-protector-strong `
   -Wall -Wextra `
   -o $So `
   ($Sources | ForEach-Object { $_.FullName })

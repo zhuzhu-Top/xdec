@@ -1,5 +1,6 @@
 #include "xdec/pass/manager.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "xdec/il/verify.h"
@@ -14,6 +15,18 @@ namespace xdec::pass {
 // which is not answerable from the outside, because the pipeline reports nothing
 // until it is done. Set XDEC_LOG=pass=debug for a line per pass.
 XDEC_DEFINE_LOG_CATEGORY(passLog, "pass")
+
+namespace {
+
+[[nodiscard]] std::size_t largestBlockOpCount(const il::Function& function) {
+  std::size_t maxOps = 0;
+  for (const il::BlockId blockId : function.blockHandles()) {
+    maxOps = std::max(maxOps, function.block(blockId).ops.size());
+  }
+  return maxOps;
+}
+
+}  // namespace
 
 Result<std::vector<RunStats>> Manager::run(
     il::Function& function, std::span<Pass* const> pipeline) const {
@@ -53,7 +66,10 @@ Result<std::vector<RunStats>> Manager::run(
     }
     RunStats slot{.passName = info.name, .iterations = 0, .changed = false};
     const auto started = std::chrono::steady_clock::now();
+    XDEC_LOG_DEBUG(passLog(), "{:>18} start {} block(s) {} op(s) {} expr(s)", info.name,
+                   function.blockCount(), function.opCount(), function.exprCount());
     do {
+      const auto iterationStart = std::chrono::steady_clock::now();
       Result<bool> changed = pass->run(context);
       if (!changed) {
         // The pipeline stops here, so the failing pass names itself; without
@@ -64,6 +80,30 @@ Result<std::vector<RunStats>> Manager::run(
       }
       ++slot.iterations;
       slot.changed = slot.changed || *changed;
+      if (info.fixpoint) {
+        const int64_t iterationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - iterationStart)
+                                        .count();
+        XDEC_LOG_DEBUG(passLog(), "{:>18} iter {:>2} {:6}ms changed={} {} op(s) {} expr(s)",
+                       info.name, slot.iterations, iterationMs, *changed ? "yes" : "no ",
+                       function.opCount(), function.exprCount());
+        // A single iteration this slow is not "converging slowly" (the
+        // kFixpointLimit bound below already catches that): it means one op or
+        // block inside this run() call is doing disproportionate work, and the
+        // per-iteration total gives no clue which. Set XDEC_LOG=local=debug (or
+        // the pass's own category) for the sub-phase breakdown; see
+        // eval/FINDINGS.md's "mega-block local-simplify" note for the playbook
+        // this line exists to point at.
+        constexpr int64_t kSlowIterationWarningMs = 30'000;
+        if (iterationMs >= kSlowIterationWarningMs) {
+          XDEC_LOG_WARN(passLog(),
+                       "{} iteration {} took {}ms on {} op(s), {} block(s) (max {} op(s) in one "
+                       "block) -- a sub-phase inside the pass is likely the bottleneck, not the "
+                       "fixpoint loop itself",
+                       info.name, slot.iterations, iterationMs, function.opCount(),
+                       function.blockCount(), largestBlockOpCount(function));
+        }
+      }
       if (!info.fixpoint || !*changed) {
         break;
       }

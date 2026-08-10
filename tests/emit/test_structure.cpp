@@ -381,6 +381,307 @@ TEST_CASE("a flattened dispatcher chain becomes a switch over the state",
   CHECK(!result.isLabeled(c3));
 }
 
+TEST_CASE("a handler ending in its own resolved switch still inlines as a case body",
+          "[emit][structure]") {
+  Fixture f;
+  // Same shape as the flattened dispatcher chain above, except handler3 does
+  // not return outright: it is itself a second, resolved dispatch (a table
+  // switch), the way one OLLVM state's handler routing into a nested table is
+  // no different from any other block a case body can end with. Both of the
+  // nested switch's own targets return, so control never falls past it -- a
+  // handler shaped this way still qualifies as a claimable case body.
+  const BlockId c1 = f.block(0x2000);
+  const BlockId c2 = f.block(0x2100);
+  const BlockId c3 = f.block(0x2200);
+  const BlockId handler1 = f.block(0x3000);
+  const BlockId handler2 = f.block(0x3100);
+  const BlockId handler3 = f.block(0x3200);
+  const BlockId tail = f.block(0x4000);
+  const BlockId sub1 = f.block(0x5000);
+  const BlockId sub2 = f.block(0x5100);
+  const ExprId spine = f.function.entryReg(f.function.registers().find("x0"));
+  const ExprId guard = f.function.binary(ExprOp::CmpLtU, spine, f.i64(4));
+  f.function.appendCondBranch(f.entry, 0x1000, guard, c1, tail);
+  f.function.appendCondBranch(c1, 0x2000,
+                              f.function.binary(ExprOp::CmpEq, spine, f.i64(1)),
+                              handler1, c2);
+  f.function.appendCondBranch(c2, 0x2100,
+                              f.function.binary(ExprOp::CmpEq, spine, f.i64(2)),
+                              handler2, c3);
+  f.function.appendCondBranch(c3, 0x2200,
+                              f.function.binary(ExprOp::CmpNe, spine, f.i64(3)),
+                              tail, handler3);
+  f.function.appendReturn(handler1, 0x3000);
+  f.function.appendReturn(handler2, 0x3100);
+  const il::ValueId loaded = f.function.appendLoad(
+      handler3, 0x3200, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, spine, f.i64(3))));
+  const il::OpId brind = f.function.appendIndirectBranch(
+      handler3, 0x3204, f.function.valueRef(loaded));
+  f.function.setTargets(brind, std::vector<BlockId>{sub1, sub2});
+  f.function.appendReturn(sub1, 0x5000);
+  f.function.appendReturn(sub2, 0x5100);
+  f.function.appendReturn(tail, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  const Stmt* switchStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::Switch) {
+      switchStmt = item.get();
+    }
+  }
+  REQUIRE(switchStmt != nullptr);
+  REQUIRE(switchStmt->caseBodies.size() == 3);
+  // The claim succeeded: handler3 is written inline, not left as a `goto` to
+  // a label of its own.
+  REQUIRE(switchStmt->caseBodies[2] != nullptr);
+  CHECK_FALSE(result.isLabeled(handler3));
+  // Its own nested switch is in there, table mode, unmolested.
+  Walk walk;
+  walk.visit(switchStmt->caseBodies[2]);
+  const auto nestedSwitches =
+      std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch);
+  REQUIRE(nestedSwitches == 1);
+}
+
+TEST_CASE("a dispatcher whose handlers all fall into a shared tail inlines every "
+          "case with one shared epilogue",
+          "[emit][structure]") {
+  // The flattened-dispatcher shape (see analysis::DispatcherShape): each
+  // handler does its own thing, then all of them land on the same block
+  // before it jumps on to the hub. claimCaseBody alone would refuse every
+  // one of these -- the shared tail has more than one predecessor, so
+  // regionClosed always fails -- which is exactly the shape
+  // claimDispatcherCaseBody exists for.
+  Fixture f;
+  const BlockId h1 = f.block(0x2000);
+  const BlockId h2 = f.block(0x2100);
+  const BlockId h3 = f.block(0x2200);
+  const BlockId merge = f.block(0x3000);
+  const BlockId hub = f.block(0x4000);
+  const il::OpId brind =
+      f.function.appendIndirectBranch(f.entry, 0x1000, f.function.undefined(Type::integer(64)));
+  f.function.setTargets(brind, std::vector<BlockId>{h1, h2, h3});
+  f.function.appendBranch(h1, 0x2000, merge);
+  f.function.appendBranch(h2, 0x2100, merge);
+  f.function.appendBranch(h3, 0x2200, merge);
+  f.function.appendBranch(merge, 0x3000, hub);
+  f.function.appendReturn(hub, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  const Stmt* switchStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::Switch) {
+      switchStmt = item.get();
+    }
+  }
+  REQUIRE(switchStmt != nullptr);
+  REQUIRE(switchStmt->caseBodies.size() == 3);
+  for (const auto& body : switchStmt->caseBodies) {
+    REQUIRE(body != nullptr);
+  }
+  // The shared tail is the switch's own epilogue, not any one case's -- and
+  // not a label left over for gotos to find, either.
+  REQUIRE(switchStmt->epilogue != nullptr);
+  CHECK(switchStmt->mergeBlock == merge);
+  CHECK_FALSE(result.isLabeled(merge));
+  CHECK_FALSE(result.isLabeled(h1));
+  CHECK_FALSE(result.isLabeled(h2));
+  CHECK_FALSE(result.isLabeled(h3));
+  // Every case ends with a break into that epilogue, and the merge block's
+  // own code is not duplicated into any of them.
+  for (const auto& body : switchStmt->caseBodies) {
+    Walk walk;
+    walk.visit(body);
+    CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Break) == 1);
+    CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), merge) == 0);
+  }
+  Walk epilogueWalk;
+  epilogueWalk.visit(switchStmt->epilogue);
+  CHECK(std::count(epilogueWalk.blocks.begin(), epilogueWalk.blocks.end(), merge) == 1);
+}
+
+TEST_CASE("a dispatcher's lone return handler keeps its own return while its "
+          "merge handlers break to the shared tail",
+          "[emit][structure]") {
+  // The real shape this comes from (0x2a2428's 162-case dispatcher) mixes a
+  // handful of handlers that return outright with the rest that all merge:
+  // both must be recognized in the same switch, each inlined the right way.
+  Fixture f;
+  const BlockId h1 = f.block(0x2000);
+  const BlockId h2 = f.block(0x2100);
+  const BlockId h3 = f.block(0x2200);
+  const BlockId h4 = f.block(0x2300);
+  const BlockId ret = f.block(0x2400);
+  const BlockId merge = f.block(0x3000);
+  const BlockId hub = f.block(0x4000);
+  const il::OpId brind =
+      f.function.appendIndirectBranch(f.entry, 0x1000, f.function.undefined(Type::integer(64)));
+  f.function.setTargets(brind, std::vector<BlockId>{h1, h2, h3, h4, ret});
+  f.function.appendBranch(h1, 0x2000, merge);
+  f.function.appendBranch(h2, 0x2100, merge);
+  f.function.appendBranch(h3, 0x2200, merge);
+  f.function.appendBranch(h4, 0x2300, merge);
+  f.function.appendReturn(ret, 0x2400);
+  f.function.appendBranch(merge, 0x3000, hub);
+  f.function.appendReturn(hub, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  const Stmt* switchStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::Switch) {
+      switchStmt = item.get();
+    }
+  }
+  REQUIRE(switchStmt != nullptr);
+  REQUIRE(switchStmt->epilogue != nullptr);
+  REQUIRE(switchStmt->caseBodies.size() == 5);
+  for (const auto& body : switchStmt->caseBodies) {
+    REQUIRE(body != nullptr);
+  }
+  // The four handlers that fall through to the shared tail each end with a
+  // break, not their own copy of it.
+  for (std::size_t index = 0; index < 4; ++index) {
+    Walk walk;
+    walk.visit(switchStmt->caseBodies[index]);
+    CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Break) == 1);
+    CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), merge) == 0);
+  }
+  // The lone handler that returns outright never reaches the merge block at
+  // all, so it stays exactly what it was: its own return, no break.
+  Walk returnWalk;
+  returnWalk.visit(switchStmt->caseBodies[4]);
+  CHECK(std::count(returnWalk.kinds.begin(), returnWalk.kinds.end(), StmtKind::Break) == 0);
+  CHECK(std::count(returnWalk.blocks.begin(), returnWalk.blocks.end(), ret) == 1);
+  CHECK_FALSE(result.isLabeled(ret));
+  CHECK_FALSE(result.isLabeled(merge));
+}
+
+TEST_CASE("a resolved dispatcher behind its own guard header wraps the whole "
+          "state machine in a while loop",
+          "[emit][structure]") {
+  // tryDispatcherLoop's target shape: header tests a guard condition, one arm
+  // leaves the loop outright, the other reaches a resolved dispatch whose
+  // handlers all fall into a shared tail (see analysis::DispatcherShape) that
+  // jumps back to header. Everything from the guard down to the tail folds
+  // into one `while (true)`, with the tail's own back edge implicit in the
+  // loop's re-entry rather than printed as a goto.
+  Fixture f;
+  const BlockId header = f.block(0x2000);
+  const BlockId dispatch = f.block(0x2100);
+  const BlockId h1 = f.block(0x3000);
+  const BlockId h2 = f.block(0x3100);
+  const BlockId h3 = f.block(0x3200);
+  const BlockId merge = f.block(0x4000);
+  const BlockId exit = f.block(0x5000);
+  f.function.appendBranch(f.entry, 0x1000, header);
+  f.function.appendCondBranch(header, 0x2000, f.cond(), dispatch, exit);
+  const il::OpId brind =
+      f.function.appendIndirectBranch(dispatch, 0x2100, f.function.undefined(Type::integer(64)));
+  f.function.setTargets(brind, std::vector<BlockId>{h1, h2, h3});
+  f.function.appendBranch(h1, 0x3000, merge);
+  f.function.appendBranch(h2, 0x3100, merge);
+  f.function.appendBranch(h3, 0x3200, merge);
+  f.function.appendBranch(merge, 0x4000, header);
+  f.function.appendReturn(exit, 0x5000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::While) == 1);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 1);
+  // A genuine exit: the guard's other arm truly leaves the loop, so it stays
+  // a labelled goto, same as any ordinary guarded loop.
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 1);
+  CHECK(result.isLabeled(exit));
+  CHECK_FALSE(result.isLabeled(merge));
+}
+
+TEST_CASE("a guard's own out-of-range arm rejoining the dispatcher's shared tail "
+          "still wraps in a while loop, as the switch's else",
+          "[emit][structure]") {
+  // bc_lib's own dispatcher (see samples/manifest.json's sample_core_mba):
+  // the guard's "state out of range" arm does not leave the loop at all --
+  // it does its own small bit of work and then lands on the very same
+  // `merge` block every handler does. That is a three-way convergence
+  // tryDispatcherLoop's simpler guard+switch+tail case does not cover
+  // directly: it is also what makes `exit` here turn up inside the natural
+  // loop's own block set (naturalLoop's backward walk reaches it from
+  // `merge` without ever passing through `header`), so `!loop.blocks.
+  // contains(headerExit)` -- the ordinary "this really is an exit" test --
+  // no longer holds. The exit arm has to become the guard's own `if` body
+  // instead of a goto, dispatch/the switch move into the `else`, and the
+  // tail prints once after the whole `if`/`else` rather than as the switch's
+  // own epilogue.
+  Fixture f;
+  const BlockId header = f.block(0x2000);
+  const BlockId dispatch = f.block(0x2100);
+  const BlockId h1 = f.block(0x3000);
+  const BlockId h2 = f.block(0x3100);
+  const BlockId h3 = f.block(0x3200);
+  const BlockId merge = f.block(0x4000);
+  const BlockId exit = f.block(0x5000);
+  f.function.appendBranch(f.entry, 0x1000, header);
+  f.function.appendCondBranch(header, 0x2000, f.cond(), dispatch, exit);
+  const il::OpId brind =
+      f.function.appendIndirectBranch(dispatch, 0x2100, f.function.undefined(Type::integer(64)));
+  f.function.setTargets(brind, std::vector<BlockId>{h1, h2, h3});
+  f.function.appendBranch(h1, 0x3000, merge);
+  f.function.appendBranch(h2, 0x3100, merge);
+  f.function.appendBranch(h3, 0x3200, merge);
+  // The convergence: exit's only way out is straight into the same tail, not
+  // a return or a jump elsewhere.
+  f.function.appendBranch(exit, 0x5000, merge);
+  f.function.appendBranch(merge, 0x4000, header);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  // No exit left to name: every path back out of this region is back through
+  // the header, so the whole thing is one loop with nothing after it.
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::While) == 1);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 1);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 1);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  CHECK_FALSE(result.isLabeled(exit));
+  CHECK_FALSE(result.isLabeled(merge));
+  // exit's own code is the guard's thenArm, and the switch is the elseArm --
+  // both still appear exactly once, and merge's own code is not duplicated
+  // into either one.
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), exit) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), merge) == 1);
+  const Stmt* whileStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::While) {
+      whileStmt = item.get();
+    }
+  }
+  REQUIRE(whileStmt != nullptr);
+  const Stmt& guard = *whileStmt->body->items[1];
+  REQUIRE(guard.kind == StmtKind::If);
+  REQUIRE(guard.thenArm != nullptr);
+  REQUIRE(guard.elseArm != nullptr);
+  Walk thenWalk;
+  thenWalk.visit(guard.thenArm);
+  CHECK(std::count(thenWalk.blocks.begin(), thenWalk.blocks.end(), exit) == 1);
+  Walk elseWalk;
+  elseWalk.visit(guard.elseArm);
+  CHECK(std::count(elseWalk.kinds.begin(), elseWalk.kinds.end(), StmtKind::Switch) == 1);
+  // merge's own code follows the if/else as the loop body's own next item,
+  // not tucked inside either arm.
+  CHECK(std::count(elseWalk.blocks.begin(), elseWalk.blocks.end(), merge) == 0);
+  REQUIRE(whileStmt->body->items.size() == 3);  // header block, guard if, tail
+  Walk tailWalk;
+  tailWalk.visit(whileStmt->body->items.back());
+  CHECK(std::count(tailWalk.blocks.begin(), tailWalk.blocks.end(), merge) == 1);
+}
+
 TEST_CASE("a chain starting at the region entry absorbs its head block",
           "[emit][structure]") {
   Fixture f;

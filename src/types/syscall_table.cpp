@@ -4,11 +4,93 @@
 #include <filesystem>
 #include <format>
 
+#include "xdec/types/database.h"
+
 #ifndef XDEC_TYPES_DIR
 #define XDEC_TYPES_DIR "types"
 #endif
 
 namespace xdec::types {
+
+namespace {
+
+/// Reads the small subset of C type spellings the syscall table's `args`/`ret`
+/// strings use: an optional `const`, a base name (`int`, `unsigned long`,
+/// `size_t`, or `struct`/`union`/`enum <tag>`), then zero or more trailing
+/// `*`. This is not the `.hdecl` grammar — no arrays, no function pointers, no
+/// declarator nesting — because the table never spells anything more than
+/// that; see types/syscall/aarch64-linux.json for the full vocabulary this
+/// covers.
+///
+/// `const` is dropped rather than modelled: TypeDatabase has no const bit (see
+/// types/type.h), and the printer already casts every syscall argument to the
+/// table's own spelling regardless, so the qualifier would have nowhere to go.
+[[nodiscard]] TypeId resolveSpelling(const TypeDatabase& database, std::string_view spelling) {
+  const auto trim = [](std::string_view text) {
+    while (!text.empty() && text.front() == ' ') {
+      text.remove_prefix(1);
+    }
+    while (!text.empty() && text.back() == ' ') {
+      text.remove_suffix(1);
+    }
+    return text;
+  };
+
+  std::string_view text = trim(spelling);
+  unsigned pointerDepth = 0;
+  while (!text.empty() && text.back() == '*') {
+    text.remove_suffix(1);
+    text = trim(text);
+    ++pointerDepth;
+  }
+  constexpr std::string_view kConst = "const ";
+  if (text.starts_with(kConst)) {
+    text = trim(text.substr(kConst.size()));
+  }
+
+  TypeId base;
+  bool matched = false;
+  for (const std::string_view keyword : {"struct ", "union ", "enum "}) {
+    if (text.starts_with(keyword)) {
+      base = database.lookup(text.substr(keyword.size()), NameSpace::Tag);
+      matched = true;
+      break;
+    }
+  }
+  if (!matched) {
+    base = database.lookup(text);
+  }
+  if (!base.valid()) {
+    return {};
+  }
+
+  TypeId result = base;
+  for (unsigned level = 0; level < pointerDepth; ++level) {
+    const std::optional<TypeId> pointer = database.findPointerTo(result);
+    if (!pointer.has_value()) {
+      // No earlier declaration ever needed exactly this pointer depth, and
+      // resolving from a `const TypeDatabase&` cannot intern a new one (see
+      // TypeDatabase::findPointerTo) -- so the spelling stays untyped rather
+      // than silently stopping one level short of what it said.
+      return {};
+    }
+    result = *pointer;
+  }
+  return result;
+}
+
+}  // namespace
+
+void SyscallTable::resolveTypes(const TypeDatabase& database) {
+  for (auto& [number, info] : byNumber_) {
+    info.argTypeIds.clear();
+    info.argTypeIds.reserve(info.argTypes.size());
+    for (const std::string& spelling : info.argTypes) {
+      info.argTypeIds.push_back(resolveSpelling(database, spelling));
+    }
+    info.returnTypeId = info.returnType.empty() ? TypeId{} : resolveSpelling(database, info.returnType);
+  }
+}
 
 Result<SyscallTable> SyscallTable::fromJson(const json::Value& value) {
   const json::Value* syscalls = value.find("syscalls");

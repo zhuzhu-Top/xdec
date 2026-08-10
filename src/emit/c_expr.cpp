@@ -28,7 +28,16 @@ std::string ExprPrinter::rootText(il::ExprId id) {
       cached != materializedText_.end()) {
     return cached->second.text;
   }
-  if (const il::Expr& expr = ctx_.function.expr(id); isRedundantRootZext(expr)) {
+  const il::Expr& expr = ctx_.function.expr(id);
+  // Dropping the cast here means printing straight through to `operand(0)`'s
+  // own text, under `operand(0)`'s own identity -- fine when this ZExt node
+  // is not itself something another use needs to name, but wrong the moment
+  // it is: a parent elsewhere in this scope may reference this exact ZExt
+  // node (not its operand) enough times to make IT the shared one (see
+  // isShared's own per-node counting), and skipping straight to the operand
+  // here would print that shared value's full text instead of the `_cseN`
+  // name every other use of this same node already agreed on.
+  if (!isShared(id, expr) && isRedundantRootZext(expr)) {
     return integerOperand(expr.operand(0));
   }
   return text(id);
@@ -39,7 +48,8 @@ std::string ExprPrinter::rootInteger(il::ExprId id) {
       cached != materializedText_.end()) {
     return cached->second.text;
   }
-  if (const il::Expr& expr = ctx_.function.expr(id); isRedundantRootZext(expr)) {
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (!isShared(id, expr) && isRedundantRootZext(expr)) {
     return integerOperand(expr.operand(0));
   }
   return integerOperand(id);
@@ -50,6 +60,12 @@ void ExprPrinter::beginScope(const std::vector<il::ExprId>& roots) {
   materializedText_.clear();
   pendingDecls_.clear();
   for (const il::ExprId root : roots) {
+    countReferences(root);
+  }
+}
+
+void ExprPrinter::extendScope(const std::vector<il::ExprId>& moreRoots) {
+  for (const il::ExprId root : moreRoots) {
     countReferences(root);
   }
 }
@@ -230,20 +246,20 @@ std::string ExprPrinter::inner(il::ExprId id) {
       const bool sign = e.op == il::ExprOp::MulHiS;
       const uint32_t width = e.type.bits();
       ctx_.helpers.insert(std::format("mulhi{}{}", sign ? "s" : "u", width));
-      return std::format("__xdec_mulhi{}{}({}, {})", sign ? "s" : "u", width,
+      return std::format("xdec_mulhi{}{}({}, {})", sign ? "s" : "u", width,
                          integerOperand(e.operand(0)),
                          integerOperand(e.operand(1)));
     }
     case il::ExprOp::RotR:
     case il::ExprOp::RotL: {
       // Bit rotate: extremely common in the hash/PRNG-shaped code obfuscators
-      // favour, so this is not the rare case a comment-and-embedder-stub
-      // helper elsewhere in this switch is for — it gets a real, portable
-      // definition (see rotateHelperDefinition in c_helpers.cpp).
+      // favour, so this is not the rare case an embedder-stub elsewhere in
+      // this switch is for — it gets a real, portable definition, in
+      // xdec_helpers.h rather than repeated inline in every decompiled file.
       const bool right = e.op == il::ExprOp::RotR;
       const uint32_t width = e.type.bits();
       ctx_.helpers.insert(std::format("rot{}{}", right ? "r" : "l", width));
-      return std::format("__xdec_rot{}{}({}, {})", right ? "r" : "l", width,
+      return std::format("rot{}{}({}, {})", right ? "r" : "l", width,
                          integerOperand(e.operand(0)),
                          integerOperand(e.operand(1)));
     }
@@ -251,7 +267,7 @@ std::string ExprPrinter::inner(il::ExprId id) {
       // Same shape as Clz just above: the zero-input result is target-defined,
       // so this stays an embedder-supplied stub rather than guessing.
       ctx_.helpers.insert(std::format("ctz{}", e.type.bits()));
-      return std::format("__xdec_ctz{}({})", e.type.bits(),
+      return std::format("xdec_ctz{}({})", e.type.bits(),
                          integerOperand(e.operand(0)));
     case il::ExprOp::Bitcast:
       // Reinterpreting the same bits at a possibly different type: this IL
@@ -324,23 +340,25 @@ std::string ExprPrinter::inner(il::ExprId id) {
                          integerOperand(e.operand(0)), e.immediate);
     }
     case il::ExprOp::ByteSwap:
-      return std::format("__builtin_bswap{}({})", e.type.bits(),
+      ctx_.helpers.insert(std::format("bswap{}", e.type.bits()));
+      return std::format("bswap{}({})", e.type.bits(),
                          integerOperand(e.operand(0)));
     case il::ExprOp::BitReverse:
       ctx_.helpers.insert(std::format("brev{}", e.type.bits()));
-      return std::format("__xdec_brev{}({})", e.type.bits(),
+      return std::format("xdec_brev{}({})", e.type.bits(),
                          integerOperand(e.operand(0)));
     case il::ExprOp::PopCount:
-      return std::format("__builtin_popcountll({})", integerOperand(e.operand(0)));
+      ctx_.helpers.insert("popcount64");
+      return std::format("popcount64({})", integerOperand(e.operand(0)));
     case il::ExprOp::Clz:
       ctx_.helpers.insert(std::format("clz{}", e.type.bits()));
-      return std::format("__xdec_clz{}({})", e.type.bits(),
+      return std::format("xdec_clz{}({})", e.type.bits(),
                          integerOperand(e.operand(0)));
     case il::ExprOp::FlagCond:
       return printFlagCond(ctx_, *this, id);
     case il::ExprOp::FlagBit:
       ctx_.helpers.insert("flagbit");
-      return std::format("__xdec_flagbit({}, {})", text(e.operand(0)), e.immediate);
+      return std::format("xdec_flagbit({}, {})", text(e.operand(0)), e.immediate);
     case il::ExprOp::FlagDef:
       // Only meaningful under a FlagCond or FlagBit; alone it says nothing.
       return "/*flagdef*/0";
@@ -350,8 +368,8 @@ std::string ExprPrinter::inner(il::ExprId id) {
     case il::ExprOp::FDiv:
     case il::ExprOp::FNeg: {
       const std::string name = std::format("{}{}", il::toString(e.op), e.type.bits());
-      ctx_.helpers.insert("f" + name);
-      std::string call = std::format("__xdec_{}(", name);
+      ctx_.helpers.insert(name);
+      std::string call = std::format("xdec_{}(", name);
       for (unsigned index = 0; index < e.operandCount; ++index) {
         call += index == 0 ? "" : ", ";
         call += text(e.operand(index));

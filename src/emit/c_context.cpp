@@ -5,6 +5,9 @@
 #include <cctype>
 #include <format>
 
+#include "c_stmt.h"
+#include "xdec/analysis/import_callee.h"
+#include "xdec/analysis/typed_variables.h"
 #include "xdec/types/syscall_table.h"
 
 namespace xdec::emit {
@@ -14,6 +17,30 @@ std::string intType(uint32_t width, bool isSigned) {
     return "bool";  // i1: conditions and sign bits
   }
   return std::format("{}int{}_t", isSigned ? "" : "u", width);
+}
+
+CContext::CContext(const il::Function& theFunction, const analysis::VariableTable& theVariables,
+                   const analysis::StackFrame& theFrame, const StructuredFunction& theStructured,
+                   const COptions& theOptions)
+    : function(theFunction),
+      variables(theVariables),
+      frame(theFrame),
+      structured(theStructured),
+      options(theOptions),
+      deadOps(theStructured.root ? collectDeadOps(theFunction, *theStructured.root, theOptions)
+                                 : std::unordered_set<uint32_t>{}) {
+  if (options.types != nullptr) {
+    binder_.emplace(*options.types, [this](uint64_t va) {
+      const SymbolRef symbol = symbolAt(va);
+      if (symbol.exact()) {
+        return types::BoundName{symbol.name, symbol.isFunction};
+      }
+      // No real symbol starts here: the one other exact fact an address can
+      // carry is being a PLT stub's entry, already resolved (and aliased) by
+      // `options.names` -- see nameResolverOf in xdec_main.cpp.
+      return options.names ? options.names(va) : types::BoundName{};
+    });
+  }
 }
 
 const std::string* CContext::tempFor(il::ValueId value) const {
@@ -99,6 +126,16 @@ const types::TypeEntry* CContext::calleeType(il::ExprId target) const {
   if (function.asConstantThroughCasts(target, address)) {
     return binder_->prototypeAt(address);
   }
+  // A call through a GOT/import slot a `Load` reads: the same evidence
+  // apply-types trimmed this call's arity from (see
+  // analysis::calleeThroughImportSlot), asked here so the computed-call cast
+  // this feeds (StmtPrinter::calleeCast) agrees with that trim instead of
+  // falling back to the untyped `uint64_t (*)(...)` form.
+  if (const types::TypeEntry* imported =
+          analysis::calleeThroughImportSlot(function, *binder_, options.memory, target);
+      imported != nullptr) {
+    return imported;
+  }
   const il::Expr& expr = function.expr(target);
   if (expr.op != il::ExprOp::EntryReg) {
     return nullptr;
@@ -137,8 +174,18 @@ struct Displacement {
 }  // namespace
 
 types::TypeId CContext::typeOfValue(il::ValueId value) const {
-  const auto found = valueTypes.find(value.index());
-  return found == valueTypes.end() ? types::TypeId{} : found->second;
+  if (const auto found = valueTypes.find(value.index()); found != valueTypes.end()) {
+    return found->second;
+  }
+  // A call or `svc` result the callee's own signature typed -- evidence
+  // fieldAccess never sees, since nothing here dereferenced it through a
+  // struct. See analysis::TypedVariables and COptions::typedVariables.
+  if (options.typedVariables != nullptr) {
+    if (const std::optional<types::TypeId> typed = options.typedVariables->forValue(value)) {
+      return *typed;
+    }
+  }
+  return {};
 }
 
 bool CContext::valueIsPointer(il::ValueId value) const {
@@ -252,6 +299,19 @@ types::TypeId CContext::argumentType(const analysis::Variable& variable) const {
   return binder_->registerShaped(declared) ? declared : types::TypeId{};
 }
 
+types::TypeId CContext::functionReturnType() const {
+  if (options.typedVariables == nullptr || !binder_) {
+    return {};
+  }
+  const std::optional<types::TypeId> typed = options.typedVariables->returnType();
+  const std::optional<analysis::CType>& inferred = variables.returnType();
+  if (!typed.has_value() || !inferred.has_value() ||
+      !binder_->consistent(*typed, inferred->width, inferred->pointerDepth)) {
+    return {};
+  }
+  return *typed;
+}
+
 std::string CContext::argumentName(const analysis::Variable& variable) const {
   const types::TypeEntry* proto = prototype();
   const int position = argumentPosition(variable);
@@ -261,6 +321,47 @@ std::string CContext::argumentName(const analysis::Variable& variable) const {
   }
   const std::string& declared = proto->params[static_cast<std::size_t>(position)].name;
   return declared.empty() ? variable.name : declared;
+}
+
+std::string CContext::localFieldAccess(int64_t delta, uint32_t width) const {
+  const analysis::Variable* local = variables.localAt(delta);
+  if (local == nullptr) {
+    return {};
+  }
+  if (local->aliasBase.has_value()) {
+    if (local->type.width != width) {
+      return {};
+    }
+    const analysis::Variable* base = variables.localAt(*local->aliasBase);
+    return base == nullptr ? std::string{}
+                           : std::format("{}.{}", base->name, local->aliasField);
+  }
+  if (!local->importedType.has_value()) {
+    return {};
+  }
+  const types::TypeDatabase& database = *options.types;
+  const types::TypeDatabase::FieldPath field = database.fieldAt(*local->importedType, 0);
+  if (!field.found() || field.remainder != 0 ||
+      database.sizeOf(field.type).value_or(0) * 8 != width) {
+    return {};
+  }
+  std::string path;
+  for (const std::string& name : field.names) {
+    path += path.empty() ? name : "." + name;
+  }
+  return std::format("{}.{}", local->name, path);
+}
+
+std::string CContext::addressOfLocal(il::ExprId address) const {
+  const analysis::AddressInfo info = frame.classify(address);
+  if (info.kind != analysis::AddressKind::StackSlot) {
+    return {};
+  }
+  const analysis::Variable* local = variables.localAt(info.delta);
+  if (local == nullptr || !local->importedType.has_value()) {
+    return {};
+  }
+  return std::format("&{}", local->name);
 }
 
 bool CContext::argumentIsPointer(const analysis::Variable& variable) const {

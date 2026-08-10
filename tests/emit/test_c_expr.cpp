@@ -256,10 +256,14 @@ TEST_CASE("a bit rotate calls a real, defined helper", "[emit][expr]") {
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "static inline uint64_t __xdec_rotr64(uint64_t x, uint32_t n) {"));
-  CHECK(contains(text, "static inline uint64_t __xdec_rotl64(uint64_t x, uint32_t n) {"));
-  CHECK(contains(text, "__xdec_rotr64(a0, 0x3f)"));
-  CHECK(contains(text, "__xdec_rotl64(a1, 0x7)"));
+  // Defined once in xdec_helpers.h, not inline in every decompiled file --
+  // the body just pulls the header in and calls the short name.
+  CHECK(contains(text, "#include \"xdec_helpers.h\""));
+  CHECK(!contains(text, "static inline uint64_t rotr64"));
+  CHECK(contains(text, "rotr64(a0, 0x3f)"));
+  CHECK(contains(text, "rotl64(a1, 0x7)"));
+  CHECK(!contains(text, "__xdec_rotr64"));
+  CHECK(!contains(text, "__xdec_rotl64"));
   CHECK(!contains(text, "rotr?"));
   CHECK(!contains(text, "rotl?"));
 }
@@ -271,8 +275,12 @@ TEST_CASE("count-trailing-zeros is a labelled embedder stub, not a silent zero",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "__xdec_ctz64(a0)"));
-  CHECK(contains(text, "__xdec_ctz64: semantics helper, supplied by the embedder"));
+  // Declared in xdec_helpers.h (a real prototype, not a comment): the
+  // header is the one place an embedder needs to look to see the whole
+  // list of stubs a decompiled body might call.
+  CHECK(contains(text, "#include \"xdec_helpers.h\""));
+  CHECK(contains(text, "xdec_ctz64(a0)"));
+  CHECK(!contains(text, "__xdec_ctz64"));
   CHECK(!contains(text, "ctz?"));
 }
 

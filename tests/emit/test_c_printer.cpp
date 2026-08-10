@@ -174,9 +174,12 @@ TEST_CASE("a residual flag condition prints its exact helper", "[emit][print]") 
   f.function.appendReturn(right, 0x3000);
 
   const std::string text = f.emit();
-  CHECK(contains(text, "__xdec_cc_lt_32(((uint32_t)(a0)), 0x1)"));
-  // The helper is declared in the preamble, once, before the function.
-  CHECK(contains(text, "static inline bool __xdec_cc_lt_32(uint32_t a, uint32_t b)"));
+  CHECK(contains(text, "cc_lt32(((uint32_t)(a0)), 0x1)"));
+  // Defined once in xdec_helpers.h, pulled in by one `#include` -- not
+  // repeated as a `static inline` block in this file's own preamble.
+  CHECK(contains(text, "#include \"xdec_helpers.h\""));
+  CHECK(!contains(text, "static inline bool cc_lt32"));
+  CHECK(!contains(text, "__xdec_cc_lt_32"));
 }
 
 TEST_CASE("a returned select prints as a guard, and a nested one as a chain",

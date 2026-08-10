@@ -3,6 +3,7 @@ xdec_add_library(xdec_binary
     elf.cpp
     image.cpp
     memory_map.cpp
+    target_profile.cpp
   DEPS
     xdec_support)
 

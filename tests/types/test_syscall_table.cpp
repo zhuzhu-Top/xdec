@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "xdec/types/database.h"
+#include "xdec/types/parse.h"
 #include "xdec/types/syscall_table.h"
 
 using namespace xdec;
@@ -66,4 +68,45 @@ TEST_CASE("malformed tables are rejected with the offending entry named",
       load(R"({"syscalls":{"64":{"name":"write","args":["int","void*"],"argc":3}}})")
           .hasValue());
   REQUIRE(load(R"({"syscalls":{"64":{"name":"write","argc":3}}})").hasValue());
+}
+
+TEST_CASE("resolveTypes turns a syscall's argument spellings into TypeIds",
+          "[types][syscall]") {
+  const Result<std::string> path = SyscallTable::resolvePath(SyscallTable::defaultName());
+  REQUIRE(path.hasValue());
+  Result<SyscallTable> table = SyscallTable::loadFile(*path);
+  REQUIRE(table.hasValue());
+
+  TypeDatabase database;
+  // The struct tags alone are not enough: nothing interns "struct timeval*"
+  // (see TypeDatabase::findPointerTo) until some declaration actually takes
+  // one, so a prototype naming each pointer is included purely to force that.
+  const Result<ParseReport> report = parseHeader(
+      "struct timeval { long tv_sec; long tv_usec; };\n"
+      "struct timezone { int tz_minuteswest; int tz_dsttime; };\n"
+      "void gettimeofday_proto(struct timeval *tv, struct timezone *tz);\n",
+      database);
+  REQUIRE(report.hasValue());
+
+  const SyscallInfo* beforeGettimeofday = table->find(169);
+  REQUIRE(beforeGettimeofday != nullptr);
+  CHECK(beforeGettimeofday->argTypeIds.empty());  // not resolved yet
+
+  table->resolveTypes(database);
+  const SyscallInfo* gettimeofday = table->find(169);
+  REQUIRE(gettimeofday != nullptr);
+  REQUIRE(gettimeofday->argTypeIds.size() == 2);
+  // "struct timeval*": one level of pointer over the tag this header declared.
+  const TypeId timeval = database.lookup("timeval", NameSpace::Tag);
+  REQUIRE(timeval.valid());
+  CHECK(gettimeofday->argTypeIds[0] == database.pointerTo(timeval));
+  // "struct timezone*" is declared here too, so it resolves the same way.
+  CHECK(gettimeofday->argTypeIds[1].valid());
+
+  // A number this header never declared a tag for still resolves cleanly to
+  // an invalid TypeId rather than crashing the pass that reads it.
+  const SyscallInfo* write = table->find(64);
+  REQUIRE(write != nullptr);
+  REQUIRE(write->argTypeIds.size() == write->argTypes.size());
+  CHECK(write->returnTypeId.valid());  // "ssize_t" is a builtin, always present
 }

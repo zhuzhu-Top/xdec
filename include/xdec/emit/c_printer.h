@@ -9,10 +9,16 @@
 //     typed dereference `*(uint32_t*)(addr)`.
 //   * Widths are honest: sub-64-bit arithmetic wraps in an explicit cast,
 //     signed operations cast their operands, extensions are casts.
-//   * What the IL cannot yet say in C gets a helper, never a guess:
-//     __xdec_flag_* for residual flag conditions, __xdec_intrin_* for
-//     intrinsics, __xdec_unimplemented for instructions the spec declined.
-//     Helpers are declared in a preamble emitted only when used.
+//   * What C can say unambiguously and portably gets a short, plain name --
+//     `rotr32`, `bswap64`, `cc_lt32` -- defined once in xdec_helpers.h and
+//     pulled in with one `#include` (see COptions::helpersHeader) instead of
+//     repeating a definition inline in every decompiled file.
+//   * What the IL cannot yet say in C at all gets an `xdec_`-prefixed
+//     embedder stub instead of a guess: declared in that same header when
+//     one fixed signature covers it (`xdec_clz32`, `xdec_fadd32`, ...), or
+//     declared here, on demand, when it cannot be (`__xdec_intrin_*` is a
+//     family of differently-named calls, `__xdec_syscall`'s declaration
+//     predates the header, `__xdec_unimplemented` is never declared at all).
 #pragma once
 
 #include <cstdint>
@@ -23,11 +29,17 @@
 #include "xdec/analysis/variables.h"
 #include "xdec/emit/structure.h"
 #include "xdec/il/function.h"
+#include "xdec/support/reader.h"
+#include "xdec/types/binder.h"
 
 namespace xdec::types {
 class SyscallTable;
 class TypeDatabase;
 }  // namespace xdec::types
+
+namespace xdec::analysis {
+class TypedVariables;
+}  // namespace xdec::analysis
 
 namespace xdec::emit {
 
@@ -110,6 +122,20 @@ struct COptions {
   SymbolResolver symbols;
   /// What the image says about the addresses the body loads from and stores to.
   AddressDescriber addresses;
+  /// A fixed call target's name when no symbol starts exactly there: the
+  /// import behind a PLT stub's GOT indirection (see
+  /// analysis/plt_stub.h), already aliased to the header's own spelling of it
+  /// (bionic's `__errno` vs. the NDK header's `__errno_location`; see
+  /// binary::TargetProfile). Consulted by CContext::calleeName and its own
+  /// type binder after `symbols` finds no exact function there. Absent skips
+  /// the fallback, same as before this existed: such a call still prints as
+  /// `sub_<va>`.
+  types::NameAt names;
+  /// What the loader resolves a GOT/import slot to, for the same "call
+  /// through a slot a `Load` reads" shape analysis::calleeThroughImportSlot
+  /// answers for arity and typing. Absent leaves such a call typed only by
+  /// the machine's own register width, same as before this existed.
+  MemoryFacts memory;
   /// Declarations imported from headers, when the caller supplied any. What
   /// this changes is spelling, never structure: a signature becomes
   /// `int32_t f(EvalVec3 *v)` instead of `uint64_t f(uint64_t a0)`, and an
@@ -119,6 +145,19 @@ struct COptions {
   /// The kernel's syscall numbering, for turning a recovered `svc` into a
   /// named call. Absent leaves syscalls as the raw helper.
   const types::SyscallTable* syscalls = nullptr;
+  /// Type evidence a call or `svc` site's own signature gave a value this
+  /// function computes, layered the same way `variables` layers it onto
+  /// arguments and locals (see analysis::TypedVariables) -- but keyed by
+  /// every call/intrinsic result, not just the ones VariableTable models as
+  /// a Variable. Absent leaves a call result declared at its measured width,
+  /// same as before this analysis existed.
+  const analysis::TypedVariables* typedVariables = nullptr;
+  /// The `#include` path the preamble names for the portable semantics
+  /// helpers (rotate, byte swap, population count, the overflow-exact
+  /// condition codes -- see xdec_helpers.h) when the body used any of them.
+  /// Empty suppresses the include; the caller is then responsible for
+  /// making those names available some other way.
+  std::string helpersHeader = "xdec_helpers.h";
 };
 
 [[nodiscard]] std::string printFunction(const il::Function& function,

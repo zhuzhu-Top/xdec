@@ -54,6 +54,15 @@ class Structurizer {
   /// do-while when the latch is.
   StmtPtr tryLoop(const analysis::NaturalLoop& loop, unsigned depth);
 
+  /// Loop form for the OLLVM state-machine shape: a guard header, a resolved
+  /// switch whose cases mostly fall through one shared tail (see
+  /// analysis::DispatcherShape), and that tail's own unconditional jump back
+  /// to the header. Built as one region in a single pass -- the guard, the
+  /// switch and the tail all have to become one region's blocks together or
+  /// not at all, since `regionClosed` demands every predecessor of the tail
+  /// be accounted for either way.
+  StmtPtr tryDispatcherLoop(const analysis::NaturalLoop& loop, unsigned depth);
+
   StmtPtr gotoChain(il::ExprId cond, il::BlockId taken, il::BlockId untaken);
   StmtPtr gotoStmt(il::BlockId target);
 
@@ -64,6 +73,20 @@ class Structurizer {
   /// Structures a case's handler into the case itself, or nothing when the
   /// handler is shared and so has to keep its own label.
   StmtPtr claimCaseBody(il::BlockId dispatcher, il::BlockId handler, unsigned depth);
+
+  /// Like `claimCaseBody`, but for a handler that flows into a dispatcher
+  /// shape's shared tail `merge` (see analysis::DispatcherShape) rather than
+  /// leaving on its own: the body is walked only up to `merge`, not into it,
+  /// and (when `appendBreak`) closed off with a `Break` instead of requiring
+  /// the handler itself to end in a return/goto/switch. `appendBreak` is
+  /// false for `tryDispatcherLoop`'s three-way merge case: there, the
+  /// caller's own `if`/`else` reaches `merge` structurally (as the shared
+  /// code following both arms), so nothing needs to say so explicitly, and a
+  /// `Break` outside of any switch would wrongly leave the enclosing loop
+  /// instead.
+  StmtPtr claimDispatcherCaseBody(il::BlockId dispatcher, il::BlockId handler,
+                                  il::BlockId merge, unsigned depth,
+                                  bool appendBreak = true);
 
   /// Whether control cannot reach the bottom of a statement and carry on past it.
   /// Conservative: unsure counts as "it can".
@@ -179,3 +202,4 @@ class Structurizer {
 };
 
 }  // namespace xdec::emit
+

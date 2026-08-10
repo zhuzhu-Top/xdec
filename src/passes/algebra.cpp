@@ -6,10 +6,14 @@
 
 #include "xdec/il/ceval.h"
 #include "xdec/support/bits.h"
+#include "xdec/support/log.h"
 
 #include "algebra_idioms.h"
 
 namespace xdec::passes {
+
+// Walk statistics for simplifyAlgebra. Set XDEC_LOG=algebra=debug.
+XDEC_DEFINE_LOG_CATEGORY(algebraLog, "algebra")
 
 namespace {
 
@@ -42,8 +46,18 @@ class Algebra {
  public:
   explicit Algebra(il::Function& function) : function_(function), pred_{function} {}
 
+  struct Stats {
+    std::size_t entries = 0;
+    std::size_t memoHits = 0;
+    std::size_t interned = 0;
+  };
+
+  [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+
   [[nodiscard]] il::ExprId simplify(il::ExprId id, unsigned depth = 0) {
+    ++stats_.entries;
     if (const auto found = memo_.find(id); found != memo_.end()) {
+      ++stats_.memoHits;
       return found->second;
     }
     // Deep substituted chains outgrow any call stack: past the bound, leave
@@ -64,6 +78,7 @@ class Algebra {
       }
       if (changed) {
         result = function_.intern(rebuilt);
+        ++stats_.interned;
       }
       // The node's own rules, to a fixpoint: one rewrite may enable the next
       // (an MBA match leaves an add; the add may reassociate).
@@ -325,6 +340,11 @@ class Algebra {
     if (const il::ExprId shift = matchMaskedShift(function_, expr); shift.valid()) {
       return shift;
     }
+    // The errno idiom's `hi` half, once fold.cpp's lazy-flag folding has
+    // turned `cset hi` into `(sum <u a) & (sum != 0)`.
+    if (const il::ExprId carry = matchCarryCompare(function_, expr); carry.valid()) {
+      return carry;
+    }
     return unchanged(expr);
   }
 
@@ -365,6 +385,10 @@ class Algebra {
     }
     if (const il::ExprId mba = matchMbaOr(function_, expr); mba.valid()) {
       return mba;
+    }
+    // The errno idiom's `ls` half, the negation of the `hi` half above.
+    if (const il::ExprId carry = matchCarryCompareOr(function_, expr); carry.valid()) {
+      return carry;
     }
     return unchanged(expr);
   }
@@ -499,6 +523,10 @@ class Algebra {
         narrowed.valid()) {
       return narrowed;
     }
+    if (const il::ExprId cancelled = matchCancelledSubtrahend(function_, expr);
+        cancelled.valid()) {
+      return cancelled;
+    }
     return id;
   }
 
@@ -544,6 +572,7 @@ class Algebra {
 
   il::Function& function_;
   Pred pred_;
+  Stats stats_;
   std::unordered_map<il::ExprId, il::ExprId> memo_;
 };
 
@@ -554,8 +583,10 @@ il::ExprId simplifyAlgebra(il::Function& function, il::ExprId id) {
 }
 
 bool simplifyAlgebra(il::Function& function) {
+  const std::size_t exprBefore = function.exprCount();
   Algebra algebra(function);
   bool changed = false;
+  std::size_t opsTouched = 0;
   for (const il::BlockId blockId : function.blockHandles()) {
     for (const il::OpId opId : function.block(blockId).ops) {
       const auto operands = function.operands(function.op(opId));
@@ -572,9 +603,15 @@ bool simplifyAlgebra(il::Function& function) {
       if (touched) {
         function.setOperands(opId, rewritten);
         changed = true;
+        ++opsTouched;
       }
     }
   }
+  const Algebra::Stats& stats = algebra.stats();
+  XDEC_LOG_DEBUG(
+      algebraLog(),
+      "{} op(s) touched, {} simplify walk(s) ({} memo hit(s)), {} intern(s), {} -> {} expr(s)",
+      opsTouched, stats.entries, stats.memoHits, stats.interned, exprBefore, function.exprCount());
   return changed;
 }
 

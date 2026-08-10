@@ -20,18 +20,29 @@ add_executable(xdec_tests
   support/test_handle.cpp
   support/test_result.cpp
   analysis/test_analysis.cpp
+  analysis/test_dispatcher_shape.cpp
+  analysis/test_expr_reuse.cpp
   analysis/test_image_eval.cpp
+  analysis/test_import_callee.cpp
+  analysis/test_index_bound.cpp
   analysis/test_jump_table.cpp
+  analysis/test_live_register_frame.cpp
+  analysis/test_plt_stub.cpp
   analysis/test_profile.cpp
   analysis/test_stack_frame.cpp
+  analysis/test_typed_variables.cpp
   analysis/test_variables.cpp
   decompile/test_driver.cpp
   emit/test_structure.cpp
   emit/test_c_printer.cpp
   emit/test_c_expr.cpp
+  emit/test_c_expr_reuse.cpp
+  emit/test_c_helpers_header.cpp
+    emit/test_c_import_call.cpp
     emit/test_c_syscall.cpp
     emit/test_c_types.cpp
   emit/test_c_phi_edges.cpp
+  emit/test_c_typed_return.cpp
   binary/test_memory_map.cpp
   binary/test_elf.cpp
   il/test_type.cpp
@@ -68,7 +79,8 @@ add_executable(xdec_tests
   spec/test_spec_engine.cpp
   types/test_type_database.cpp
   types/test_hdecl_parser.cpp
-  types/test_syscall_table.cpp)
+  types/test_syscall_table.cpp
+  types/test_binder.cpp)
 
 # The spec tests read the shipped .xspec files rather than a copy of them, so
 # that a spec which stops checking cannot pass the suite.

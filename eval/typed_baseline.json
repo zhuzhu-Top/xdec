@@ -23,6 +23,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -30,12 +31,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -46,7 +52,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 8,
+        "lines": 7,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -55,6 +61,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -62,12 +69,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -87,19 +99,25 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
         "undef": 0,
         "unnamed": 0,
         "dead": 0,
-        "intrinsics": 1,
+        "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -119,6 +137,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -126,12 +145,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -142,7 +166,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 11,
+        "lines": 10,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -151,6 +175,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -158,12 +183,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -174,7 +204,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 16,
+        "lines": 14,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -183,6 +213,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 3,
@@ -190,12 +221,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -206,7 +242,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 29,
+        "lines": 27,
         "gotos": 1,
         "labels": 1,
         "switches": 0,
@@ -215,6 +251,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 1,
@@ -222,12 +259,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 4,
+        "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -238,7 +280,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 23,
+        "lines": 21,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -247,6 +289,7 @@
         "ternaries": 2,
         "conditionals": 3,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 1,
@@ -254,12 +297,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 2,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -270,7 +318,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 29,
+        "lines": 27,
         "gotos": 1,
         "labels": 1,
         "switches": 0,
@@ -279,6 +327,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 1,
@@ -286,12 +335,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 3,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -311,6 +365,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 8,
@@ -318,12 +373,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -334,7 +394,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 11,
+        "lines": 10,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -343,6 +403,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -350,12 +411,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -366,7 +432,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 16,
+        "lines": 11,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -375,6 +441,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -382,12 +449,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 6,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -398,15 +470,16 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 40,
+        "lines": 44,
         "gotos": 1,
         "labels": 1,
         "switches": 0,
         "cases": 0,
-        "ifs": 3,
-        "ternaries": 2,
+        "ifs": 5,
+        "ternaries": 0,
         "conditionals": 5,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 2,
@@ -414,12 +487,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 5,
+        "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -439,6 +517,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -446,12 +525,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -471,6 +555,7 @@
         "ternaries": 2,
         "conditionals": 4,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -478,12 +563,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -503,6 +593,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -510,12 +601,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -526,7 +622,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 11,
+        "lines": 10,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -535,6 +631,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -542,12 +639,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -558,7 +660,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 35,
+        "lines": 32,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -567,6 +669,7 @@
         "ternaries": 2,
         "conditionals": 5,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 3,
@@ -574,12 +677,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 2,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -599,6 +707,7 @@
         "ternaries": 0,
         "conditionals": 3,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 3,
@@ -606,12 +715,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -622,7 +736,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 34,
+        "lines": 33,
         "gotos": 1,
         "labels": 1,
         "switches": 1,
@@ -631,6 +745,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 1,
+        "loops_while_true": 1,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -638,12 +753,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 2,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -654,7 +774,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 10,
+        "lines": 8,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -663,6 +783,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -670,12 +791,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 3,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 3
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 3,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -686,7 +812,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 30,
+        "lines": 28,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -695,6 +821,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -702,12 +829,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 5,
+        "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 5
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 5,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -718,7 +850,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 23,
+        "lines": 22,
         "gotos": 0,
         "labels": 0,
         "switches": 1,
@@ -727,6 +859,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 5,
@@ -734,12 +867,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -750,7 +888,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 29,
+        "lines": 27,
         "gotos": 1,
         "labels": 1,
         "switches": 0,
@@ -759,6 +897,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 1,
@@ -766,12 +905,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 4,
+        "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -791,6 +935,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -798,12 +943,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 1,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -823,6 +973,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -830,12 +981,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -846,7 +1002,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 16,
+        "lines": 12,
         "gotos": 0,
         "labels": 0,
         "switches": 0,
@@ -855,6 +1011,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -862,12 +1019,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 3,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -878,7 +1040,7 @@
       "ok": true,
       "issues": [],
       "metrics": {
-        "lines": 29,
+        "lines": 27,
         "gotos": 1,
         "labels": 1,
         "switches": 0,
@@ -887,6 +1049,7 @@
         "ternaries": 0,
         "conditionals": 2,
         "loops_while": 1,
+        "loops_while_true": 0,
         "loops_do": 1,
         "loops_for": 0,
         "returns": 1,
@@ -894,19 +1057,24 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 4,
+        "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
       "name": "eval_svc_write",
       "category": "syscall",
       "source": "long eval_svc_write(const void* buf, unsigned long n) -- svc #0, x8=64",
-      "emitted": "uint64_t eval_svc_write(uint64_t a0, uint64_t a1)",
+      "emitted": "ssize_t eval_svc_write(uint64_t a0, uint64_t a1)",
       "ok": true,
       "issues": [],
       "metrics": {
@@ -919,6 +1087,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -926,12 +1095,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 1,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 1,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -951,6 +1125,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -958,12 +1133,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 1,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 1,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -983,6 +1163,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -990,12 +1171,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 1,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 1,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -1015,6 +1201,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -1022,12 +1209,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 1,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 1,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -1047,6 +1239,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -1054,12 +1247,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 1,
+        "unresolved_branches": 0,
         "unhandled": 0,
         "temps": 1,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 1,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -1079,6 +1277,7 @@
         "ternaries": 0,
         "conditionals": 1,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 2,
@@ -1086,12 +1285,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 1,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 1,
         "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     },
     {
@@ -1099,6 +1303,44 @@
       "category": "tailcall",
       "source": "int32_t eval_tailcall_table(const EvalTailOp* ops, int32_t index, int32_t a, int32_t b) -- returns ops[index](a, b)",
       "emitted": "uint64_t eval_tailcall_table(uint64_t a0, uint32_t a1, uint64_t a2, uint64_t a3, uint64_t a4 /* unused */, uint64_t a5, uint64_t a6, uint64_t a7)",
+      "ok": true,
+      "issues": [],
+      "metrics": {
+        "lines": 8,
+        "gotos": 0,
+        "labels": 0,
+        "switches": 0,
+        "cases": 0,
+        "ifs": 0,
+        "ternaries": 0,
+        "conditionals": 0,
+        "loops_while": 0,
+        "loops_while_true": 0,
+        "loops_do": 0,
+        "loops_for": 0,
+        "returns": 1,
+        "undef": 0,
+        "unnamed": 0,
+        "dead": 0,
+        "intrinsics": 0,
+        "unresolved_branches": 0,
+        "unhandled": 0,
+        "temps": 0,
+        "svc_intrinsics": 0,
+        "syscall_named": 0,
+        "syscall_raw": 0,
+        "plt_sub_calls": 0,
+        "import_comments": 0,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
+      }
+    },
+    {
+      "name": "eval_tailcall_import",
+      "category": "tailcall",
+      "source": "ssize_t eval_tailcall_import(int32_t fd, const void* buf, size_t n) -- returns write(fd, buf, n)",
+      "emitted": "uint64_t eval_tailcall_import(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)",
       "ok": true,
       "issues": [],
       "metrics": {
@@ -1111,6 +1353,7 @@
         "ternaries": 0,
         "conditionals": 0,
         "loops_while": 0,
+        "loops_while_true": 0,
         "loops_do": 0,
         "loops_for": 0,
         "returns": 1,
@@ -1118,44 +1361,17 @@
         "unnamed": 0,
         "dead": 0,
         "intrinsics": 0,
+        "unresolved_branches": 0,
         "unhandled": 0,
-        "temps": 2,
+        "temps": 0,
         "svc_intrinsics": 0,
         "syscall_named": 0,
         "syscall_raw": 0,
-        "struct_arrow": 0
-      }
-    },
-    {
-      "name": "eval_tailcall_import",
-      "category": "tailcall",
-      "source": "ssize_t eval_tailcall_import(int32_t fd, const void* buf, size_t n) -- returns write(fd, buf, n)",
-      "emitted": "uint64_t eval_tailcall_import(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)",
-      "ok": true,
-      "issues": [],
-      "metrics": {
-        "lines": 10,
-        "gotos": 0,
-        "labels": 0,
-        "switches": 0,
-        "cases": 0,
-        "ifs": 0,
-        "ternaries": 0,
-        "conditionals": 0,
-        "loops_while": 0,
-        "loops_do": 0,
-        "loops_for": 0,
-        "returns": 1,
-        "undef": 0,
-        "unnamed": 0,
-        "dead": 0,
-        "intrinsics": 0,
-        "unhandled": 0,
-        "temps": 2,
-        "svc_intrinsics": 0,
-        "syscall_named": 0,
-        "syscall_raw": 0,
-        "struct_arrow": 0
+        "plt_sub_calls": 0,
+        "import_comments": 1,
+        "struct_arrow": 0,
+        "encrypted_dispatch_calls": 0,
+        "state_named": 0
       }
     }
   ],

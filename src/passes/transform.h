@@ -9,6 +9,22 @@
 
 namespace xdec::passes {
 
+/// Above this many ops, a block is a "mega-block": straight-line code (an
+/// unrolled hash round, say) with no internal branch, dense enough that
+/// copyPropagateBlock and forwardRedundantLoads stop paying for themselves.
+/// Both walk substituted expression trees, and before copyprop capped how
+/// large a tracked register value is allowed to grow (see
+/// kMaxTrackedExprNodes in copyprop.cpp) that growth was unbounded and turned
+/// a few thousand ops into minutes instead of milliseconds -- see
+/// eval/FINDINGS.md's "mega-block local-simplify" note for the measured
+/// curve. With the cap in place both transforms are linear in block size even
+/// on a straight-line 5000+-op block (measured: <20ms/iteration), so this
+/// threshold is now a fuse against a future regression rather than the
+/// primary defense; local-simplify skips both past this size, and dceBlock
+/// and the whole-function algebra/fold passes stay in scope regardless, since
+/// neither ever showed the same blowup.
+inline constexpr std::size_t kMegaBlockOpThreshold = 16384;
+
 /// Rewrites Value leaves through a substitution map. Replacement expressions
 /// were themselves substituted at the time they were recorded, so the walk
 /// does not recurse into them. Shared by every transform that replaces SSA
@@ -79,5 +95,18 @@ bool foldFlagConditions(il::Function& function);
 /// Block-local dead code elimination: ReadReg ops whose value is never used,
 /// and WriteReg ops overwritten again before any read of the register.
 [[nodiscard]] bool dceBlock(il::Function& function, il::BlockId block);
+
+/// Block-local redundant load forwarding: a Load whose (already-substituted)
+/// address repeats one already read since the last Store/Call/Intrinsic in
+/// this block is replaced by that earlier Load's value and removed outright.
+///
+/// Safe where a generic "unused load" DCE is not (see dceBlock's own note on
+/// why it keeps every load, dead or not): removing the second load never
+/// changes whether the block can fault. The first load already proved the
+/// address readable, and nothing between the two could have unmapped it, so
+/// the second is guaranteed to see the same value and cannot introduce a
+/// fault the first did not already risk. See docs/09-expression-reuse.md's
+/// shape B for the duplicate this closes.
+[[nodiscard]] bool forwardRedundantLoads(il::Function& function, il::BlockId block);
 
 }  // namespace xdec::passes

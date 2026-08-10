@@ -12,9 +12,10 @@
 //   * A **direct** call whose target address a symbol names, where the header
 //     declared a prototype under that name, keeps that prototype's parameters
 //     and drops the rest.
-//   * An **indirect** call through a value whose type is known — today that
-//     means one of this function's own parameters, typed by this function's
-//     own imported prototype — is trimmed to the pointee function's arity.
+//   * An **indirect** call through a value whose type is known — one of this
+//     function's own parameters, typed by this function's own imported
+//     prototype, or a GOT/import slot a relocation resolves to another
+//     module's symbol — is trimmed to the pointee function's arity.
 //
 // Why here and not in the emitter: `vars` counts what the body reads to decide
 // what this function's parameters are, so a call that still passes eight

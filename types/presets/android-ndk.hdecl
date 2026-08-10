@@ -64,6 +64,48 @@ typedef struct {
   void *fnPtr;
 } JNINativeMethod;
 
+// The eight JNIEnv entry points source_jni.c exercises. Function-pointer
+// typedefs rather than inline members because the struct below needs the
+// same signature in one place, not repeated per pad run.
+typedef jclass (*JNI_FindClassFn)(JNIEnv *env, const char *name);
+typedef jclass (*JNI_GetObjectClassFn)(JNIEnv *env, jobject obj);
+typedef jmethodID (*JNI_GetMethodIDFn)(JNIEnv *env, jclass clazz,
+                                       const char *name, const char *sig);
+typedef jobject (*JNI_CallObjectMethodFn)(JNIEnv *env, jobject obj,
+                                           jmethodID methodID, ...);
+typedef jint (*JNI_CallIntMethodFn)(JNIEnv *env, jobject obj,
+                                     jmethodID methodID, ...);
+typedef jstring (*JNI_NewStringUTFFn)(JNIEnv *env, const char *bytes);
+typedef jint (*JNI_RegisterNativesFn)(JNIEnv *env, jclass clazz,
+                                      const JNINativeMethod *methods,
+                                      jint nMethods);
+typedef jboolean (*JNI_ExceptionCheckFn)(JNIEnv *env);
+
+// The real jni.h table, in its real order: the JNI ABI has been frozen at
+// this layout since 1.2, so every native library's vtable matches it
+// exactly. Only the eight members above are named; everything else is
+// pointer-sized padding so the named ones land at their real offsets --
+// `void*` and a function pointer are both one word wide, so a run of them
+// costs nothing but the count.
+struct JNINativeInterface {
+  void *pad0[6];                        // reserved0..3, GetVersion, DefineClass
+  JNI_FindClassFn FindClass;             // 6, +0x30
+  void *pad1[24];                        // FromReflectedMethod .. NewObjectA
+  JNI_GetObjectClassFn GetObjectClass;   // 31, +0xf8
+  void *pad2[1];                         // IsInstanceOf
+  JNI_GetMethodIDFn GetMethodID;         // 33, +0x108
+  JNI_CallObjectMethodFn CallObjectMethod; // 34, +0x110
+  void *pad3[14];                        // CallObjectMethodV .. CallShortMethodA
+  JNI_CallIntMethodFn CallIntMethod;     // 49, +0x188
+  void *pad4[117];                       // CallIntMethodV .. ReleaseStringChars
+  JNI_NewStringUTFFn NewStringUTF;       // 167, +0x538
+  void *pad5[47];                        // GetStringUTFLength .. SetDoubleArrayRegion
+  JNI_RegisterNativesFn RegisterNatives; // 215, +0x6b8
+  void *pad6[12];                        // UnregisterNatives .. DeleteWeakGlobalRef
+  JNI_ExceptionCheckFn ExceptionCheck;   // 228, +0x720
+  void *pad7[4];                         // NewDirectByteBuffer .. GetObjectRefType
+};
+
 // ---------------------------------------------------------------------------
 // libc: the calls a native library reaches for through the PLT
 // ---------------------------------------------------------------------------
@@ -113,11 +155,51 @@ int close(int fd);
 off_t lseek(int fd, off_t offset, int whence);
 
 int access(const char *path, int mode);
+ssize_t readlink(const char *path, char *buf, size_t bufsiz);
 pid_t getpid(void);
 pid_t gettid(void);
 uid_t getuid(void);
 int prctl(int option, unsigned long a2, unsigned long a3, unsigned long a4,
           unsigned long a5);
+
+// Opaque: every call here only passes a buffer's address or tests the return
+// value, never a field, so a forward declaration is all a call site needs
+// (see struct JNINativeInterface above for the same pattern).
+struct stat;
+int stat(const char *path, struct stat *buf);
+
+struct FILE;
+typedef struct FILE FILE;
+FILE *fopen(const char *path, const char *mode);
+size_t fread(void *ptr, size_t size, size_t n, FILE *stream);
+int fclose(FILE *stream);
+
+char *getenv(const char *name);
+
+// System properties: Android's device-fingerprint store (ro.product.*,
+// ro.build.version.sdk, ...), reached by every native library that checks
+// what it is running on.
+struct prop_info;
+int __system_property_get(const char *name, char *value);
+const struct prop_info *__system_property_find(const char *name);
+
+// The per-thread error slot: `errno` is this call's result dereferenced, not
+// a symbol of its own, so a write through it is what the code actually does
+// (see sub_199214-shaped syscall wrappers, which store -errno here).
+int *__errno_location(void);
+
+void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+int munmap(void *addr, size_t length);
+int mprotect(void *addr, size_t length, int prot);
+
+// A raw syscall escape hatch, and the anti-debug check built on it -- both
+// common in a native library that hand-rolls what libc would otherwise wrap.
+long syscall(long number, ...);
+long ptrace(int request, pid_t pid, void *addr, void *data);
+
+int kill(pid_t pid, int sig);
+unsigned int sleep(unsigned int seconds);
+int usleep(unsigned int usec);
 
 // ---------------------------------------------------------------------------
 // Time and the structs syscalls fill in

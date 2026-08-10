@@ -16,9 +16,11 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "xdec/analysis/dominators.h"
+#include "xdec/analysis/live_register_frame.h"
 #include "xdec/analysis/loops.h"
 #include "xdec/il/function.h"
 
@@ -33,6 +35,9 @@ enum class StmtKind : uint8_t {
   Switch,    // index expr (table mode) or target expr (chain mode); cases
   Goto,      // `block` is the target
   Continue,  // back edge to the enclosing loop's header, which is `block`
+  Break,     // exits the nearest switch; a dispatcher case's own back edge
+             // to the switch's shared tail (see Stmt::epilogue) prints this
+             // way instead of a `goto` to it
 };
 
 struct Stmt;
@@ -73,6 +78,20 @@ struct Stmt {
   /// the default arm.
   il::BlockId defaultPred{};  // Switch, chain mode
   StmtPtr defaultBody;        // Switch, chain mode
+  /// Switch: the dispatcher shape's shared tail (see
+  /// analysis::DispatcherShape), structured once and printed right after the
+  /// switch's closing brace instead of once per case. A case that reaches it
+  /// ends with a `Break` rather than a `goto`/`return`. Null when no such
+  /// shape was found for this switch.
+  StmtPtr epilogue;          // Switch
+  /// The block `epilogue` was built from; invalid when `epilogue` is null.
+  il::BlockId mergeBlock{};  // Switch
+  /// The shadow/live register pairing the dispatcher's handlers save into and
+  /// restore out of on their way to `epilogue` (see
+  /// analysis::LiveRegisterFrame). Null whenever `epilogue` is, or the shape
+  /// was found but this exact save/restore protocol was not -- emission then
+  /// prints every case's edge copies in full, same as any ordinary switch.
+  std::optional<analysis::LiveRegisterFrame> frame;  // Switch
 
   static StmtPtr make(StmtKind kind) {
     auto stmt = std::make_unique<Stmt>();

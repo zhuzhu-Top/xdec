@@ -57,6 +57,15 @@ class TypeDatabase {
   // --- Derived types (interned) -----------------------------------------
 
   [[nodiscard]] TypeId pointerTo(TypeId pointee);
+
+  /// The pointer-to-`pointee` type, if some earlier import already interned
+  /// it (a header declaring a parameter or field of that pointer type is
+  /// enough). Read-only: never creates an entry, so a caller holding only a
+  /// `const TypeDatabase&` — evidence, not authorship, see types/binder.h —
+  /// can still ask "does this pointer type already exist" without needing
+  /// the mutable access `pointerTo` requires. Unset when nothing ever
+  /// declared exactly this pointer.
+  [[nodiscard]] std::optional<TypeId> findPointerTo(TypeId pointee) const;
   [[nodiscard]] TypeId arrayOf(TypeId element, uint64_t length);
   [[nodiscard]] TypeId functionType(TypeId returnType, std::vector<FunctionParam> params,
                                     bool variadic);

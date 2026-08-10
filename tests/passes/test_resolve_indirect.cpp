@@ -8,7 +8,9 @@
 // with it.
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <cstddef>
+#include <map>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,9 +24,12 @@
 namespace il = xdec::il;
 using xdec::Arch;
 using xdec::il::BlockId;
+using xdec::il::ExprId;
+using xdec::il::ExprOp;
 using xdec::il::Function;
 using xdec::il::Maturity;
 using xdec::il::OpCode;
+using xdec::il::Type;
 
 namespace {
 
@@ -115,4 +120,87 @@ TEST_CASE("sealing leaves unreachable blocks alone", "[passes][resolve-indirect]
 
   CHECK(run(function, /*seal=*/true));
   CHECK(terminatorOf(function, stray).code == OpCode::IndirectBranch);
+}
+
+namespace {
+
+/// A table's worth of qwords, for the fake image below to serve.
+struct FakeTableImage {
+  std::map<uint64_t, uint64_t> qwords;
+
+  [[nodiscard]] xdec::ByteReader reader() const {
+    return [this](uint64_t va, std::span<std::byte> out) -> xdec::Result<void> {
+      const auto found = qwords.find(va);
+      if (found == qwords.end() || out.size() > 8) {
+        return xdec::err(xdec::DiagCode::UnmappedAddress, "not in the fake image");
+      }
+      for (std::size_t index = 0; index < out.size(); ++index) {
+        out[index] = static_cast<std::byte>(found->second >> (index * 8));
+      }
+      return {};
+    };
+  }
+};
+
+}  // namespace
+
+TEST_CASE(
+    "a table entry the index's own value set skips is never claimed, even inside "
+    "the structural bound",
+    "[passes][resolve-indirect]") {
+  // index = cond ? 0 : 2 -- both arms plain constants, condition opaque (an
+  // unconstrained entry register), so ImageEval's evaluator (which unions a
+  // select's arms when the condition does not collapse to one of them -- see
+  // analysis/image_eval.cpp) reads this as exactly {0, 2}: never 1, whatever
+  // cond turns out to be. The structural bound, by contrast, sees only two
+  // plain constants and answers max(0, 2) = 2, which is wide enough to admit
+  // 1 -- the case this test exists to catch: reading the table 0..bound wide
+  // would ask for entry 1, which this fake image deliberately leaves with no
+  // block behind it.
+  Function function(Arch::AArch64, xdec::test::arm64Registers(), 0x1000);
+  const BlockId entry = function.createBlock(0x1000);
+  function.setEntryBlock(entry);
+  const BlockId case0 = function.createBlock(0x2000);
+  const BlockId case2 = function.createBlock(0x2020);
+
+  const ExprId cond = function.binary(
+      ExprOp::CmpEq, function.entryReg(function.registers().find("x0")),
+      function.constant(Type::integer(64), 0x1234));
+  const ExprId index =
+      function.select(cond, function.constant(Type::integer(64), 0),
+                      function.constant(Type::integer(64), 2));
+  const ExprId address = function.binary(
+      ExprOp::Add, function.constant(Type::integer(64), 0x30000),
+      function.binary(ExprOp::Shl, index, function.constant(Type::integer(64), 3)));
+  const ExprId target =
+      function.valueRef(function.appendLoad(entry, 0x1000, Type::integer(64), address));
+  function.appendIndirectBranch(entry, 0x1004, target);
+  function.rebuildEdges();
+  function.setMaturity(Maturity::Ssa);
+
+  FakeTableImage image;
+  image.qwords[0x30000] = 0x2000;  // index 0 -> case0
+  // 0x30008 (index 1) deliberately absent: claiming it would fail this test,
+  // either by reporting it as a missing discovery (the branch would not
+  // resolve this round) or, worse, by resolving to garbage.
+  image.qwords[0x30010] = 0x2020;  // index 2 -> case2
+  // isCode() falls back to plain readability with no MemoryFacts wired in
+  // (see resolve_indirect.cpp), so the two branch targets need a byte behind
+  // them too, distinct from the table's own bytes above.
+  image.qwords[0x2000] = 0;
+  image.qwords[0x2020] = 0;
+
+  const auto pass = xdec::passes::makeResolveIndirectPass();
+  xdec::pass::Context context(function);
+  context.setImage(image.reader());
+  auto result = pass->run(context);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+  CHECK(*result);
+
+  const auto targets = function.targets(terminatorOf(function, entry));
+  REQUIRE(targets.size() == 2);
+  CHECK(std::find(targets.begin(), targets.end(), case0) != targets.end());
+  CHECK(std::find(targets.begin(), targets.end(), case2) != targets.end());
 }

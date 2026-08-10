@@ -6,9 +6,11 @@
 #include <format>
 #include <map>
 #include <set>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "xdec/analysis/reachability.h"
 #include "xdec/passes/resolve_indirect.h"
 #include "xdec/spec/lift.h"
 #include "xdec/support/log.h"
@@ -185,13 +187,13 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
   // place. Both ways out of the loop end here, so a run cut short by the cap
   // still yields the function the rounds did manage to uncover.
   auto finish = [&]() -> Result<DriverResult> {
-    auto whole = spec::liftFunction(engine, reader, entry);
+    auto whole = spec::liftFunction(engine, reader, entry, options.memory);
     if (!whole) {
       return std::move(whole).takeUnexpected();
     }
     if (entries.size() > 1) {
       const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*whole->function, engine, reader, extra);
+      auto more = spec::liftBlocksInto(*whole->function, engine, reader, extra, options.memory);
       if (!more) {
         return std::move(more).takeUnexpected();
       }
@@ -201,6 +203,22 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
     XDEC_TRY_VOID(manager.runTo(*whole->function, registry, il::Maturity::Cfg));
     applyResolutions(*whole->function, resolved);
     XDEC_TRY_VOID(manager.runTo(*whole->function, registry, options.target));
+    // The second half of the jump-table candidate defence (see
+    // analysis/reachability.h): every block the candidate filtering and the
+    // discovery loop above actually needed should be reachable from the
+    // entry by now. One that is not was lifted for nothing -- silently
+    // harmless, since nothing downstream emits it, but worth surfacing rather
+    // than leaving to be noticed as an unexplained unused local.
+    const std::unordered_set<il::BlockId> reachable =
+        analysis::reachableBlocks(*whole->function);
+    if (reachable.size() < whole->function->blockCount()) {
+      report.unreachableBlocks = whole->function->blockCount() - reachable.size();
+      XDEC_LOG_WARN(driverLog(),
+                    "{} block(s) in the lifted function have no path from entry; nothing "
+                    "emits them, but a resolve or discovery step claimed one that turns "
+                    "out not to be reachable",
+                    report.unreachableBlocks);
+    }
     return DriverResult{std::move(whole->function), std::move(report)};
   };
 
@@ -210,13 +228,13 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
 
   for (unsigned round = 0; round < budget; ++round) {
     // Fresh and consistent: the whole function at Lifted, every round.
-    auto lifted = spec::liftFunction(engine, reader, entry);
+    auto lifted = spec::liftFunction(engine, reader, entry, options.memory);
     if (!lifted) {
       return std::move(lifted).takeUnexpected();
     }
     if (entries.size() > 1) {
       const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra);
+      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra, options.memory);
       if (!more) {
         return std::move(more).takeUnexpected();
       }
@@ -246,12 +264,71 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
 
     const std::size_t liftedFrom = entries.size();  // before this round's finds
     std::size_t foundNew = 0;
+    std::size_t outsideFence = 0;
+    std::size_t capped = 0;
     for (const uint64_t va : probe.discoveries) {
-      if (known.insert(va).second) {
-        entries.push_back(va);
-        report.extraEntries.push_back(va);
-        ++foundNew;
+      if (options.fence.active() && !options.fence.contains(va)) {
+        ++outsideFence;
+        // Advisory only (see FunctionFence), and deliberately quiet about it:
+        // a linker-recorded size that undershoots by a few bytes -- a jump
+        // table placed right past the code the size accounts for, say -- is
+        // routine and not a sign of anything wrong, so this is a debug trace
+        // for a real bleed-through investigation to pull up, not a warning
+        // every ordinary run would print.
+        XDEC_LOG_DEBUG(driverLog(),
+                       "discovery {:#x} is outside the entry's symbol extent [{:#x}, {:#x}); "
+                       "lifting it anyway",
+                       va, options.fence.start, options.fence.end);
       }
+      if (known.contains(va)) {
+        continue;
+      }
+      // The hard backstop (see DriverOptions::maxTotalEntries): everything
+      // admitted before the cap still gets lifted and emitted, same as a
+      // round-cap cutoff, so this is one more way the run ends up partial
+      // rather than one more way it fails outright.
+      if (known.size() >= options.maxTotalEntries) {
+        ++capped;
+        continue;
+      }
+      known.insert(va);
+      entries.push_back(va);
+      report.extraEntries.push_back(va);
+      ++foundNew;
+    }
+    if (capped > 0) {
+      XDEC_LOG_WARN(driverLog(),
+                    "round {} hit the {}-entry hard cap with {} more address(es) "
+                    "discovered but not admitted; if the entry is a real function "
+                    "start this should not happen, so the result from here on is "
+                    "worth treating as partial",
+                    report.rounds, options.maxTotalEntries, capped);
+    }
+    // A few stray addresses past an undershooting symbol size are routine
+    // (see the debug trace above); hundreds are not. That shape is exactly
+    // what an unbounded jump-table enumeration off an entry that turns out
+    // not to be a real function start looks like -- the case this exists to
+    // catch is sub_627ac-in-bc_lib, where treating a mid-MBA address as an
+    // entry (no fence at all, since it has no symbol) let one round's
+    // discovery pull in 1349 jump-table targets and inflate the output to
+    // tens of thousands of lines with nothing louder than an INFO line to
+    // notice it by.
+    constexpr std::size_t kLargeDiscoveryWarning = 512;
+    constexpr std::size_t kLargeFencedOverrunWarning = 32;
+    if (!options.fence.active() && foundNew > kLargeDiscoveryWarning) {
+      XDEC_LOG_WARN(driverLog(),
+                    "round {} discovered {} new address(es) with no function-size fence "
+                    "active; if the entry is not a real function start, this is likely a "
+                    "jump table being enumerated as if it were free-standing code rather "
+                    "than bounded by a caller's function (pass a symbol with a size, or "
+                    "double-check the entry address)",
+                    report.rounds, foundNew);
+    } else if (options.fence.active() && outsideFence > kLargeFencedOverrunWarning) {
+      XDEC_LOG_WARN(driverLog(),
+                    "round {} discovered {} address(es) outside the entry's symbol extent "
+                    "[{:#x}, {:#x}); this is too many to be the usual few-byte undershoot, "
+                    "and likely means the fence itself is wrong for this function",
+                    report.rounds, outsideFence, options.fence.start, options.fence.end);
     }
     // Resolving a branch is progress even when it revealed no new address: the
     // edge it adds is what lets the next round's SSA reach one level further in,

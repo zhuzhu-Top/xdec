@@ -78,6 +78,26 @@
 
 namespace xdec::decompile {
 
+/// A function's known extent, from its ELF symbol size when the entry point
+/// has one. This is advisory, not enforced (see DriverOptions::fence): a
+/// discovery outside it is logged, not dropped, because a symbol's recorded
+/// size is not always trustworthy enough to bet a correct decompilation on --
+/// stripped or hand-written tables can legitimately reach past it, and
+/// refusing to lift an address the code genuinely branches to would trade a
+/// bleed-through bug for a missing-block one. What it is good for today is
+/// exactly what the noreturn and jump-table fixes were found by: a number in
+/// a log line for a case that looks too big, instead of nothing until someone
+/// reads the output by hand.
+struct FunctionFence {
+  uint64_t start = 0;
+  uint64_t end = 0;  // exclusive; start == end means "no fence"
+
+  [[nodiscard]] bool active() const noexcept { return end > start; }
+  [[nodiscard]] bool contains(uint64_t va) const noexcept {
+    return !active() || (va >= start && va < end);
+  }
+};
+
 struct DriverOptions {
   il::Maturity target = il::Maturity::Resolved;
   pass::Observer* observer = nullptr;  // final-round dumps, if wanted
@@ -113,6 +133,24 @@ struct DriverOptions {
   /// The image's symbol table, which is what connects an imported declaration
   /// to an address (see pass::Context::setNames). Unset binds nothing.
   pass::NameAt names;
+  /// The entry's own symbol extent, if the caller found one worth recording
+  /// (see FunctionFence). Inactive by default: nothing about this loop needs
+  /// a fence to behave, it is purely a diagnostic the caller opts into.
+  FunctionFence fence;
+  /// The hard backstop behind the per-round discovery-size warnings (see
+  /// driver.cpp): however many addresses a round keeps discovering, the total
+  /// entries a run will ever add is capped here. A real dispatcher chain
+  /// widens by a handful of entries a round (single digits, in every sample
+  /// this codebase ships); an entry that is not really a function start
+  /// turning a jump table into free-standing "code" is the shape that hands
+  /// over hundreds to thousands at once instead (the motivating case handed
+  /// over 1349 in its very first round). Sized to the same order of
+  /// magnitude as driver.cpp's own "this many at once is not an ordinary
+  /// dispatcher" warning threshold, since that is the same judgment call
+  /// this makes consequential instead of merely loud — a wall well above any
+  /// legitimate count on purpose, the same role kRoundCeiling plays for
+  /// rounds, for entries instead.
+  std::size_t maxTotalEntries = 512;
 };
 
 /// What the loop did, for CLI reporting and tests.
@@ -124,6 +162,15 @@ struct DriverReport {
   /// Whether a round finally found nothing left to find, as opposed to the cap
   /// cutting the loop short. Output is produced either way — see below.
   bool converged = false;
+  /// Blocks the final function has that analysis::reachableBlocks() does not
+  /// reach from the entry: a resolve-indirect candidate, or a discovery lifted
+  /// from one, that turned out not to be reachable after all. Nothing
+  /// downstream emits these (the structurizer only walks blocks Dominators
+  /// itself reaches, by the same reasoning), so this is not a correctness
+  /// problem by itself -- it is the double-check the jump-table candidate
+  /// filtering is meant to make almost always zero, kept here so a caller or
+  /// test can notice when it is not.
+  std::size_t unreachableBlocks = 0;
 };
 
 struct DriverResult {
