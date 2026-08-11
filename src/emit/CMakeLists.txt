@@ -2,6 +2,7 @@ xdec_add_library(xdec_emit
   SOURCES
     structure.cpp
     structure_dispatch.cpp
+    address_render.cpp
     c_context.cpp
     c_expr.cpp
     c_flags.cpp

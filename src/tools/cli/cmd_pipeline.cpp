@@ -15,18 +15,11 @@
 #include "common.h"
 #include "options.h"
 #include "session.h"
-#include "xdec/analysis/dominators.h"
 #include "xdec/analysis/emit_redundancy.h"
 #include "xdec/analysis/expr_reuse.h"
-#include "xdec/analysis/loops.h"
 #include "xdec/analysis/profile.h"
-#include "xdec/analysis/stack_frame.h"
-#include "xdec/analysis/typed_variables.h"
-#include "xdec/analysis/variables.h"
-#include "xdec/binary/target_profile.h"
 #include "xdec/decompile/driver.h"
-#include "xdec/emit/c_printer.h"
-#include "xdec/emit/structure.h"
+#include "xdec/decompile/emit.h"
 #include "xdec/il/printer.h"
 #include "xdec/pass/manager.h"
 #include "xdec/pass/observe.h"
@@ -39,18 +32,17 @@
 
 namespace xdec::cli {
 
-XDEC_DEFINE_LOG_CATEGORY(emitLog, "emit")
-
-/// Times one stage of the analyse-and-emit tail, which the pass manager does not
-/// cover: everything from the stack frame to the printed text runs outside the
-/// pipeline, and on a large flattened function that is where the wall clock goes.
+/// Times a CLI-only diagnostic (`--reuse-report`/`--emit-report`) under the
+/// same "emit" category decompileToC's own internal stages log under (see
+/// xdec/decompile/emit.h) -- one category for the whole analyse-and-emit
+/// tail, whichever side of the library boundary a given stage now lives on.
 template <class Fn>
 auto timed(std::string_view stage, Fn&& fn) {
   const auto started = std::chrono::steady_clock::now();
   auto out = std::forward<Fn>(fn)();
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started);
-  XDEC_LOG_DEBUG(emitLog(), "{:>16} {:>6}ms", stage, elapsed.count());
+  XDEC_LOG_DEBUG(xdec::decompile::emitLog(), "{:>16} {:>6}ms", stage, elapsed.count());
   return out;
 }
 
@@ -265,81 +257,28 @@ int commandDecompile(std::string_view path, uint64_t address,
     }
   }
 
-  auto session = ToolSession::openBinary(path);
+  SessionLoadOptions loadOptions;
+  loadOptions.typeSources = typeSources;
+  loadOptions.syscallSource = syscallSource;
+  auto session = SessionContext::open(path, loadOptions);
   if (!session) {
     return reportError(session.error());
   }
   const BinaryImage& image = *session->image;
   const xdec::spec::SpecEngine& engine = *session->engine;
-  const xdec::spec::ByteReader reader =
-      [&image](uint64_t va, std::span<std::byte> out) { return image.read(va, out); };
-
-  // What the platform implies, applied wherever the user did not already say
-  // something more specific: `--types`/`--syscall-table` are still there for
-  // when the inference is wrong, but the common case -- an AArch64 .so, this
-  // project's only supported target today -- no longer needs either flag
-  // (see xdec/binary/target_profile.h).
-  const xdec::binary::TargetProfile profile = xdec::binary::inferTargetProfile(image);
-  if (typeSources.empty()) {
-    typeSources = profile.typePresets;
-  }
-  if (syscallSource == xdec::types::SyscallTable::defaultName() && !profile.syscallTable.empty()) {
-    syscallSource = profile.syscallTable;
-  }
-
-  xdec::types::TypeDatabase types;
-  if (!typeSources.empty()) {
-    auto loaded = loadTypes(typeSources, /*verbose=*/false);
-    if (!loaded) {
-      return reportError(loaded.error());
-    }
-    types = std::move(*loaded);
-    print("types: {} type(s), {} declaration(s) from {} header(s)", types.typeCount(),
-          types.declarations().size(), typeSources.size());
-  }
-
-  xdec::types::SyscallTable syscalls;
-  if (!syscallSource.empty()) {
-    const auto load = [&]() -> xdec::Result<xdec::types::SyscallTable> {
-      XDEC_TRY(const std::string resolved,
-               xdec::types::SyscallTable::resolvePath(syscallSource));
-      return xdec::types::SyscallTable::loadFile(resolved);
-    };
-    auto loaded = load();
-    if (!loaded) {
-      // A table the user named must load: they said which ABI this is, and
-      // guessing past that would name syscalls from the wrong kernel. The
-      // default is different -- it is the build's own data file, and a broken
-      // installation should not stop a decompilation that never needed it.
-      if (syscallSource != xdec::types::SyscallTable::defaultName()) {
-        return reportError(loaded.error());
-      }
-      print("note: no syscall table ({}); svc will print as __xdec_syscall",
-            loaded.error().format());
-    } else {
-      syscalls = std::move(*loaded);
-    }
-  }
-  // Both loaded independently (the syscall table has no reason to depend on
-  // whether a header was given, see SyscallTable::resolveTypes), so the link
-  // between them is made here, once, rather than by either constructor.
-  if (!typeSources.empty() && !syscalls.empty()) {
-    syscalls.resolveTypes(types);
-  }
+  const xdec::spec::ByteReader reader = session->reader();
 
   xdec::pass::Registry registry;
   xdec::passes::registerBuiltinPasses(registry);
-  xdec::decompile::DriverOptions driverOptions;
+  // Session-wide facts (memory/types/syscalls/names) come from `session`;
+  // only what varies per call is set here.
+  xdec::decompile::DriverOptions driverOptions = session->driverOptions();
   // Vars, not Resolved: emission reads the recovered call arity off the IL, and
   // stopping a level short would leave it guessing (see passes/vars.h).
   driverOptions.target = xdec::il::Maturity::Vars;
   driverOptions.maxRounds = roundCap.value;
   driverOptions.extendWhileProving = !roundCap.pinned;
   driverOptions.sealUnresolvedBranches = allowUnresolved;
-  driverOptions.memory = memoryFactsOf(image);
-  driverOptions.types = typeSources.empty() ? nullptr : &types;
-  driverOptions.syscalls = syscalls.empty() ? nullptr : &syscalls;
-  driverOptions.names = nameResolverOf(image, reader, driverOptions.memory, profile);
   if (const xdec::binary::Symbol* symbol = image.symbolAt(address);
       symbol != nullptr && symbol->size != 0) {
     driverOptions.fence = {address, address + symbol->size};
@@ -356,14 +295,28 @@ int commandDecompile(std::string_view path, uint64_t address,
           "size to stay inside and this run may pull in unrelated code",
           address);
   }
-  auto result = xdec::decompile::decompile(engine, reader, address, registry, driverOptions);
+  xdec::decompile::DecompileToCOptions toCOptions;
+  toCOptions.driver = driverOptions;
+  toCOptions.profile = &session->profile;
+  toCOptions.emit.annotateBlocks = annotate;
+  toCOptions.emit.symbols = session->symbols();
+  toCOptions.emit.addresses = session->addresses();
+  toCOptions.emit.imageReader = session->reader();
+  toCOptions.emit.helpersHeader = helpersHeader;
+  toCOptions.emit.indexedArgumentNames = indexedArgumentNames;
+  toCOptions.emit.securityHintsAsComments = securityHintsAsComments;
+  // `--emit-report` now asks decompileToC() itself for the scan (see
+  // DecompileToCOptions::computeEmitRedundancy) instead of the CLI repeating
+  // it over the result -- the same report, the same one function-sized scan.
+  toCOptions.computeEmitRedundancy = emitReport;
+  auto result = xdec::decompile::decompileToC(engine, reader, address, registry, toCOptions);
   if (!result) {
     return reportError(result.error());
   }
   const xdec::il::Function& function = *result->function;
-  print("driver: {} round(s), {} extra entrie(s), {} block(s) total{}", result->report.rounds,
-        result->report.extraEntries.size(), function.blockCount(),
-        result->report.converged ? "" : " (round cap reached; coverage may be partial)");
+  print("driver: {} round(s), {} extra entrie(s), {} block(s) total{}", result->driverReport.rounds,
+        result->driverReport.extraEntries.size(), function.blockCount(),
+        result->driverReport.converged ? "" : " (round cap reached; coverage may be partial)");
   if (reuseReport) {
     const xdec::analysis::ExpressionReuseReport reuse =
         timed("reuse-report", [&] { return xdec::analysis::analyzeExpressionReuse(function); });
@@ -377,79 +330,23 @@ int commandDecompile(std::string_view path, uint64_t address,
   if (dumpIl) {
     print("{}", xdec::il::print(function));
   }
-
-  const xdec::analysis::StackFrame frame =
-      timed("stack-frame", [&] { return xdec::analysis::StackFrame::compute(function); });
-  xdec::analysis::VariableTable variables = timed(
-      "vars", [&] { return xdec::analysis::VariableTable::recover(function, frame); });
-  if (emitReport) {
-    const xdec::analysis::EmitRedundancyReport emitRedundancy = timed(
-        "emit-report", [&] { return xdec::analysis::analyzeEmitRedundancy(function, frame, variables); });
-    print("emit-report: {}", emitRedundancy.format());
+  if (emitReport && result->report.emitRedundancy) {
+    print("emit-report: {}", result->report.emitRedundancy->format());
   }
-  // Outlives this block -- COptions::typedVariables below borrows it, so it
-  // has to still be alive at emission, not just while applyImportedTypes
-  // runs. Default-constructed (every lookup unset) when neither a header nor
-  // a syscall table was given, the same "no evidence" shape TypedVariables
-  // itself returns for that case.
-  xdec::analysis::TypedVariables typedVariables;
-  // Built unconditionally: CContext's own binder and calleeName (below) reuse
-  // this exact resolver, so a callee named through a PLT stub's import (see
-  // nameResolverOf) resolves the same way whether or not a header ended up
-  // loaded.
-  const xdec::types::NameAt namesForTypes = [&](uint64_t va) {
-    const xdec::pass::SymbolName symbol = driverOptions.names(va);
-    return xdec::types::BoundName{symbol.name, symbol.isFunction};
-  };
-  if (driverOptions.types != nullptr || driverOptions.syscalls != nullptr) {
-    typedVariables = timed("typed-variables", [&] {
-      return xdec::analysis::TypedVariables::recover(function, frame, driverOptions.types,
-                                                      driverOptions.syscalls, namesForTypes, {},
-                                                      driverOptions.memory, &profile);
-    });
-    if (driverOptions.types != nullptr) {
-      const xdec::types::TypeBinder binder(*driverOptions.types, namesForTypes);
-      variables.applyImportedTypes(typedVariables, binder);
-    }
-  }
-  const xdec::analysis::Dominators dominators =
-      timed("dominators", [&] { return xdec::analysis::Dominators::compute(function); });
-  const xdec::analysis::PostDominators postDominators = timed(
-      "post-dominators", [&] { return xdec::analysis::PostDominators::compute(function); });
-  const std::vector<xdec::analysis::NaturalLoop> loops =
-      timed("loops", [&] { return xdec::analysis::naturalLoops(function, dominators); });
-  const xdec::emit::StructuredFunction structured = timed("structure", [&] {
-    return xdec::emit::structureFunction(function, dominators, postDominators, loops);
-  });
-  xdec::emit::COptions cOptions;
-  cOptions.annotateBlocks = annotate;
-  cOptions.symbols = symbolResolverOf(image);
-  cOptions.addresses = addressDescriberOf(image);
-  cOptions.types = driverOptions.types;
-  cOptions.syscalls = driverOptions.syscalls;
-  cOptions.typedVariables = &typedVariables;
-  cOptions.names = namesForTypes;
-  cOptions.memory = driverOptions.memory;
-  cOptions.helpersHeader = helpersHeader;
-  cOptions.indexedArgumentNames = indexedArgumentNames;
-  cOptions.securityHintsAsComments = securityHintsAsComments;
-  const std::string text = timed("print", [&] {
-    return xdec::emit::printFunction(function, variables, frame, structured, cOptions);
-  });
 
   print("emit: {} argument(s), {} local(s), {} temp(s), {} labeled block(s)",
-        variables.arguments().size(), variables.locals().size(),
-        variables.temps().size(), structured.labeled.size());
+        result->variables.arguments().size(), result->variables.locals().size(),
+        result->variables.temps().size(), result->structured.labeled.size());
   if (outPath.empty()) {
-    print("{}", text);
+    print("{}", result->cSource);
   } else {
     std::ofstream stream(outPath, std::ios::binary | std::ios::trunc);
     if (!stream) {
       print("error: cannot open '{}' for writing", outPath.string());
       return 1;
     }
-    stream << text;
-    print("wrote '{}' ({} bytes)", outPath.string(), text.size());
+    stream << result->cSource;
+    print("wrote '{}' ({} bytes)", outPath.string(), result->cSource.size());
   }
   return 0;
 }

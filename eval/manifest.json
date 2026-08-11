@@ -885,12 +885,12 @@
       "category": "env",
       "modes": ["baseline"],
       "source": "int32_t eval_env_property_get_model(void) -- __system_property_get(\"ro.product.model\", buf)",
-      "comment": "The device-fingerprint read every anti-emulator check starts with. baseline is scored, not typed: TargetProfile's android-ndk preset resolves the name with no --types argument.",
+      "comment": "The device-fingerprint read every anti-emulator check starts with. baseline is scored, not typed: TargetProfile's android-ndk preset resolves the name with no --types argument. The property name is pinned as a recovered literal (AddressRenderer + analysis::ImageLiteralRecovery, see docs/15-address-form.md), not the bare .rodata address it used to print.",
       "expect": {
         "max_gotos": 0,
         "max_plt_sub_calls": 0,
-        "patterns": ["__system_property_get("],
-        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "patterns": ["__system_property_get(\"ro.product.model\","],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\(", "__system_property_get\\(0x"],
         "signature": { "return": "32", "params": [] }
       }
     },
@@ -902,8 +902,8 @@
       "expect": {
         "max_gotos": 0,
         "max_plt_sub_calls": 0,
-        "patterns": ["__system_property_get("],
-        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "patterns": ["__system_property_get(\"ro.build.version.sdk\","],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\(", "__system_property_get\\(0x"],
         "signature": { "return": "32", "params": [] }
       }
     },
@@ -915,8 +915,8 @@
       "expect": {
         "max_gotos": 0,
         "max_plt_sub_calls": 0,
-        "patterns": ["__system_property_get("],
-        "forbid_patterns": ["\\bsub_[0-9a-f]+\\("],
+        "patterns": ["__system_property_get(\"ro.serialno\","],
+        "forbid_patterns": ["\\bsub_[0-9a-f]+\\(", "__system_property_get\\(0x"],
         "signature": { "return": "32", "params": [] }
       }
     },

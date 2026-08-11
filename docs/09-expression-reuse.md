@@ -316,6 +316,37 @@ tracked and partly reduced by that analysis's own passthrough detection —
 listed here only for completeness of the taxonomy's letter range, not as new
 work this document's phases claim.
 
+## K. A pointer-context stack address printed as arithmetic instead of a name
+
+Not a reuse or redundancy shape — a *form* problem: a call argument or other
+pointer-context use of a stack slot's address prints as the raw arithmetic
+that classifies it (`(__entry_sp - 0x70)`) instead of the local name
+`StackFrame::classify` already resolved it to (`&var_70`). `memoryLvalue`
+(a `Load`/`Store` target) has printed through the local's name since before
+this taxonomy existed; what was missing was the same treatment wherever a
+stack address's *own value* — not a dereference of it — was the thing being
+printed.
+
+**Fixed** by `emit::AddressRenderer` (`docs/15-address-form.md`): every
+pointer-context consumer (`ExprPrinter::pointerOperand`, `StmtPrinter`'s call
+argument loop) classifies the address once, through the same `StackFrame`
+every other shape in this document uses, before falling back to arithmetic.
+
+## L. An immutable global's pointer argument printed as a bare address
+
+A call argument that is a constant address into memory the image proves
+never changes (`.rodata`) prints as the number it happens to be
+(`0x20f98`) instead of the string it points at (`"ro.arch"`) — readable to
+the tool that already proved the fact, unreadable to anyone re-deriving it
+by hand from a hex dump.
+
+**Fixed** by `analysis::ImageLiteralRecovery` consumed through
+`emit::AddressRenderer` and `StmtPrinter::callArgumentText`
+(`docs/15-address-form.md`), gated on the callee's own declared parameter
+type being pointer-shaped — never guessed from the address alone, so an
+integer constant that happens to double as a readable offset is never
+misprinted as a string.
+
 ## Using the report
 
 ```

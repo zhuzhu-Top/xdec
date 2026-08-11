@@ -5,12 +5,10 @@
 #include <cctype>
 #include <format>
 
+#include "address_render.h"
 #include "c_stmt.h"
-#include "xdec/analysis/atomic_exclusive.h"
+#include "xdec/analysis/emit_redundancy.h"
 #include "xdec/analysis/import_callee.h"
-#include "xdec/analysis/load_inline.h"
-#include "xdec/analysis/stack_load_fold.h"
-#include "xdec/analysis/stack_store_fold.h"
 #include "xdec/analysis/typed_variables.h"
 #include "xdec/types/syscall_table.h"
 
@@ -31,6 +29,7 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
       frame(theFrame),
       structured(theStructured),
       options(theOptions),
+      literals(theOptions.imageReader, theOptions.memory),
       deadOps(theStructured.root ? collectDeadOps(theFunction, *theStructured.root, theOptions)
                                  : std::unordered_set<uint32_t>{}) {
   if (options.types != nullptr) {
@@ -45,60 +44,49 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
       return options.names ? options.names(va) : types::BoundName{};
     });
   }
-  // The ldaxr/stlxr fold: see analysis/atomic_exclusive.h. Joining deadOps
-  // here, before anything else below counts a live reference or decides
-  // what needs a declaration, keeps both ops out of that reasoning
-  // entirely -- exactly like every other fold in this constructor.
-  for (const auto& [loadIndex, exclusive] : analysis::findExclusiveLoads(function)) {
+  // Every prescan below -- the ldaxr/stlxr fold, stack-load-fold,
+  // load-inline, and stack-store-fold -- is gathered by one aggregator (see
+  // analysis::prepareEmitRedundancy) rather than called independently here,
+  // so this constructor and analyzeEmitRedundancy's own report can never
+  // drift out of step on what actually folds. `deadOps` already carries
+  // `collectDeadOps`'s jump-table finds, seeded above; the aggregator adds
+  // to it in the same order this constructor always applied these folds in
+  // (order is load-bearing here, not stylistic -- see the header).
+  //
+  // The stack-load-fold stage is the one fold this aggregator cannot decide
+  // alone: whether a candidate actually gets applied depends on
+  // `stackSlotLvalue` finding text for its slot, and only this emit-layer
+  // context (typed variables, the binder) can answer that. This filter is
+  // exactly that answer, threaded back into the aggregator so a rejected
+  // candidate's op is never mistaken for dead by the folds after it.
+  std::map<uint32_t, InlinedStackLoad> stackLoadTexts;
+  const analysis::EmitRedundancyPrep prep = analysis::prepareEmitRedundancy(
+      function, frame, variables, std::move(deadOps),
+      [&](uint32_t opIndex, const analysis::FoldableStackLoad& load) {
+        std::string text = stackSlotLvalue(load.delta, load.width);
+        if (text.empty()) {
+          return false;  // no local recovered at this slot; leave the ordinary temp path
+        }
+        const analysis::Variable* local = variables.localAt(load.delta);
+        const bool pointer = local != nullptr && local->type.pointerDepth > 0;
+        stackLoadTexts.emplace(opIndex, InlinedStackLoad{std::move(text), pointer});
+        return true;
+      });
+  deadOps = prep.deadOps;
+  for (const auto& [loadIndex, exclusive] : prep.exclusiveLoads) {
     exclusiveLoads.insert(loadIndex);
-    deadOps.insert(exclusive.reserveOp.index());
   }
-  for (const auto& [storeIndex, exclusive] : analysis::findExclusiveStores(function)) {
+  for (const auto& [storeIndex, exclusive] : prep.exclusiveStores) {
     exclusiveStoreFor.emplace(exclusive.statusOp.index(), il::OpId{storeIndex});
-    deadOps.insert(storeIndex);
   }
-  // Stack-load-fold: a Load this analysis proves reads a slot with exactly
-  // one downstream reader, nothing between the two able to have changed what
-  // the slot holds. Its own statement joins `deadOps` (so neither a
-  // temporary nor an assignment to it is ever printed) and its result is
-  // mapped to the slot's own text, substituted wherever that one reader
-  // would otherwise have read the temporary (see ExprPrinter::value).
-  for (const auto& [opIndex, load] : analysis::findFoldableStackLoads(function, frame, deadOps)) {
-    std::string text = stackSlotLvalue(load.delta, load.width);
-    if (text.empty()) {
-      continue;  // no local recovered at this slot; leave the ordinary temp path
-    }
-    const analysis::Variable* local = variables.localAt(load.delta);
-    const bool pointer = local != nullptr && local->type.pointerDepth > 0;
-    inlinedStackLoads.emplace(function.op(il::OpId{opIndex}).result.index(),
-                              InlinedStackLoad{std::move(text), pointer});
-    deadOps.insert(opIndex);
+  for (auto& [opIndex, inlined] : stackLoadTexts) {
+    inlinedStackLoads.emplace(function.op(il::OpId{opIndex}).result.index(), std::move(inlined));
   }
-  // Load-inline: the same fold as stack-load-fold above, for a Load whose
-  // address is a Global or an Other (e.g. argument-plus-offset) address
-  // rather than a stack slot. There is no name to substitute ahead of time
-  // here, so ExprPrinter::value re-renders the dereference itself; this
-  // loop only needs to mark the load dead and record what to re-render.
-  for (const auto& [opIndex, load] : analysis::findFoldableMemoryLoads(function, frame, deadOps)) {
+  for (const auto& [opIndex, load] : prep.foldableMemoryLoads) {
     inlinedMemoryLoads.emplace(function.op(il::OpId{opIndex}).result.index(),
                                InlinedMemoryLoad{load.address, load.width});
-    deadOps.insert(opIndex);
   }
-  // Stack-store-fold: a Store through a slot nothing in the function ever
-  // reads back and whose address never escapes (see stack_store_fold.h).
-  // Joining `deadOps` here, before `StmtPrinter::printBlock` ever collects a
-  // scope's CSE roots, is what lets a dead spill's own contribution to a
-  // shared subexpression's reference count disappear along with the
-  // statement -- see docs/09 shape I1.
-  for (const uint32_t opIndex : analysis::findDeadStackStores(function, frame, variables)) {
-    deadOps.insert(opIndex);
-    // findDeadStackStores proves a whole slot dead, never just one of
-    // several stores to it (every write to a delta it never reads back is
-    // dead together, see the header), so every dead Store's own delta is a
-    // local with nothing left in the body to justify declaring.
-    const auto operands = function.operands(function.op(il::OpId{opIndex}));
-    deadLocalStackDeltas.insert(frame.classify(operands[0]).delta);
-  }
+  deadLocalStackDeltas = prep.deadLocalStackDeltas;
 }
 
 const std::string* CContext::tempFor(il::ValueId value) const {
@@ -445,16 +433,18 @@ std::string CContext::stackSlotLvalue(int64_t delta, uint32_t width) const {
   return std::format("(*({}*)(&{}))", intType(width), local->name);
 }
 
-std::string CContext::addressOfLocal(il::ExprId address) const {
-  const analysis::AddressInfo info = frame.classify(address);
-  if (info.kind != analysis::AddressKind::StackSlot) {
+std::string CContext::addressOfLocal(il::ExprId address) {
+  // Global and Other addresses are never this renderer's business to guess
+  // at from here -- checked before AddressRenderer even sees the
+  // expression, so this stays exactly as safe as it always was for every
+  // caller that expects "" for anything but a recovered local's own slot.
+  if (frame.classify(address).kind != analysis::AddressKind::StackSlot) {
     return {};
   }
-  const analysis::Variable* local = variables.localAt(info.delta);
-  if (local == nullptr || !local->importedType.has_value()) {
-    return {};
+  if (const auto rendered = AddressRenderer(*this).render(address, AddressRole::AddressOf, 0)) {
+    return rendered->text;
   }
-  return std::format("&{}", local->name);
+  return {};
 }
 
 bool CContext::argumentIsPointer(const analysis::Variable& variable) const {

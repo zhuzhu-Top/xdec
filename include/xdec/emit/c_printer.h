@@ -151,6 +151,12 @@ struct COptions {
   /// answers for arity and typing. Absent leaves such a call typed only by
   /// the machine's own register width, same as before this existed.
   MemoryFacts memory;
+  /// Raw image bytes, for recovering a constant pointer argument's referent
+  /// as a literal (`"ro.arch"` for `__system_property_get`'s first argument,
+  /// say) instead of the bare address -- see analysis::ImageLiteralRecovery
+  /// and emit::AddressRenderer. Absent leaves every such address printed as
+  /// the number it always was, the same as a pipeline with no image gets.
+  ByteReader imageReader;
   /// Declarations imported from headers, when the caller supplied any. What
   /// this changes is spelling, never structure: a signature becomes
   /// `int32_t f(EvalVec3 *v)` instead of `uint64_t f(uint64_t a0)`, and an

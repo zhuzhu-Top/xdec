@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <vector>
 
 #include "il/il_test_support.h"
 #include "xdec/analysis/stack_frame.h"
@@ -145,6 +146,33 @@ TEST_CASE("a store to the promoted 'state' slot is left alone even though nothin
   REQUIRE(variables.localAt(-0x10)->name == "state");
   const auto dead = findDeadStackStores(f.function, frame, variables);
   CHECK(!dead.contains(store.index()));
+}
+
+TEST_CASE(
+    "stores adjacent to a slot passed to a call are not dead, even though nothing reads "
+    "them back",
+    "[analysis][stack-store-fold]") {
+  Fixture f;
+  // Mirrors bc_lib's sub_2f9a38, block b4: the callee is only ever handed
+  // `&var_70`, but the three stores together lay out an 0x18-byte aggregate
+  // it reads through that one pointer (see analysis::StackEscapeMap).
+  const ExprId address = f.slot(-0x70);
+  const OpId first = f.function.appendStore(f.entry, 0x1000, Type::integer(64), address,
+                                            f.i64(0x18));
+  const OpId second =
+      f.function.appendStore(f.entry, 0x1004, Type::integer(64), f.slot(-0x68), f.i64(1));
+  const OpId third =
+      f.function.appendStore(f.entry, 0x1008, Type::integer(64), f.slot(-0x60), f.i64(2));
+  const OpId call = f.function.appendCall(f.entry, 0x100c, f.i64(0x9000));
+  f.function.setOperands(call, std::vector<ExprId>{f.i64(0x9000), address});
+  f.function.appendReturn(f.entry, 0x1010);
+  f.function.rebuildEdges();
+
+  const StackFrame frame = StackFrame::compute(f.function);
+  const auto dead = findDeadStackStores(f.function, frame, VariableTable{});
+  CHECK(!dead.contains(first.index()));
+  CHECK(!dead.contains(second.index()));
+  CHECK(!dead.contains(third.index()));
 }
 
 TEST_CASE("a store to a global address is left alone", "[analysis][stack-store-fold]") {

@@ -869,6 +869,11 @@ TEST_CASE("irreducible cross jumps fall back to labels and gotos",
   // Every block is emitted exactly once, and somebody needed a goto.
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) >= 1);
   CHECK(!result.labeled.empty());
+  // Neither guard here has a shape any real pattern closes (both feed into
+  // a shared, multi-predecessor middle from outside any diamond/cascade
+  // arm), so both fall all the way through to the unconditional fallback.
+  CHECK(std::count(result.matchedPatterns.begin(), result.matchedPatterns.end(), "goto-chain") >=
+        1);
 }
 
 TEST_CASE("a goto that only restates the fallthrough is dropped",
@@ -1053,6 +1058,109 @@ TEST_CASE("a block reached only by falling into it gets no label", "[emit][struc
   const StructuredFunction result = run(f.function);
   CHECK_FALSE(result.isLabeled(merge));
   CHECK(result.labeled.empty());
+}
+
+TEST_CASE("two nested guards sharing one fallback structure with no goto at all",
+          "[emit][structure]") {
+  // bc_lib's own sub_2f9a38: an outer guard whose failure arm and an inner
+  // guard's failure arm both land on the very same fallback block. Neither
+  // tryDiamond nor tryOneSided can close this (the fallback has two
+  // predecessors, so whichever claims it first leaves the other with
+  // nowhere to put its own copy) -- see analysis::GuardCascadeShape.
+  Fixture f;
+  const BlockId inner = f.block(0x2000);
+  const BlockId fallback = f.block(0x3000);
+  const BlockId merge = f.block(0x4000);
+  f.function.appendCondBranch(f.entry, 0x1000, f.cond(), fallback, inner);
+  f.function.appendCondBranch(inner, 0x2000, f.cond(), merge, fallback);
+  f.function.appendStore(fallback, 0x3000, Type::integer(64), f.i64(0x9000), f.i64(1));
+  f.function.appendBranch(fallback, 0x3004, merge);
+  f.function.appendReturn(merge, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  CHECK(result.labeled.empty());
+  // The one CondBranch site here (the outer guard) is exactly the shape
+  // tryGuardCascade exists for -- see PatternAttempt's own doc comment for
+  // why this is the stable name to check against instead of re-deriving it
+  // from the Stmt tree's shape.
+  CHECK(result.matchedPatterns == std::vector<std::string_view>{"guard-cascade"});
+  // Every real block appears; the shared fallback appears under both guards'
+  // failure arms, so it is the one block printed twice on purpose -- a
+  // duplicated few lines of cleanup, not a duplicated bug, and cheaper to
+  // read than a goto/label pair for a body this small.
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), f.entry) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), inner) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), merge) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), fallback) == 2);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 2);
+
+  // Shape check: outer if's thenArm leads with the inner guard's own block,
+  // then the inner if; outer's elseArm is the fallback body directly.
+  // entry's own block, the outer if, then merge's own block/return.
+  REQUIRE(result.root->items.size() == 3);
+  const Stmt& outerIf = *result.root->items[1];
+  REQUIRE(outerIf.kind == StmtKind::If);
+  REQUIRE(outerIf.thenArm != nullptr);
+  REQUIRE(outerIf.elseArm != nullptr);
+  REQUIRE(outerIf.thenArm->items.size() == 2);
+  CHECK(outerIf.thenArm->items[0]->kind == StmtKind::Block);
+  CHECK(outerIf.thenArm->items[0]->block == inner);
+  const Stmt& innerIf = *outerIf.thenArm->items[1];
+  REQUIRE(innerIf.kind == StmtKind::If);
+  // Success (reaching merge) needs nothing of its own to say, so the
+  // structurizer leaves it as an empty elseArm -- which the goto-elision
+  // pass then normalizes into a one-armed `if` (see "an if left with only
+  // its else arm inverts" above) rather than printing empty braces ahead of
+  // an else.
+  REQUIRE(innerIf.thenArm != nullptr);
+  CHECK(innerIf.elseArm == nullptr);
+  Walk innerFallbackWalk;
+  innerFallbackWalk.visit(innerIf.thenArm);
+  CHECK(std::count(innerFallbackWalk.blocks.begin(), innerFallbackWalk.blocks.end(), fallback) ==
+        1);
+  Walk outerFallbackWalk;
+  outerFallbackWalk.visit(outerIf.elseArm);
+  CHECK(std::count(outerFallbackWalk.blocks.begin(), outerFallbackWalk.blocks.end(), fallback) ==
+        1);
+  // Neither copy is the other's own node -- two independent trees, not one
+  // shared pointer printed twice (Stmt has single ownership either way).
+  CHECK(innerIf.thenArm.get() != outerIf.elseArm.get());
+}
+
+TEST_CASE("kCondBranchPatterns states emitRegion's own priority order",
+          "[emit][structure]") {
+  // One place the priority order lives as data, checked here so a reorder
+  // in structure.cpp's if-chain cannot silently drift from what this table
+  // (and the comments quoting it) claim.
+  using xdec::emit::kCondBranchPatterns;
+  REQUIRE(kCondBranchPatterns.size() == 4);
+  CHECK(kCondBranchPatterns[0].name == "diamond");
+  CHECK(kCondBranchPatterns[1].name == "guard-cascade");
+  CHECK(kCondBranchPatterns[2].name == "dispatch-tree");
+  CHECK(kCondBranchPatterns[3].name == "one-sided");
+  for (std::size_t i = 1; i < kCondBranchPatterns.size(); ++i) {
+    CHECK(kCondBranchPatterns[i - 1].priority < kCondBranchPatterns[i].priority);
+  }
+}
+
+TEST_CASE("matchedPatterns records which pattern claimed a diamond and a goto-chain site",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId left = f.block(0x2000);
+  const BlockId right = f.block(0x3000);
+  const BlockId merge = f.block(0x4000);
+  f.function.appendCondBranch(f.entry, 0x1000, f.cond(), left, right);
+  f.function.appendBranch(left, 0x2000, merge);
+  f.function.appendBranch(right, 0x3000, merge);
+  f.function.appendReturn(merge, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  CHECK(result.matchedPatterns == std::vector<std::string_view>{"diamond"});
 }
 
 TEST_CASE("a while loop with a genuinely empty body still structures, not crashes",

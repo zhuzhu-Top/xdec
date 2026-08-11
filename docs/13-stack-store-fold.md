@@ -36,13 +36,14 @@ For every `Store` in the function whose address classifies as a `StackSlot`
    already folded into its reader's text by stack-load-fold (`docs/12`) —
    either way the read still happens as far as this analysis is concerned,
    only spelled differently, so it still disqualifies the slot.
-2. **The slot's address never escapes.** A single function-wide scan records,
-   for every op's every operand, any stack address that shows up somewhere
-   other than as the address operand of its own Load or Store: a
-   `Call`/`Intrinsic`/`Unimplemented` argument (any of which may read
-   through a pointer this analysis has no way to reason about), or a value
-   stored into some *other* location, which this analysis has no way to
-   trace further. Either escape makes every store to that delta ineligible.
+2. **The slot's delta is not escaped**, per `analysis::StackEscapeMap`
+   (`stack_escape.h`, see its own section below): a `Call`/`Intrinsic`/
+   `Unimplemented` argument (any of which may read through a pointer this
+   analysis has no way to reason about) or a value stored into some *other*
+   location (which this analysis has no way to trace further) makes that
+   delta ineligible — and so is every other delta `StackEscapeMap` closes
+   into the same region, since a store there may be writing a field of the
+   same aggregate the callee reads through the escaped pointer.
 3. **The slot is not an aliased field** (`Variable::aliasBase`) — an aliased
    local's liveness is tied to its base slot's own accesses, which this
    analysis does not model.
@@ -66,6 +67,59 @@ flowchart TD
   Alias -->|no| Dead["dead: statement and (if every\nwrite to the slot is dead) declaration both drop"]
 ```
 
+## Stack Escape Regions (SER): `StackEscapeMap`
+
+`include/xdec/analysis/stack_escape.h` / `src/analysis/stack_escape.cpp`.
+
+Rule 2 above answers one delta at a time: is *this exact* stack address an
+operand somewhere other than a Load/Store's own address. That is correct as
+far as it goes, but a pointer handed to a callee is rarely a promise about
+only the one byte it points at. `bc_lib`'s `sub_2f9a38` calls
+`sub_2f949c(flags, &var_70)` after three stores lay out an 0x18-byte
+aggregate starting at `var_70` (`var_70`'s own qword, then `var_68`, then
+`var_60`); nothing in the caller ever loads any of the three back. Treating
+only `var_70`'s own delta as escaped — which is all rule 2 alone can see —
+made the other two stores look dead, and `findDeadStackStores` folded them
+away: an aggregate initializer with two fields silently missing, and their
+source values (registers like `t4` in the emitted C) looking unused.
+
+`StackEscapeMap` is a separate analysis rather than a third clause bolted
+onto rule 2's own scan, because it answers a different question. Rule 2 (a
+`Point` escape, in `StackEscapeReason` terms) is "does this delta escape".
+SER is "how wide is the region a callee might touch, starting from an
+escaped delta" — reusable anywhere else that question comes up, without
+`findDeadStackStores` growing a second responsibility.
+
+**Region construction (`StackEscapeReason::StoreFootprint`).** For each
+`Point` escape at delta `B`, the region starts at `[B, B)` and grows by
+repeatedly folding in any Store in the function whose own delta `D` touches
+or overlaps the region built so far (`D` in `[B, currentEnd]`), extending
+the end to `D`'s own store width past `D`. A store that leaves a gap above
+the current end is left out on every pass, since nothing bridges it — this
+is a closure over *contiguous* stores, not "every store at or above `B`
+anywhere in the function": the latter would treat any unrelated local
+further up the same frame as escaped too, which rule 2's own tests guard
+against staying dead-foldable.
+
+```mermaid
+flowchart LR
+  B["Point escape at B\n(e.g. &var_70, passed to a call)"] --> Grow{"any Store at delta D\nwith B <= D <= end?"}
+  Grow -->|yes: extend end to D + width| Grow
+  Grow -->|no more matches| Region["region [B, end) -- StoreFootprint\n(or just [B, B+1) -- Point, if nothing adjoined)"]
+```
+
+Two escapes at unrelated deltas each close over their own region
+independently; a gap between them belongs to neither, and stays eligible for
+its own dead-store verdict same as before this analysis existed.
+
+**Non-goal (`StackEscapeReason::CalleeType`, not yet implemented).** When
+`types::TypeBinder` can resolve a call's parameter to `T*` with a known
+`sizeof(T)`, a future phase can widen a `StoreFootprint` region to
+`max(footprint, sizeof(T))` for a callee prototype that claims more than the
+caller's own stores prove — additive to this phase, not a replacement, since
+the enum and `compute()`'s single call site are the only things a new reason
+needs to touch.
+
 ## Where the finding is consumed
 
 **`CContext`'s constructor** (`emit/c_context.cpp`) calls
@@ -88,7 +142,15 @@ either.
   load reads is not; a store whose address is passed to an intrinsic, or
   stored elsewhere as a value, is not; two stores to the same unread slot
   are both dead; a store to a global is left alone; the promoted `state`
-  slot is left alone even with no reader.
+  slot is left alone even with no reader; three stores forming an aggregate
+  behind one call-escaped pointer (mirroring `sub_2f9a38`'s `b4`) are all
+  kept, not just the escaped delta itself.
+- `tests/analysis/test_stack_escape.cpp` — `StackEscapeMap` directly: a bare
+  `Point` escape with no adjoining store still marks its own delta;
+  contiguous stores above an escaped delta close into one region; a store
+  across a gap is excluded; two unrelated escapes each close over their own
+  region without bleeding into each other; a function with no escapes at
+  all reports none.
 - `tests/emit/test_c_printer.cpp` and `tests/emit/test_c_expr_reuse.cpp` —
   three existing fixtures that happened to construct exactly this
   now-optimized shape (a diamond's write-only merge, an assigned select, a

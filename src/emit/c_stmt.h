@@ -151,6 +151,17 @@ class StmtPrinter {
   /// handle.
   void printOp(il::OpId opId, std::string& out);
   void printCall(const il::Op& op, std::string& out);
+  /// One call argument's text: a recovered local's own address ahead of
+  /// everything else (see CContext::addressOfLocal, unconditional on the
+  /// callee's own type same as it always was); otherwise, where `callee`
+  /// declares this position a pointer, the literal its immutable referent
+  /// recovers to, or its global's own name, ahead of the plain arithmetic
+  /// every other argument still prints as (see AddressRenderer). `callee` is
+  /// null wherever nothing typed the call (see CContext::calleeType), and
+  /// then only the first, address-independent check ever fires.
+  [[nodiscard]] std::string callArgumentText(const types::TypeEntry* callee,
+                                             std::size_t paramIndex, il::ExprId operand,
+                                             std::string& out);
   /// The function-pointer type a computed call is cast through, from what a
   /// header said about the callee where it said anything.
   [[nodiscard]] std::string calleeCast(const types::TypeEntry* callee,

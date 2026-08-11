@@ -15,8 +15,10 @@
 // structured region is verified to have no predecessors outside that region.
 #pragma once
 
+#include <array>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "xdec/analysis/dominators.h"
@@ -25,6 +27,38 @@
 #include "xdec/il/function.h"
 
 namespace xdec::emit {
+
+/// One pattern `Structurizer::emitRegion`'s `CondBranch` site tries, and the
+/// fixed priority it tries them in -- doc-only metadata naming the same
+/// order the if-chain in structure.cpp's `emitRegion` already encodes, not a
+/// dispatch table it drives: each pattern's actual match logic keeps its own
+/// method (`tryDiamond`, `tryGuardCascade`, ...), its own signature, and its
+/// own claim/rollback discipline, since `tryDispatchTree` mutates the
+/// sequence directly while every other pattern returns a `StmtPtr` on
+/// success -- unifying those under one function-pointer signature would cost
+/// more than the five sites here are worth (see the architecture plan's own
+/// note on why a full Structurizer registry waits for pattern #6+). What
+/// this table buys instead: one place that states the priority order in
+/// code, checked by a test, so a future reorder cannot silently drift from
+/// what the comments describe -- and the stable names `StructuredFunction::
+/// matchedPatterns` records a claim under.
+struct PatternAttempt {
+  std::string_view name;
+  int priority;  // lower tries first, matching emitRegion's own if-chain
+};
+
+/// The `CondBranch`-site patterns `emitRegion` tries, in the exact order it
+/// tries them. A goto chain -- emitRegion's unconditional fallback once every
+/// pattern here has declined -- always succeeds, so it is not a "pattern
+/// attempt" and is not listed; see `StructuredFunction::matchedPatterns` for
+/// what actually claimed each site, goto chains included (recorded as
+/// `"goto-chain"` there even though it has no entry of its own here).
+inline constexpr std::array<PatternAttempt, 4> kCondBranchPatterns{{
+    {"diamond", 0},
+    {"guard-cascade", 1},
+    {"dispatch-tree", 2},
+    {"one-sided", 3},
+}};
 
 enum class StmtKind : uint8_t {
   Sequence,  // items, in order
@@ -112,6 +146,14 @@ struct StructuredFunction {
   [[nodiscard]] bool isLabeled(il::BlockId block) const;
 
   std::vector<il::BlockId> labeled;
+  /// The name (see `kCondBranchPatterns`, plus `"goto-chain"` for the
+  /// unconditional fallback) of whichever pattern claimed each `CondBranch`
+  /// site `emitRegion` visited, in claim order. Purely observational --
+  /// nothing downstream of structuring reads this or depends on what is in
+  /// it -- kept for tests and metrics that want to know which patterns a
+  /// function's control flow actually exercised without re-walking the
+  /// `Stmt` tree to guess from its shape.
+  std::vector<std::string_view> matchedPatterns;
 };
 
 /// Structures the whole function. The analyses must be computed from the

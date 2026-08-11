@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "address_render.h"
 #include "xdec/analysis/import_callee.h"
 #include "xdec/analysis/noreturn.h"
 #include "xdec/il/expr_roots.h"
@@ -28,6 +29,24 @@ namespace {
 
 using il::addExprRoots;
 using il::collectValueLeaves;
+
+/// The bits of what a declared pointer parameter points at, or 0 when
+/// `callee` is null, has no such parameter at `index`, or that parameter is
+/// not a pointer at all -- every one of which means "no positive evidence
+/// this argument is address-shaped", the gate callArgumentText's own Global
+/// branch will not cross without.
+[[nodiscard]] uint32_t paramPointeeWidth(const CContext& ctx, const types::TypeEntry* callee,
+                                        std::size_t index) {
+  if (callee == nullptr || ctx.options.types == nullptr || index >= callee->params.size()) {
+    return 0;
+  }
+  const types::TypeDatabase& database = *ctx.options.types;
+  const types::TypeEntry* param = database.get(database.resolveTypedef(callee->params[index].type));
+  if (param == nullptr || param->kind != types::TypeKind::Pointer) {
+    return 0;
+  }
+  return static_cast<uint32_t>(database.sizeOf(param->element).value_or(1) * 8);
+}
 
 }  // namespace
 
@@ -978,6 +997,32 @@ bool StmtPrinter::printSelectAssign(
   return true;
 }
 
+std::string StmtPrinter::callArgumentText(const types::TypeEntry* callee, std::size_t paramIndex,
+                                          il::ExprId operand, std::string& out) {
+  if (std::string address = ctx_.addressOfLocal(operand); !address.empty()) {
+    return address;
+  }
+  // Only past a recovered local's own address (StackSlot, handled above,
+  // unconditionally -- see CContext::addressOfLocal) does this position's
+  // *declared* type start to matter: a Global address is otherwise exactly
+  // as ambiguous a bare number as it always was, and guessing it names a
+  // pointer without the callee's own signature saying so is how a decoded
+  // flag value would turn into a fabricated string the moment it happened
+  // to double as a readable rodata address.
+  if (const uint32_t pointeeWidth = paramPointeeWidth(ctx_, callee, paramIndex); pointeeWidth != 0) {
+    const analysis::AddressInfo info = ctx_.frame.classify(operand);
+    if (info.kind == analysis::AddressKind::Global) {
+      if (const std::optional<analysis::ImageLiteral> literal = ctx_.literals.at(info.address)) {
+        return analysis::quoteCString(literal->text);
+      }
+    }
+    if (const auto rendered = AddressRenderer(ctx_).render(operand, AddressRole::PointerValue, pointeeWidth)) {
+      return rendered->text;
+    }
+  }
+  return exprText(operand, out);
+}
+
 void StmtPrinter::printCall(const il::Op& op, std::string& out) {
   const auto operands = ctx_.function.operands(op);
   // At Vars and beyond the operand list *is* the recovered argument list (see
@@ -997,30 +1042,34 @@ void StmtPrinter::printCall(const il::Op& op, std::string& out) {
     --argCount;
   }
   const bool trimmed = argCount + 1 < operands.size();
+  // Asked once, ahead of either branch below, because it also answers this
+  // loop's own question (see callArgumentText) -- calleeType already
+  // resolves a direct constant target the same way the branch that prints
+  // one does, so there is nothing here for the direct/computed split to
+  // change.
+  const types::TypeEntry* callee = ctx_.calleeType(operands[0]);
   std::string args;
   for (std::size_t index = 1; index <= argCount; ++index) {
     args += index == 1 ? "" : ", ";
-    std::string address = ctx_.addressOfLocal(operands[index]);
-    args += address.empty() ? exprText(operands[index], out) : address;
+    args += callArgumentText(callee, index - 1, operands[index], out);
   }
   const std::string suffix = trimmed ? " /* + unknown arg(s) */" : "";
   const std::string* temp = ctx_.tempFor(op.result);
   const std::string assignee = temp == nullptr ? "" : *temp + " = ";
   uint64_t address = 0;
   if (ctx_.function.asConstant(operands[0], address)) {
-    const std::string callee = ctx_.calleeName(address);
-    ctx_.callees.emplace(address, callee);
+    const std::string calleeName = ctx_.calleeName(address);
+    ctx_.callees.emplace(address, calleeName);
     // Same annotation the syscall path prints for a noreturn number (see
     // printSyscall): a reader who has just read `abort()` or
     // `__stack_chk_fail()` should not have to also know each one's contract
     // to see why nothing here worries about what follows on this path.
     const std::string_view note =
-        analysis::isKnownNoreturnSymbol(callee) ? " /* does not return */" : "";
-    line(out, std::format("{}{}({}){}{};", assignee, callee, args, suffix, note));
+        analysis::isKnownNoreturnSymbol(calleeName) ? " /* does not return */" : "";
+    line(out, std::format("{}{}({}){}{};", assignee, calleeName, args, suffix, note));
     return;
   }
-  const std::string prototype = calleeCast(ctx_.calleeType(operands[0]), argCount,
-                                           temp != nullptr);
+  const std::string prototype = calleeCast(callee, argCount, temp != nullptr);
   const std::string target = exprInt(operands[0], out);
   // The cast above already carries the callee's prototype when a header
   // covers it (see CContext::calleeType); what it cannot carry is the
@@ -1237,36 +1286,16 @@ bool StmtPrinter::printSecurityHint(const il::Op& op, std::string& out) {
 
 std::string StmtPrinter::memoryLvalue(il::ExprId address, uint32_t width,
                                       std::string& out, il::ValueId result) {
-  const analysis::AddressInfo info = ctx_.frame.classify(address);
-  if (info.kind == analysis::AddressKind::StackSlot) {
-    if (std::string text = ctx_.stackSlotLvalue(info.delta, width); !text.empty()) {
-      return text;
-    }
-  }
-  // A field of a struct a header described, where one describes this access.
+  // A field of a struct a header described, where one describes this
+  // access -- checked ahead of AddressRenderer because it answers a
+  // different question (an argument-plus-offset's declared shape) that a
+  // StackSlot/Global address never has an opinion on either way (see
+  // CContext::fieldAccess).
   if (std::string field = ctx_.fieldAccess(address, width, result); !field.empty()) {
     return field;
   }
-  // A fixed address is a global, and prints as one where the image can say that
-  // much. The cast usually stays: the same global is read at several widths in
-  // this code, so a declaration cannot carry the type and the access has to.
-  uint64_t absolute = 0;
-  if (ctx_.function.asConstant(address, absolute)) {
-    if (const std::string* global = ctx_.globalName(absolute)) {
-      // Exception: a byte access against the untyped fallback declaration
-      // (globalDeclarations() falls back to `uint8_t NAME[]` precisely when no
-      // header binds this address) is already reading at the array's own
-      // element type. `NAME[0]` says that directly; `(*(uint8_t*)(NAME))`
-      // would only be undoing the very array-to-pointer decay it started
-      // from. A header-bound address may not be an array at all, so this
-      // stays only for the fallback declaration.
-      const types::TypeBinder* binder = ctx_.binder();
-      const bool headerTyped = binder != nullptr && binder->at(absolute).valid();
-      if (width == 8 && !headerTyped) {
-        return std::format("{}[0]", *global);
-      }
-      return std::format("(*({}*)({}))", intType(width), *global);
-    }
+  if (const auto rendered = AddressRenderer(ctx_).render(address, AddressRole::MemoryLvalue, width)) {
+    return rendered->text;
   }
   // A bare pointer (an argument, a typed field) needs no round trip through
   // an integer just to be dereferenced: `exprPointer` already casts it where

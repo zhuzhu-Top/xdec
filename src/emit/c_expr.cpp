@@ -4,6 +4,7 @@
 #include <format>
 #include <vector>
 
+#include "address_render.h"
 #include "c_flags.h"
 
 namespace xdec::emit {
@@ -19,6 +20,17 @@ std::string ExprPrinter::integerOperand(il::ExprId id) {
 }
 
 std::string ExprPrinter::pointerOperand(il::ExprId id, uint32_t width) {
+  // A stack slot or an immutable global reads the same way here as it does
+  // as an lvalue: `&var_70`/`g_400900`, not the raw arithmetic that
+  // classifies it (see AddressRenderer). Tried ahead of `value()` because
+  // a StackSlot expression is ordinary arithmetic to it (`Sub(entry_sp,
+  // 0x70)`), ExprPrinter's own leaf-recognition patterns notwithstanding.
+  if (const auto rendered = AddressRenderer(ctx_).render(id, AddressRole::PointerValue, width)) {
+    if (rendered->pointer) {
+      return rendered->text;
+    }
+    return std::format("({}*)({})", intType(width), rendered->text);
+  }
   const Text operand = value(id);
   if (operand.pointer) {
     return operand.text;

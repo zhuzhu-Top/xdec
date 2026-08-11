@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "xdec/analysis/image_literals.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/emit/c_printer.h"
@@ -94,6 +95,12 @@ class CContext {
   const analysis::StackFrame& frame;
   const StructuredFunction& structured;
   const COptions& options;
+  /// Recovers a constant address's referent as a literal, where `options`
+  /// supplied an image to read it from (see AddressRenderer, the only
+  /// consumer). Built with an absent reader when it did not, so `at()`
+  /// answers nothing everywhere -- the same "no evidence" shape `addresses`
+  /// and `symbols` already default to.
+  analysis::ImageLiteralRecovery literals;
 
   /// Value index -> temporary name, for results that must not be re-evaluated
   /// at each use: loads, calls, intrinsics, and untracked register reads.
@@ -278,8 +285,11 @@ class CContext {
   /// header was imported, or the two disagree.
   [[nodiscard]] types::TypeId functionReturnType() const;
 
-  /// `&var_10` for an address expression that is exactly the stack slot of a
-  /// local TypedVariables gave a struct type, empty otherwise.
+  /// `&var_10` for an address expression that classifies as a stack slot
+  /// (see StackFrame::classify) with a recovered local, empty otherwise --
+  /// including for a Global or an Other address, which this never guesses
+  /// at (see AddressRenderer, whose AddressOf/StackSlot branch this is a
+  /// thin wrapper over).
   ///
   /// Checked ahead of the ordinary cast-and-print path (see StmtPrinter's
   /// call and syscall argument loops) because those wrap every argument text
@@ -287,7 +297,7 @@ class CContext {
   /// `(struct timeval*)(__entry_sp + -0x10)` -- not wrong, since the slot is
   /// declared as that struct, but a needless trip through arithmetic and a
   /// cast for what is now just one named local's address.
-  [[nodiscard]] std::string addressOfLocal(il::ExprId address) const;
+  [[nodiscard]] std::string addressOfLocal(il::ExprId address);
 
   /// `var_50.tv_sec` for a `width`-bit access to the stack slot at `delta`,
   /// when that slot is (or aliases into, see analysis::Variable::aliasBase) a

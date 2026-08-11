@@ -35,11 +35,16 @@ namespace xdec::analysis {
 ///     already dead itself (see stack_load_fold.h): a load `deadOps` folds
 ///     into its reader's text still performs the read as far as this
 ///     analysis is concerned, it is only spelled differently.
-///  3. The slot's address never escapes: it is never an operand of anything
-///     other than as the address of a Load or a Store (its own address
-///     operand included) -- not a Call or Intrinsic argument, which may read
-///     through any pointer at all, and not stored as a value into some other
-///     location this analysis would then have to track indirectly.
+///  3. The slot's delta is not escaped (see analysis::StackEscapeMap): it is
+///     never an operand of anything other than as the address of a Load or a
+///     Store (its own address operand included) -- not a Call or Intrinsic
+///     argument, which may read through any pointer at all, and not stored
+///     as a value into some other location this analysis would then have to
+///     track indirectly. An escaped delta's protection also covers every
+///     other delta StackEscapeMap closes into the same region: a Store one
+///     slot above an escaped pointer may be writing a field of the same
+///     aggregate the callee reads through it, and this analysis has no way
+///     to tell that store's field apart from the pointer's own.
 ///  4. The slot is not an aliased field (`Variable::aliasBase`): an aliased
 ///     local's liveness is tied to its base slot's own accesses, which this
 ///     analysis does not model.

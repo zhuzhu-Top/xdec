@@ -1,11 +1,14 @@
 xdec_add_library(xdec_analysis
   SOURCES
+    analysis_cache.cpp
     atomic_exclusive.cpp
     call_target.cpp
     dispatcher_shape.cpp
     dominators.cpp
     expr_reuse.cpp
+    guard_cascade.cpp
     image_eval.cpp
+    image_literals.cpp
     index_bound.cpp
     import_callee.cpp
     jump_table.cpp
@@ -18,6 +21,7 @@ xdec_add_library(xdec_analysis
     reachability.cpp
     scc.cpp
     emit_redundancy.cpp
+    stack_escape.cpp
     stack_frame.cpp
     stack_load_fold.cpp
     stack_store_fold.cpp

@@ -20,10 +20,13 @@ add_executable(xdec_tests
   support/test_handle.cpp
   support/test_result.cpp
   analysis/test_analysis.cpp
+  analysis/test_analysis_cache.cpp
   analysis/test_dispatcher_shape.cpp
   analysis/test_emit_redundancy.cpp
   analysis/test_expr_reuse.cpp
+  analysis/test_guard_cascade.cpp
   analysis/test_image_eval.cpp
+  analysis/test_image_literals.cpp
   analysis/test_import_callee.cpp
   analysis/test_index_bound.cpp
   analysis/test_jump_table.cpp
@@ -31,12 +34,15 @@ add_executable(xdec_tests
   analysis/test_load_inline.cpp
   analysis/test_plt_stub.cpp
   analysis/test_profile.cpp
+  analysis/test_stack_escape.cpp
   analysis/test_stack_frame.cpp
   analysis/test_stack_load_fold.cpp
   analysis/test_stack_store_fold.cpp
   analysis/test_typed_variables.cpp
   analysis/test_variables.cpp
   decompile/test_driver.cpp
+  decompile/test_decompile_to_c.cpp
+  decompile/test_api.cpp
   emit/test_structure.cpp
   emit/test_c_printer.cpp
   emit/test_c_atomic.cpp
@@ -45,6 +51,7 @@ add_executable(xdec_tests
   emit/test_c_helpers_header.cpp
   emit/test_c_load_inline.cpp
   emit/test_c_stack_load_inline.cpp
+    emit/test_c_address_form.cpp
     emit/test_c_import_call.cpp
     emit/test_c_syscall.cpp
     emit/test_c_types.cpp

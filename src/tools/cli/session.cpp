@@ -79,6 +79,10 @@ xdec::Result<xdec::types::TypeDatabase> loadTypes(std::span<const std::string> s
   return facts;
 }
 
+[[nodiscard]] xdec::ByteReader imageReaderOf(const BinaryImage& image) {
+  return [&image](uint64_t va, std::span<std::byte> out) { return image.read(va, out); };
+}
+
 [[nodiscard]] xdec::emit::SymbolResolver symbolResolverOf(const BinaryImage& image) {
   return [&image](uint64_t va) {
     xdec::emit::SymbolRef out;
@@ -161,6 +165,78 @@ xdec::Result<ToolSession> ToolSession::openBinary(std::string_view path) {
   XDEC_TRY(std::unique_ptr<BinaryImage> image, open(path));
   XDEC_TRY(std::unique_ptr<xdec::spec::SpecEngine> engine, loadEngine());
   return ToolSession{std::move(image), std::move(engine)};
+}
+
+xdec::Result<SessionContext> SessionContext::open(std::string_view path,
+                                                   const SessionLoadOptions& load) {
+  XDEC_TRY(ToolSession session, ToolSession::openBinary(path));
+
+  SessionContext ctx;
+  static_cast<ToolSession&>(ctx) = std::move(session);
+  // Built once and kept as members: everything below that closes over "the
+  // image's bytes" or "what it says about an address" (names(),
+  // driverOptions()) captures these by reference, and a fresh one recomputed
+  // on every call would leave those closures pointing at a destroyed
+  // temporary (see SessionContext::names()'s doc comment).
+  ctx.memory_ = memoryFactsOf(*ctx.image);
+  ctx.reader_ = imageReaderOf(*ctx.image);
+  ctx.profile = xdec::binary::inferTargetProfile(*ctx.image);
+
+  std::vector<std::string> typeSources = load.typeSources;
+  if (typeSources.empty()) {
+    typeSources = ctx.profile.typePresets;
+  }
+  ctx.hasTypes_ = !typeSources.empty();
+  if (ctx.hasTypes_) {
+    XDEC_TRY(xdec::types::TypeDatabase loaded, loadTypes(typeSources, /*verbose=*/false));
+    ctx.types = std::move(loaded);
+    print("types: {} type(s), {} declaration(s) from {} header(s)", ctx.types.typeCount(),
+          ctx.types.declarations().size(), typeSources.size());
+  }
+
+  std::string syscallSource = load.syscallSource;
+  if (syscallSource == xdec::types::SyscallTable::defaultName() &&
+      !ctx.profile.syscallTable.empty()) {
+    syscallSource = ctx.profile.syscallTable;
+  }
+  if (!syscallSource.empty()) {
+    const auto loadSyscalls = [&]() -> xdec::Result<xdec::types::SyscallTable> {
+      XDEC_TRY(const std::string resolved,
+               xdec::types::SyscallTable::resolvePath(syscallSource));
+      return xdec::types::SyscallTable::loadFile(resolved);
+    };
+    auto loaded = loadSyscalls();
+    if (!loaded) {
+      // A table the user named must load: they said which ABI this is, and
+      // guessing past that would name syscalls from the wrong kernel. The
+      // default is different -- it is the build's own data file, and a broken
+      // installation should not stop a decompilation that never needed it.
+      if (syscallSource != xdec::types::SyscallTable::defaultName()) {
+        return xdec::err(std::move(loaded).error());
+      }
+      print("note: no syscall table ({}); svc will print as __xdec_syscall",
+            loaded.error().format());
+    } else {
+      ctx.syscalls = std::move(*loaded);
+      ctx.hasSyscalls_ = true;
+    }
+  }
+  // Both loaded independently (the syscall table has no reason to depend on
+  // whether a header was given, see SyscallTable::resolveTypes), so the link
+  // between them is made here, once, rather than by either constructor.
+  if (ctx.hasTypes_ && ctx.hasSyscalls_) {
+    ctx.syscalls.resolveTypes(ctx.types);
+  }
+  return ctx;
+}
+
+xdec::decompile::DriverOptions SessionContext::driverOptions() const {
+  xdec::decompile::DriverOptions options;
+  options.memory = memory();
+  options.types = hasTypes_ ? &types : nullptr;
+  options.syscalls = hasSyscalls_ ? &syscalls : nullptr;
+  options.names = names();
+  return options;
 }
 
 }  // namespace xdec::cli

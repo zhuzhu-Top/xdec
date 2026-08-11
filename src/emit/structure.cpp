@@ -7,6 +7,7 @@
 #include <limits>
 
 #include "xdec/analysis/dispatcher_shape.h"
+#include "xdec/analysis/guard_cascade.h"
 #include "xdec/analysis/jump_table.h"
 
 namespace xdec::emit {
@@ -44,6 +45,45 @@ constexpr std::size_t kBudgetPerBlock = 200;
 }  // namespace
 
 namespace {
+
+/// A full, independent copy of `node`'s statement tree -- the way
+/// tryGuardCascade prints a shared fallback body under two different guards'
+/// failure arms without claiming its blocks a second time (see
+/// claimSharedFallbackBody). Safe regardless of how deep or structured the
+/// original walk found the body to be: nothing here re-inspects the CFG or
+/// touches `emitted_`/`trail_`, it only duplicates the already-built nodes,
+/// so whatever those blocks are is exactly what each copy prints.
+StmtPtr cloneStmt(const Stmt* node) {
+  if (node == nullptr) {
+    return nullptr;
+  }
+  StmtPtr copy = Stmt::make(node->kind);
+  copy->block = node->block;
+  copy->cond = node->cond;
+  copy->invertCond = node->invertCond;
+  copy->tableMode = node->tableMode;
+  copy->items.reserve(node->items.size());
+  for (const StmtPtr& item : node->items) {
+    copy->items.push_back(cloneStmt(item.get()));
+  }
+  copy->thenArm = cloneStmt(node->thenArm.get());
+  copy->elseArm = cloneStmt(node->elseArm.get());
+  copy->body = cloneStmt(node->body.get());
+  copy->cases = node->cases;
+  copy->caseBodies.reserve(node->caseBodies.size());
+  for (const StmtPtr& body : node->caseBodies) {
+    copy->caseBodies.push_back(cloneStmt(body.get()));
+  }
+  copy->caseValues = node->caseValues;
+  copy->casePreds = node->casePreds;
+  copy->defaultCase = node->defaultCase;
+  copy->defaultPred = node->defaultPred;
+  copy->defaultBody = cloneStmt(node->defaultBody.get());
+  copy->epilogue = cloneStmt(node->epilogue.get());
+  copy->mergeBlock = node->mergeBlock;
+  copy->frame = node->frame;
+  return copy;
+}
 
 /// The block `stmt` runs first when control falls into it with no jump of
 /// its own — the same question `goto`-elision needs answered for whatever
@@ -344,6 +384,7 @@ StructuredFunction Structurizer::run() {
   std::set<il::BlockId> labeled;
   collectReferences(result.root.get(), labeled);
   result.labeled.assign(labeled.begin(), labeled.end());
+  result.matchedPatterns = std::move(matchedPatterns_);
   return result;
 }
 
@@ -399,10 +440,20 @@ StmtPtr Structurizer::emitRegion(il::BlockId cur, il::BlockId stop,
             seq->items.push_back(emitBlock(cur));
             mark(cur);
             seq->items.push_back(std::move(diamond));
+            matchedPatterns_.push_back(kCondBranchPatterns[0].name);
+            cur = regionEnd_;
+            continue;
+          }
+          if (StmtPtr cascade = tryGuardCascade(cur, depth)) {
+            seq->items.push_back(emitBlock(cur));
+            mark(cur);
+            seq->items.push_back(std::move(cascade));
+            matchedPatterns_.push_back(kCondBranchPatterns[1].name);
             cur = regionEnd_;
             continue;
           }
           if (tryDispatchTree(seq.get(), cur, depth)) {
+            matchedPatterns_.push_back(kCondBranchPatterns[2].name);
             break;  // the switch consumed its tests; the region ends here
           }
           if (StmtPtr oneSided =
@@ -410,6 +461,7 @@ StmtPtr Structurizer::emitRegion(il::BlockId cur, il::BlockId stop,
             seq->items.push_back(emitBlock(cur));
             mark(cur);
             seq->items.push_back(std::move(oneSided));
+            matchedPatterns_.push_back(kCondBranchPatterns[3].name);
             cur = regionEnd_;
             continue;
           }
@@ -434,6 +486,7 @@ StmtPtr Structurizer::emitRegion(il::BlockId cur, il::BlockId stop,
         seq->items.push_back(emitBlock(cur));
         mark(cur);
         seq->items.push_back(gotoChain(operands[0], targets[0], targets[1]));
+        matchedPatterns_.push_back("goto-chain");
         break;  // region ends: both arms belong to other regions
       }
       case il::OpCode::IndirectBranch: {
@@ -581,6 +634,97 @@ StmtPtr Structurizer::tryOneSided(il::BlockId head, il::ExprId cond,
     return stmt;
   }
   return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Guard cascades: two guards sharing one fallback
+// ---------------------------------------------------------------------------
+
+StmtPtr Structurizer::tryGuardCascade(il::BlockId head, unsigned depth) {
+  if (budget_ == 0) {
+    return nullptr;
+  }
+  const std::optional<analysis::GuardCascadeShape> shape =
+      analysis::matchGuardCascade(function_, postDominators_, head);
+  if (!shape.has_value() || emitted_.contains(shape->merge) ||
+      emitted_.contains(shape->fallback) || emitted_.contains(shape->innerHead) ||
+      inProgressHeaders_.contains(shape->innerHead)) {
+    return nullptr;
+  }
+  const ScopedHeader inProgress(inProgressHeaders_, head);
+  const std::size_t snapshot = trail_.size();
+  const std::size_t gotoSnapshot = gotoTrail_.size();
+
+  // Claimed once; tryGuardCascade's own two failure arms each get an
+  // independent copy of it below (see cloneStmt and claimSharedFallbackBody).
+  StmtPtr fallbackOnce = claimSharedFallbackBody(shape->fallback, shape->merge, depth + 1);
+  if (!fallbackOnce) {
+    budget_ -= std::min(budget_, trail_.size() - snapshot);
+    rollback(snapshot, gotoSnapshot);
+    return nullptr;
+  }
+
+  // The inner guard's own ops always run once the outer guard lets control
+  // through, so they lead the outer `if`'s taken arm, ahead of the inner
+  // `if` itself -- the same shape emitRegion's own CondBranch case builds
+  // for an ordinary nested diamond, just assembled directly here instead of
+  // through a recursive emitRegion call (which would try to walk the shared
+  // fallback a second time and fail exactly as tryDiamond already does).
+  auto innerIf = Stmt::make(StmtKind::If);
+  innerIf->cond = shape->innerCond;
+  // thenArm stays null: the inner guard's success arm reaches `merge`
+  // directly, so there is nothing of its own to print there -- printIf's own
+  // handling of an empty arm takes care of that edge's phi copies. See
+  // GuardCascadeShape::innerSuccessIsTaken for the polarity this inverts.
+  innerIf->invertCond = !shape->innerSuccessIsTaken;
+  innerIf->elseArm = cloneStmt(fallbackOnce.get());
+
+  auto innerSeq = Stmt::make(StmtKind::Sequence);
+  innerSeq->items.push_back(emitBlock(shape->innerHead));
+  mark(shape->innerHead);
+  innerSeq->items.push_back(std::move(innerIf));
+
+  const il::Op* headTerm = terminatorOf(head);
+  const auto headTargets = function_.targets(*headTerm);
+  const bool outerTakenIsInner = headTargets[0] == shape->innerHead;
+
+  auto outerIf = Stmt::make(StmtKind::If);
+  outerIf->cond = shape->outerCond;
+  outerIf->invertCond = !outerTakenIsInner;
+  outerIf->thenArm = std::move(innerSeq);
+  outerIf->elseArm = std::move(fallbackOnce);
+
+  if (!regionClosed(snapshot, head)) {
+    budget_ -= std::min(budget_, trail_.size() - snapshot);
+    rollback(snapshot, gotoSnapshot);
+    return nullptr;
+  }
+  regionEnd_ = shape->merge;
+  return outerIf;
+}
+
+StmtPtr Structurizer::claimSharedFallbackBody(il::BlockId fallback, il::BlockId merge,
+                                              unsigned depth) {
+  if (depth >= kMaxDepth || budget_ == 0 || fallback == merge || emitted_.contains(fallback) ||
+      inProgressHeaders_.contains(fallback)) {
+    return nullptr;
+  }
+  const std::size_t snapshot = trail_.size();
+  const std::size_t gotoSnapshot = gotoTrail_.size();
+  // Stops AT merge rather than into it: merge belongs to whatever follows
+  // the whole cascade, not to the fallback's own body.
+  StmtPtr body = emitRegion(fallback, merge, depth);
+  // `fallback`'s own predecessors were already proven to be exactly the two
+  // guards' failure arms by matchGuardCascade, so `regionClosed` is asked
+  // about `fallback` itself here, not either guard -- exactly the trust
+  // claimDispatcherCaseBody places in its own caller's private-handler check
+  // before asking the same question about `dispatcher`.
+  if (trail_.size() == snapshot || regionEnd_ != merge || !regionClosed(snapshot, fallback)) {
+    budget_ -= std::min(budget_, trail_.size() - snapshot);
+    rollback(snapshot, gotoSnapshot);
+    return nullptr;
+  }
+  return body;
 }
 
 // ---------------------------------------------------------------------------

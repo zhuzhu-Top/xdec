@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "xdec/emit/structure.h"
@@ -49,6 +50,22 @@ class Structurizer {
   /// immediate post-dominator once one side leaves through a different exit.
   StmtPtr tryOneSided(il::BlockId head, il::ExprId cond, il::BlockId taken,
                       il::BlockId untaken, unsigned depth);
+
+  /// Two nested guards whose failure arms share one fallback body (see
+  /// analysis::GuardCascadeShape) -- the shape a diamond cannot represent,
+  /// since a diamond's arms each claim their own blocks and a fallback with
+  /// two predecessors is not that. Builds the inner `if` directly rather
+  /// than recursing through `emitRegion` for it, since the fallback must be
+  /// claimed (walked, marked) exactly once and then *printed* twice, once
+  /// per guard's failure arm -- a plain recursive walk would instead try to
+  /// claim it a second time and fail the same way tryDiamond already does.
+  StmtPtr tryGuardCascade(il::BlockId head, unsigned depth);
+
+  /// Walks and marks `fallback` up to (not including) `merge`, exactly once,
+  /// for `tryGuardCascade` to embed under both guards' failure arms -- the
+  /// second embedding is a deep copy of the statement tree this returns, not
+  /// a second walk, so the blocks themselves are still claimed only once.
+  StmtPtr claimSharedFallbackBody(il::BlockId fallback, il::BlockId merge, unsigned depth);
 
   /// Loop speculation: a while loop when the header is a bare conditional, a
   /// do-while when the latch is.
@@ -181,6 +198,13 @@ class Structurizer {
   std::vector<il::BlockId> trail_;
   std::vector<il::BlockId> gotoTrail_;
   il::BlockId regionEnd_{};
+
+  /// See `StructuredFunction::matchedPatterns`: one entry per `CondBranch`
+  /// site actually claimed, appended right where `emitRegion` commits to
+  /// that pattern -- never speculatively, so a rolled-back attempt leaves no
+  /// trace here either, the same discipline `trail_`/`gotoTrail_` already
+  /// keep. Moved into the result once in `run()`.
+  std::vector<std::string_view> matchedPatterns_;
 
   // One-sided ifs require no shared merge point, so they are happy to claim
   // a block a real (postdominator-backed) diamond somewhere else would have
