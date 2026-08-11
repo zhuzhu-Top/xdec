@@ -686,3 +686,69 @@ insn stlxr {
     write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
   }
 }
+
+// ---------------------------------------------------------------------------
+// Loads and stores: compare and swap (LSE atomics)
+// ---------------------------------------------------------------------------
+//
+// Word and doubleword only: the byte/halfword forms (casb/cash) and the
+// paired form (casp) share this instruction class but are not modelled yet,
+// and fall through to simd.xspec's memory_unmodelled catch-all same as
+// before this existed. Like ldaxr/stlxr's reservation and status, what this
+// performs has no unconditional-load-then-store IL shape -- the store only
+// happens when the compare succeeds -- so it stays one intrinsic carrying
+// the address, the expected value and the new value in, and the old value
+// out, the same honest "named but opaque" treatment ldarb/stlrb give
+// acquire/release.
+insn cas {
+  encoding size:2 "0010001" "0" "1" Rs:5 "0" "11111" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "cas {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    // The checker matches a `write_gpr` value's width against the register
+    // width symbolically, not numerically, so the width given to
+    // `intrinsic_value` has to spell `32 << regwidth` the exact way
+    // `write_gpr`'s own reg-width argument does -- `8 << size` is the same
+    // number for size 2 or 3, but a different expression, and fails to unify.
+    let regwidth = size == 3 ? 1 : 0;
+    write_gpr(Rs, regwidth,
+              intrinsic_value("aarch64.cas", 32 << regwidth, read_gpr_sp(Rn, 1),
+                              read_gpr(Rs, regwidth), read_gpr(Rt, regwidth)));
+  }
+}
+
+insn casa {
+  encoding size:2 "0010001" "1" "1" Rs:5 "0" "11111" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "casa {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let regwidth = size == 3 ? 1 : 0;
+    write_gpr(Rs, regwidth,
+              intrinsic_value("aarch64.cas", 32 << regwidth, read_gpr_sp(Rn, 1),
+                              read_gpr(Rs, regwidth), read_gpr(Rt, regwidth)));
+  }
+}
+
+insn casl {
+  encoding size:2 "0010001" "0" "1" Rs:5 "1" "11111" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "casl {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let regwidth = size == 3 ? 1 : 0;
+    write_gpr(Rs, regwidth,
+              intrinsic_value("aarch64.cas", 32 << regwidth, read_gpr_sp(Rn, 1),
+                              read_gpr(Rs, regwidth), read_gpr(Rt, regwidth)));
+  }
+}
+
+insn casal {
+  encoding size:2 "0010001" "1" "1" Rs:5 "1" "11111" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "casal {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let regwidth = size == 3 ? 1 : 0;
+    write_gpr(Rs, regwidth,
+              intrinsic_value("aarch64.cas", 32 << regwidth, read_gpr_sp(Rn, 1),
+                              read_gpr(Rs, regwidth), read_gpr(Rt, regwidth)));
+  }
+}

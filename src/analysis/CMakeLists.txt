@@ -1,5 +1,6 @@
 xdec_add_library(xdec_analysis
   SOURCES
+    atomic_exclusive.cpp
     call_target.cpp
     dispatcher_shape.cpp
     dominators.cpp
@@ -9,14 +10,19 @@ xdec_add_library(xdec_analysis
     import_callee.cpp
     jump_table.cpp
     live_register_frame.cpp
+    load_inline.cpp
     loops.cpp
     noreturn.cpp
     plt_stub.cpp
     profile.cpp
     reachability.cpp
     scc.cpp
+    emit_redundancy.cpp
     stack_frame.cpp
+    stack_load_fold.cpp
+    stack_store_fold.cpp
     typed_variables.cpp
+    value_uses.cpp
     variables.cpp
   DEPS
     xdec_il

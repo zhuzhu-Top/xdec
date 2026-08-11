@@ -177,6 +177,48 @@ void elideFallthroughGotos(StmtPtr& node, il::BlockId next) {
   }
 }
 
+/// Turns a `Goto` to `exit` into a `Break`, wherever it sits in a loop's own
+/// body without crossing into a nested loop's or switch's control -- a plain
+/// `break;` there would leave that inner construct rather than reach `exit`,
+/// so those are left as the `goto`/label pair they already are. Applied right
+/// after a loop pattern closes with `exit` as its proven, single successor
+/// (see Structurizer::tryLoop): a body branch that already reaches it is not
+/// telling the reader anything a `break` wouldn't, and every predecessor of
+/// `exit` besides the loop itself already keeps its own path there uneffected
+/// -- this only ever rewrites gotos this exact loop's body owns.
+///
+/// `block` is left set on the resulting `Break`, unlike a dispatcher case's
+/// (see Stmt::epilogue): the loop's `exit` still has copies to print for
+/// whichever edge just took it, exactly as its `Goto` would have, and
+/// `StmtPrinter` reads it right back off for that (see printStmt's `Break`
+/// case).
+void rewriteLoopExitToBreak(StmtPtr& node, il::BlockId exit) {
+  if (!node || !exit.valid()) {
+    return;
+  }
+  switch (node->kind) {
+    case StmtKind::Goto:
+      if (node->block == exit) {
+        node->kind = StmtKind::Break;
+      }
+      return;
+    case StmtKind::Sequence:
+      for (StmtPtr& item : node->items) {
+        rewriteLoopExitToBreak(item, exit);
+      }
+      return;
+    case StmtKind::If:
+      rewriteLoopExitToBreak(node->thenArm, exit);
+      rewriteLoopExitToBreak(node->elseArm, exit);
+      return;
+    default:
+      // A nested While/DoWhile has its own exit, and a nested Switch's cases
+      // end with their own Break bound to their own epilogue -- neither is
+      // this loop's to rewrite.
+      return;
+  }
+}
+
 /// Every block the finished tree still names, as opposed to reaching by falling
 /// into it. Only a `goto` and a `switch` case name one, so this is the whole of
 /// what needs a label — a block with several predecessors that all fall into it
@@ -579,6 +621,7 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
           stmt->body = std::move(body);
           mark(header);
           regionEnd_ = exit;
+          rewriteLoopExitToBreak(stmt->body, exit);
           result = std::move(stmt);
         } else {
           rollback(snapshot, gotoSnapshot);
@@ -635,6 +678,7 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
         stmt->invertCond = backArm == 1;
         stmt->body = std::move(body);
         regionEnd_ = exit;
+        rewriteLoopExitToBreak(stmt->body, exit);
         result = std::move(stmt);
       } else {
         rollback(snapshot, gotoSnapshot);
@@ -724,6 +768,7 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
         stmt->invertCond = backArm == 1;
         stmt->body = std::move(fullBody);
         regionEnd_ = headerExit;
+        rewriteLoopExitToBreak(stmt->body, headerExit);
         result = std::move(stmt);
         break;
       }

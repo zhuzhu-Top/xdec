@@ -142,7 +142,8 @@ class Assembler {
     for (std::size_t index = 0; index < byIndex.size(); ++index) {
       out += index == 0 ? "" : ", ";
       if (byIndex[index] == nullptr) {
-        out += std::format("uint64_t a{} /* unused */", index);
+        out += std::format("uint64_t {} /* unused */",
+                           ctx_.positionalArgumentName(static_cast<int>(index)));
         continue;
       }
       out += std::format("{} {}", byIndex[index]->type.format(),
@@ -177,7 +178,7 @@ class Assembler {
       if (paramName.empty()) {
         paramName = index < byIndex.size() && byIndex[index] != nullptr
                         ? ctx_.argumentName(*byIndex[index])
-                        : std::format("a{}", index);
+                        : ctx_.positionalArgumentName(static_cast<int>(index));
       }
       out += printed++ == 0 ? "" : ", ";
       const bool inRegisters = ctx_.binder()->registerShaped(param.type);
@@ -189,7 +190,8 @@ class Assembler {
     for (std::size_t index = proto.params.size(); index < byIndex.size(); ++index) {
       out += printed++ == 0 ? "" : ", ";
       if (byIndex[index] == nullptr) {
-        out += std::format("uint64_t a{} /* unused */", index);
+        out += std::format("uint64_t {} /* unused */",
+                           ctx_.positionalArgumentName(static_cast<int>(index)));
         continue;
       }
       out += std::format("{} {} /* beyond the prototype */",
@@ -218,6 +220,12 @@ class Assembler {
       // An aliased local is a field of the struct declared at its base delta
       // (see applyImportedTypes) and gets no declaration of its own.
       if (local->aliasBase.has_value()) {
+        continue;
+      }
+      // Every write to this slot is a dead spill (see
+      // analysis::findDeadStackStores): nothing in the body assigns or reads
+      // it, so there is nothing left for a declaration to name.
+      if (ctx_.deadLocalStackDeltas.contains(local->stackDelta)) {
         continue;
       }
       // A local a call or syscall site typed outranks the CType inference

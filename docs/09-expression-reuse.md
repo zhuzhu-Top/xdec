@@ -167,6 +167,155 @@ find every such pairing wherever it is nested, and the resulting set lives on
 unassigned temporary nor a dead assignment reaches the output. See
 `tests/emit/test_c_expr_reuse.cpp`'s resolved-jump-table-read case.
 
+## F. A single-use stack Load materialized as its own statement
+
+Not two sites sharing a computation at all — a *single* site, printed twice.
+`nameResultTemps` (`emit/c_printer.cpp`) materializes every `Load`'s result
+into a temporary unconditionally, on the theory that a use might be
+arbitrarily far away in the block. When the one reader turns out to be the
+very next op, and nothing between the two could have changed what the slot
+holds, the temporary buys nothing: the slot already has a name (the
+recovered local), and printing `tN = var_984; ...; f(tN);` says the same
+thing as `f(var_984);` in twice the space. `--reuse-report`'s own two
+decidable shapes (A/B above) do not catch this, because there is no second
+`ExprId` and no second `Load` to compare against — this is a single read
+whose *only* redundancy is emission's own unconditional naming, not
+anything about the IL.
+
+The concrete case this project hit: `0x2a2428`'s MBA body reads scores of
+stack slots exactly once each, immediately before using the value — the
+canonical shape a compiler's own register spill leaves behind on a big
+straight-line block. `385` occurrences of `tN = var_XXX;`, `42` of the
+pointer-typed variant `(*(T*)tN) = ...`, neither of which the exact-duplicate
+or re-`Load` detectors have any way to see, because there is exactly one
+`Load` op and exactly one reader of it — as minimal as SSA gets.
+
+**Fixed** by `analysis::findFoldableStackLoads`
+(`analysis/stack_load_fold.h`/`.cpp`), an emit-layer prepass rather than an
+IL rewrite (see that header's own note on why: the `Load` is exactly the one
+memory read the machine code performs, so there is nothing to delete at the
+IL level, only a *printing* decision to make once safety is proven). It
+recognises every `Load` from a `StackSlot` address whose live readers (an
+op `deadOps` has not already excluded) are all in the same block, after the
+load, with nothing in between able to have clobbered the slot; `CContext`
+turns each finding into the slot's own printed text
+(`stackSlotLvalue`) and `ExprPrinter::value` substitutes it wherever a
+folded load's result would otherwise have read a temporary — see
+`docs/12-stack-load-fold.md` for the full rule set and its relationship to
+`stack_prop.cpp`'s store-to-load forwarding, which this deliberately does
+not duplicate. `0x2a2428`'s count dropped from 385 to 95 (the rest read a
+slot from a different block or write to it a second time before the next
+use — cases stack-load-fold's same-block/freshness rules correctly decline)
+and its pointer-typed variant from 42 to 1.
+
+## G. A single-use non-stack Load materialized as its own statement
+
+Shape F's own counterpart for a `Load` whose address is not a `StackSlot` —
+an argument-plus-offset field read, most often, or a fixed global. The same
+`nameResultTemps` unconditional naming applies, and the same single-site
+"one read, one reader, no second `ExprId` to compare against" shape holds:
+`t32 = (*(uint32_t*)(a1+0x18)); bswap32(t32)` says the same thing
+`bswap32(*(uint32_t*)(a1+0x18))` would in one line instead of two, whenever
+that one read has exactly one reader and nothing between them could have
+changed what it read.
+
+**Fixed** by `analysis::findFoldableMemoryLoads`
+(`include/xdec/analysis/load_inline.h`): the same live-reader/same-block/
+no-clobber rules as `findFoldableStackLoads`, minus the `StackSlot`
+restriction — `frame.mayAlias` already reasons about `Global` and `Other`
+addresses exactly as conservatively as it does a stack slot, so nothing
+about the freshness check needed to change. What differs from shape F is the
+substitution: a stack slot has a name fixed ahead of printing, but a
+`Global`/`Other` address does not, so `CContext` records just the address
+`ExprId` and width, and `ExprPrinter::value` re-renders the same
+`fieldAccess`/`globalName`/cast-dereference text `StmtPrinter::memoryLvalue`
+would have printed, at the load's one use instead of its own statement. One
+extra rule shape F does not need: a load consumed as *another* access's
+address (`isAddressOperand`) is excluded, because that is exactly the shape
+`fieldAccess` chains a struct pointer through by looking up a *name* for the
+base value (`n->next->value`) — folding it away would trade that name for
+raw pointer arithmetic. `0x2a2428`'s `t32` read by four different `switch`
+cases is unaffected either way: each read has its own reader in its own
+block, so each is judged (and folds) independently, never at function scope.
+
+## H. A CSE temporary immediately spilled to a stack local
+
+Not a re-derivation and not an orphaned read — a value the emitter already
+decided needs a name (a shared subexpression `ExprPrinter` materializes as
+`_cseN`, or an ordinary computed temp) gets copied into a stack local right
+after, and the local either never gets read again (H1) or is read back
+somewhere the copy could have been the local's *own* definition instead of a
+second line (H2):
+
+```c
+_cse8 = bswap32(t32);
+var_aa8 = _cse8;     // H1: var_aa8 has no other reader in the whole function
+```
+
+```c
+_cse9 = bswap32(t30);
+var_abc = _cse9;     // H2: var_abc is read later -- could have been var_abc = bswap32(t30) directly
+```
+
+H1 is the write-side mirror of shape F's read side: `nameResultTemps` and
+`printOp`'s `Store` case both print unconditionally on the same "a reader
+might be arbitrarily far away" assumption, and here the answer turns out to
+be "there is no reader at all." See `docs/13-stack-store-fold.md` for the
+fix (`analysis::findDeadStackStores`) and its metrics.
+
+H2 is not dead code — the local *is* read later — just an avoidable extra
+line. **Fixed** by `ExprPrinter::materializeAs`
+(`src/emit/c_expr.h`/`.cpp`): when a `Store`'s value operand is about to be
+named for the first time in the current scope (the same "referenced 2+
+times" test `materialized()` runs) and the store target is a plain,
+uncast local — `memoryLvalue`'s bare-name case, ruling out a field access,
+an aliased local, or a width mismatch, any of which print different text —
+the name it gets is the local's own (`var_X`) instead of a fresh `_cseN`,
+folding the two lines into `var_X = <expr>;`. Every later reference to that
+same shared node in the scope then reads `var_X` back from the cache
+`rootText`/`rootInteger`/`materialized` all already check, exactly as it
+would have read a `_cseN` — including, in `0x2a2428`, a large MBA sum
+materializing straight into `var_a0c = (...)`, which a *later* formula in
+the same scope then reads back as `rotr32(var_a1c, ...)` rather than through
+a second temp. See `docs/14-emit-redundancy.md`'s Phase 4 measurements.
+
+## I. CSE reference counts inflated by what H removes
+
+`ExprPrinter::beginScope`'s roots include every op's operands, an H1 dead
+store's included, before shape H's own fix is applied — so a node with
+exactly one real downstream use and one *dead* one (the spill) still counts
+as referenced twice and gets materialized as `_cseN` when, absent the dead
+store, it would simply have inlined into its one real use. Once `deadOps`
+excludes the dead store (see H1 above), `StmtPrinter::printBlock`'s existing
+root-collection loop already skips it — `if (ctx_.deadOps.contains(...))
+continue;` runs *before* `addExprRoots` — so this shape is not a separate
+mechanism to build, only a consequence of H1 to verify. Confirmed against
+`0x2a2428`: every `_cseN` this dead-store pass affects still had at least one
+other real reference (`_cse8`, `bswap32(t32)`, is shared by three other MBA
+lines besides the dead store), so removing the dead spill's own contribution
+never demotes a genuinely-shared node — see `docs/14-emit-redundancy.md`'s
+Phase 1/2 metrics for the confirming numbers.
+
+A second sub-shape, cross-scope duplication (the identical `_cseN` RHS
+recomputed in several mutually-exclusive `switch` cases, once per case) is
+section D's own non-goal wearing a `_cse` name instead of a raw expression —
+correct per-arm behaviour, not a bug, and addressed only optionally (see
+`docs/14-emit-redundancy.md`'s Phase 5) as a readability hoist, never as a
+correctness fix. `tools/emit_metrics.ps1`'s `duplicate_cse_rhs_groups`/
+`duplicate_cse_rhs_occurrences` size the opportunity by grouping `_cseN =
+<expr>;` lines on their literal printed RHS text — `0x2a2428` currently has
+19 such groups, 181 total occurrences — without attempting the per-site
+safety proof an actual hoist would need; see Phase 5's own note on why the
+hoist itself stays undone.
+
+## J. Dispatcher relay copies
+
+`x0_live = ...; x0_exit = x0_live` at a flattened dispatcher's hub/merge
+pair (`analysis::LiveRegisterFrame`, `docs/0?`) is its own shape, already
+tracked and partly reduced by that analysis's own passthrough detection —
+listed here only for completeness of the taxonomy's letter range, not as new
+work this document's phases claim.
+
 ## Using the report
 
 ```

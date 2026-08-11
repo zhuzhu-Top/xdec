@@ -69,6 +69,59 @@
       }
     },
     {
+      "name": "eval_atomic_llsc",
+      "category": "atomic",
+      "source": "uint32_t eval_atomic_llsc(uint32_t* p, uint32_t expected, uint32_t desired) -- hand-written ldaxr/stlxr compare-and-swap loop",
+      "comment": "ldaxr/stlxr split into a reservation-plus-load and a store-plus-status pair in the IL (specs/arm64/loadstore.xspec); left unfused that is four lines indistinguishable from unrelated loads and stores. The emitter's peephole (analysis::findExclusiveLoads/findExclusiveStores) reassembles each pair into one __ldaxr32/__stlxr32 call.",
+      "expect": {
+        "min_loops": 1,
+        "max_gotos": 0,
+        "patterns": [
+          "__ldaxr32(",
+          "__stlxr32(",
+          "break"
+        ],
+        "forbid_patterns": [
+          "reserve",
+          "store_exclusive_status",
+          "__xdec_intrin_aarch64",
+          "goto L_"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "ptr",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
+      "name": "eval_atomic_cas",
+      "category": "atomic",
+      "source": "uint32_t eval_atomic_cas(uint32_t* p, uint32_t expected, uint32_t desired) -- hand-written casal",
+      "comment": "casal has no unconditional-load-then-store shape -- the store only happens when the compare succeeds -- so specs/arm64/loadstore.xspec's cas/casa/casl/casal rules lift it as one intrinsic_value, and printCas expands that back into the logical (non-atomic) load/compare/store sequence a reader of the disassembly would write by hand. The address stays a plain 64-bit value in baseline rather than a recovered pointer: unlike eval_atomic_llsc's arg1, which flows into __ldaxr32/__stlxr32's own uint32_t* prototype, printCas's address is only ever cast at its dereference, so there is no prototyped call for apply_types to infer a pointer from.",
+      "expect": {
+        "max_gotos": 0,
+        "patterns": [
+          "logical compare-and-swap"
+        ],
+        "forbid_patterns": [
+          "aarch64\\.cas",
+          "__xdec_intrin_aarch64"
+        ],
+        "signature": {
+          "return": "32",
+          "params": [
+            "64",
+            "32",
+            "32"
+          ]
+        }
+      }
+    },
+    {
       "name": "eval_abs",
       "category": "conditional",
       "source": "int32_t eval_abs(int32_t x)",

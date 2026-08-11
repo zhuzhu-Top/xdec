@@ -74,13 +74,18 @@ flowchart LR
   LIFT --> LOCAL["局部化简\nMBA + copyprop"]
   LOCAL --> RESOLVE["间接分支解析\n跳转表"]
   RESOLVE --> SSA["SSA 构建\n+ 优化"]
-  SSA --> VARS["变量恢复\n+ 类型应用"]
+  SSA --> VARS["变量恢复\n+ 类型应用\n+ 栈槽指针提升"]
   VARS --> STRUCT["结构化\nif/while/switch"]
-  STRUCT --> EMIT["C 输出"]
+  STRUCT --> ERE["ERE 预扫描\ndead spill + load 内联"]
+  ERE --> EMIT["C 输出\n+ store/CSE 合并"]
   EMIT --> OUT["*.c + xdec_helpers.h"]
 ```
 
 **Driver**（`decompile/driver.cpp`）以不动点循环运行 lift → simplify → resolve：每轮解析出的新分支可能暴露更多代码，继续提升与化简，直到收敛或达到轮次上限。
+
+**stack-load-fold**（`analysis/stack_load_fold.h`，见 `docs/12-stack-load-fold.md`）不是流水线里的独立 pass，而是 VARS 与 EMIT 两处共用的一份分析：识别只被同一 block 内、load 之后、没有中间写入的单次读者消费的栈槽 `Load`，EMIT 阶段把它折叠成直接打印槽位变量名，VARS 阶段在该读者是地址操作数时把槽位本身提升为指针类型。
+
+**ERE**（Emit Redundancy Elimination，见 `docs/14-emit-redundancy.md`）是 `CContext` 构造阶段跑的一组预扫描，在打印真正开始前把每种"打印出来是冗余的"发现都归到三个字段之一（`deadOps` 整句不打印、`inlinedStackLoads`/`inlinedMemoryLoads` 用固定文本替换临时量、`deadLocalStackDeltas` 不声明整条已死的局部）：栈槽/非栈地址的单读 `Load` 内联（`stack_load_fold.h`/`load_inline.h`）、写了从不读的死 spill store（`stack_store_fold.h`）。唯一不挂在 `CContext` 上的一环是 `ExprPrinter::materializeAs`（H2，写端 CSE 合并）——是否需要给一个节点命名是打印时按 scope 做的引用计数决定的，不是预扫描能提前算出的 IL 事实，所以它直接改写 `ExprPrinter` 自己的命名逻辑，而不是往 `CContext` 上再加一个字段。
 
 ---
 

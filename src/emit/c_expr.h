@@ -7,6 +7,7 @@
 // silently performs it unsigned.
 #pragma once
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,6 +26,17 @@ class ExprPrinter {
   /// The expression in a context that does integer arithmetic on it: a
   /// recovered pointer variable is cast back to an integer first.
   [[nodiscard]] std::string integerOperand(il::ExprId id);
+
+  /// The expression as a pointer to `width` bits, for a context that takes
+  /// the address itself rather than dereferencing it -- an ACLE atomic call
+  /// is the first such case (see c_stmt.cpp's Load/Store/Intrinsic
+  /// handling). Bare when the expression is already declared as a pointer
+  /// (an argument, a typed field): unlike `integerOperand`, this is not
+  /// arithmetic on the value, so there is no reason to round-trip it
+  /// through `(uint64_t)` first. Cast through `width`'s own pointer type
+  /// otherwise, the same as `integerOperand`'s plain text would be cast by
+  /// whatever dereferences it.
+  [[nodiscard]] std::string pointerOperand(il::ExprId id, uint32_t width);
 
   // -- root contexts ---------------------------------------------------------
   //
@@ -78,6 +90,25 @@ class ExprPrinter {
   void extendScope(const std::vector<il::ExprId>& moreRoots);
   [[nodiscard]] std::vector<std::string> takePendingDecls();
 
+  /// For a `Store`'s own value operand (see `c_stmt.cpp`'s `Store` case,
+  /// docs/09 shape H2): if `id` is about to be named for the first time in
+  /// this scope (shared, and not already materialized under some other
+  /// name), names it `preferredName` instead of a fresh `_cseN` and returns
+  /// the text that would have been its initializer, so the caller can print
+  /// `preferredName = <text>;` directly rather than `_cseN = <text>;`
+  /// followed by a second line copying `_cseN` into the local. Any later
+  /// reference to the same node in this scope then reads `preferredName`
+  /// straight from the cache `materialized()`/`rootText()`/`rootInteger()`
+  /// all check first, the same way a `_cseN` name would have been reused.
+  ///
+  /// Returns `std::nullopt` in the two cases where renaming would be wrong
+  /// or pointless: `id` was already materialized by an earlier statement in
+  /// this scope (that statement already printed the name it got, which
+  /// cannot be retroactively changed), or `id` is not shared at all (it
+  /// would have printed inline, one line, with nothing to fold).
+  [[nodiscard]] std::optional<std::string> materializeAs(il::ExprId id,
+                                                          const std::string& preferredName);
+
   [[nodiscard]] CContext& context() noexcept { return ctx_; }
 
  private:
@@ -107,6 +138,15 @@ class ExprPrinter {
   /// so the conversion the root context performs widens it correctly on
   /// its own.
   [[nodiscard]] bool isRedundantRootZext(const il::Expr& expr) const;
+
+  /// `id`'s text for one side of an `==`/`!=` comparison, where
+  /// `comparedToZero` says the OTHER side is the literal 0. Zero-extension
+  /// never changes whether a value is zero, so `ZExt(x) == 0` reads exactly
+  /// as `x == 0` at `x`'s own width -- the one comparison outcome that does
+  /// not depend on the width `compare()`'s cast would otherwise assert.
+  /// Every other comparison (against a non-zero constant, or between two
+  /// live values) really does depend on it, so this only unwraps here.
+  [[nodiscard]] std::string equalityOperand(il::ExprId id, bool comparedToZero);
 
   /// Adds `root` and everything under it to `referenceCounts_`, without
   /// walking a node's operands more than once regardless of how many

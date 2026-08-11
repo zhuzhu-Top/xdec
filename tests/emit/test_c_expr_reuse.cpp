@@ -99,17 +99,32 @@ TEST_CASE(
   const il::OpId brind =
       f.function.appendIndirectBranch(f.entry, 0x1008, f.function.valueRef(loaded));
   f.function.setTargets(brind, std::vector<BlockId>{target0, target1, target2});
-  f.function.appendReturn(target0, 0x2000);
+  // A real dispatcher loop closes back around and reads its state slot again
+  // at the top of the next iteration; model that one loop-carried read (here
+  // simply forwarded to a global) so the state store stays observable --
+  // otherwise findDeadStackStores (correctly) folds the store away, leaving
+  // only one real reference to `flag` and nothing left to materialize.
+  const il::ValueId reread =
+      f.function.appendLoad(target0, 0x2000, Type::integer(64), f.slot(-0x10));
+  f.function.appendStore(target0, 0x2004, Type::integer(64), f.i64(0x9000),
+                         f.function.valueRef(reread));
+  f.function.appendReturn(target0, 0x2008);
   f.function.appendReturn(target1, 0x3000);
   f.function.appendReturn(target2, 0x4000);
 
   const std::string text = f.emit();
   INFO(text);
-  // One CSE temp declared, one assignment to it -- not one per scope.
-  CHECK(occurrences(text, "_cse0") >= 2);       // declaration + every use
-  CHECK(occurrences(text, "_cse0 = ") == 1);    // materialized exactly once
-  CHECK(occurrences(text, "_cse1") == 0);       // no second scope re-derived it
-  CHECK(occurrences(text, "switch (_cse0)") == 1);
+  // `flag` is shared across the whole function (the store, the switch's own
+  // discriminant, and the reread in target0), so it still materializes
+  // exactly once regardless of scope -- but as of the H2 store/CSE merge
+  // (docs/09, docs/14 Phase 4) that one materialization IS the store into
+  // `var_10` itself, not a separate `_cse0` the store then copies from: one
+  // assignment, computed once, and every other reference (the switch, the
+  // reread) just reads `var_10` back rather than introducing a `_cseN`.
+  CHECK(occurrences(text, "(arg1 + 0x1000)") == 1);
+  CHECK(occurrences(text, "var_10 = (arg1 + 0x1000);") == 1);
+  CHECK(occurrences(text, "switch (var_10)") == 1);
+  CHECK(occurrences(text, "_cse") == 0);
 }
 
 TEST_CASE(

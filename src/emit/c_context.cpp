@@ -6,7 +6,11 @@
 #include <format>
 
 #include "c_stmt.h"
+#include "xdec/analysis/atomic_exclusive.h"
 #include "xdec/analysis/import_callee.h"
+#include "xdec/analysis/load_inline.h"
+#include "xdec/analysis/stack_load_fold.h"
+#include "xdec/analysis/stack_store_fold.h"
 #include "xdec/analysis/typed_variables.h"
 #include "xdec/types/syscall_table.h"
 
@@ -40,6 +44,60 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
       // `options.names` -- see nameResolverOf in xdec_main.cpp.
       return options.names ? options.names(va) : types::BoundName{};
     });
+  }
+  // The ldaxr/stlxr fold: see analysis/atomic_exclusive.h. Joining deadOps
+  // here, before anything else below counts a live reference or decides
+  // what needs a declaration, keeps both ops out of that reasoning
+  // entirely -- exactly like every other fold in this constructor.
+  for (const auto& [loadIndex, exclusive] : analysis::findExclusiveLoads(function)) {
+    exclusiveLoads.insert(loadIndex);
+    deadOps.insert(exclusive.reserveOp.index());
+  }
+  for (const auto& [storeIndex, exclusive] : analysis::findExclusiveStores(function)) {
+    exclusiveStoreFor.emplace(exclusive.statusOp.index(), il::OpId{storeIndex});
+    deadOps.insert(storeIndex);
+  }
+  // Stack-load-fold: a Load this analysis proves reads a slot with exactly
+  // one downstream reader, nothing between the two able to have changed what
+  // the slot holds. Its own statement joins `deadOps` (so neither a
+  // temporary nor an assignment to it is ever printed) and its result is
+  // mapped to the slot's own text, substituted wherever that one reader
+  // would otherwise have read the temporary (see ExprPrinter::value).
+  for (const auto& [opIndex, load] : analysis::findFoldableStackLoads(function, frame, deadOps)) {
+    std::string text = stackSlotLvalue(load.delta, load.width);
+    if (text.empty()) {
+      continue;  // no local recovered at this slot; leave the ordinary temp path
+    }
+    const analysis::Variable* local = variables.localAt(load.delta);
+    const bool pointer = local != nullptr && local->type.pointerDepth > 0;
+    inlinedStackLoads.emplace(function.op(il::OpId{opIndex}).result.index(),
+                              InlinedStackLoad{std::move(text), pointer});
+    deadOps.insert(opIndex);
+  }
+  // Load-inline: the same fold as stack-load-fold above, for a Load whose
+  // address is a Global or an Other (e.g. argument-plus-offset) address
+  // rather than a stack slot. There is no name to substitute ahead of time
+  // here, so ExprPrinter::value re-renders the dereference itself; this
+  // loop only needs to mark the load dead and record what to re-render.
+  for (const auto& [opIndex, load] : analysis::findFoldableMemoryLoads(function, frame, deadOps)) {
+    inlinedMemoryLoads.emplace(function.op(il::OpId{opIndex}).result.index(),
+                               InlinedMemoryLoad{load.address, load.width});
+    deadOps.insert(opIndex);
+  }
+  // Stack-store-fold: a Store through a slot nothing in the function ever
+  // reads back and whose address never escapes (see stack_store_fold.h).
+  // Joining `deadOps` here, before `StmtPrinter::printBlock` ever collects a
+  // scope's CSE roots, is what lets a dead spill's own contribution to a
+  // shared subexpression's reference count disappear along with the
+  // statement -- see docs/09 shape I1.
+  for (const uint32_t opIndex : analysis::findDeadStackStores(function, frame, variables)) {
+    deadOps.insert(opIndex);
+    // findDeadStackStores proves a whole slot dead, never just one of
+    // several stores to it (every write to a delta it never reads back is
+    // dead together, see the header), so every dead Store's own delta is a
+    // local with nothing left in the body to justify declaring.
+    const auto operands = function.operands(function.op(il::OpId{opIndex}));
+    deadLocalStackDeltas.insert(frame.classify(operands[0]).delta);
   }
 }
 
@@ -315,12 +373,19 @@ types::TypeId CContext::functionReturnType() const {
 std::string CContext::argumentName(const analysis::Variable& variable) const {
   const types::TypeEntry* proto = prototype();
   const int position = argumentPosition(variable);
-  if (proto == nullptr || position < 0 ||
-      static_cast<std::size_t>(position) >= proto->params.size()) {
-    return variable.name;
+  if (proto != nullptr && position >= 0 &&
+      static_cast<std::size_t>(position) < proto->params.size()) {
+    const std::string& declared = proto->params[static_cast<std::size_t>(position)].name;
+    if (!declared.empty()) {
+      return declared;
+    }
   }
-  const std::string& declared = proto->params[static_cast<std::size_t>(position)].name;
-  return declared.empty() ? variable.name : declared;
+  return position < 0 ? variable.name : positionalArgumentName(position);
+}
+
+std::string CContext::positionalArgumentName(int position) const {
+  return options.indexedArgumentNames ? std::format("arg{}", position + 1)
+                                      : std::format("a{}", position);
 }
 
 std::string CContext::localFieldAccess(int64_t delta, uint32_t width) const {
@@ -350,6 +415,34 @@ std::string CContext::localFieldAccess(int64_t delta, uint32_t width) const {
     path += path.empty() ? name : "." + name;
   }
   return std::format("{}.{}", local->name, path);
+}
+
+std::string CContext::stackSlotLvalue(int64_t delta, uint32_t width) const {
+  if (std::string field = localFieldAccess(delta, width); !field.empty()) {
+    return field;
+  }
+  const analysis::Variable* local = variables.localAt(delta);
+  if (local == nullptr) {
+    return {};
+  }
+  if (local->aliasBase.has_value()) {
+    // An aliased local has no declaration of its own (see c_printer.cpp's
+    // declarations), so an access at some other width than the field it
+    // stands for has to be reached through the base struct's address rather
+    // than by name.
+    const analysis::Variable* base = variables.localAt(*local->aliasBase);
+    return base == nullptr ? std::string{}
+                           : std::format("(*({}*)((uint8_t*)&{} + {}))", intType(width),
+                                          base->name, delta - *local->aliasBase);
+  }
+  if (local->type.width == width) {
+    // Bare name whether or not the slot has been recognised as a pointer
+    // (see analysis::VariableTable's stack-slot pointer refinement): a
+    // pointer-typed local read at its own width already denotes the address
+    // it holds, no deref-through-cast needed.
+    return local->name;
+  }
+  return std::format("(*({}*)(&{}))", intType(width), local->name);
 }
 
 std::string CContext::addressOfLocal(il::ExprId address) const {

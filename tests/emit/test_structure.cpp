@@ -186,10 +186,12 @@ TEST_CASE("a loop header that can also exit before the body becomes a "
   // One if for the header's own early exit; the loop's own condition lives
   // on the DoWhile node, not as a second If.
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 1);
-  // The early exit is a labelled goto (a real jump out of the loop's
-  // middle); nothing else needed one.
-  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 1);
-  CHECK(result.isLabeled(exit));
+  // The early exit lands on exactly the block the loop already falls into
+  // once it is done, so it reads as a `break` -- not a jump to a label two
+  // lines below the loop.
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Break) == 1);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  CHECK_FALSE(result.isLabeled(exit));
 }
 
 TEST_CASE("a do-while latch's real exit block is not lost behind a nested inner loop",

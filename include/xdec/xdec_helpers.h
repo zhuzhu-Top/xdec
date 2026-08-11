@@ -262,4 +262,26 @@ double xdec_fdiv64(double a, double b);
 float xdec_fneg32(float a);
 double xdec_fneg64(double a);
 
+/* ---- AArch64 exclusive-access load/store ----
+ * ldaxr/stlxr split into a reservation-plus-load and a store-plus-status in
+ * this project's IL (see specs/arm64/loadstore.xspec), because the
+ * reservation an exclusive load sets and the status an exclusive store's
+ * write keeps or loses are not data the IL's ordinary Load/Store model. The
+ * emitter reassembles the split pair into the one call it always was (see
+ * c_context.cpp's exclusiveLoads/exclusiveStoreFor). These names and
+ * signatures are the Arm C Language Extensions (ACLE) exclusive-access
+ * intrinsics; an embedder maps them straight to the target's own
+ * ldaxr{b,h,,}/stlxr{b,h,,} instructions, or to C11 atomics with acquire/
+ * release ordering.
+ */
+uint8_t __ldaxr8(uint8_t* ptr);
+uint16_t __ldaxr16(uint16_t* ptr);
+uint32_t __ldaxr32(uint32_t* ptr);
+uint64_t __ldaxr64(uint64_t* ptr);
+
+uint32_t __stlxr8(uint8_t value, uint8_t* ptr);
+uint32_t __stlxr16(uint16_t value, uint16_t* ptr);
+uint32_t __stlxr32(uint32_t value, uint32_t* ptr);
+uint32_t __stlxr64(uint64_t value, uint64_t* ptr);
+
 #endif  // XDEC_HELPERS_H

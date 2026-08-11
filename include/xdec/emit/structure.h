@@ -35,9 +35,15 @@ enum class StmtKind : uint8_t {
   Switch,    // index expr (table mode) or target expr (chain mode); cases
   Goto,      // `block` is the target
   Continue,  // back edge to the enclosing loop's header, which is `block`
-  Break,     // exits the nearest switch; a dispatcher case's own back edge
-             // to the switch's shared tail (see Stmt::epilogue) prints this
-             // way instead of a `goto` to it
+  Break,     // exits the nearest switch or loop. A dispatcher case's own back
+             // edge to the switch's shared tail (see Stmt::epilogue) prints
+             // this way instead of a `goto` to it, `block` left invalid. A
+             // loop body's own edge to the loop's exit block does the same
+             // once that block is proven to be exactly where control already
+             // falls once the loop is done (see Structurizer::tryLoop) --
+             // there `block` is kept (as a plain `Goto` leaving it would be)
+             // solely so the exit's edge copies still print here, ahead of
+             // the `break;` they belong to.
 };
 
 struct Stmt;

@@ -81,7 +81,7 @@ TEST_CASE("sign extension goes through the source width's signed type",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((int64_t)(int32_t)(((uint32_t)(a0))))"));
+  CHECK(contains(text, "((int64_t)(int32_t)(arg1))"));
 }
 
 TEST_CASE("sign extension from one bit negates the condition", "[emit][expr]") {
@@ -92,7 +92,7 @@ TEST_CASE("sign extension from one bit negates the condition", "[emit][expr]") {
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "(-((int64_t)((a0 == 0x0))))"));
+  CHECK(contains(text, "(-((int64_t)((arg1 == 0x0))))"));
 }
 
 TEST_CASE("a one-bit not is logical, not bitwise", "[emit][expr]") {
@@ -104,7 +104,7 @@ TEST_CASE("a one-bit not is logical, not bitwise", "[emit][expr]") {
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "(!((a0 == 0x0)))"));
+  CHECK(contains(text, "(!((arg1 == 0x0)))"));
   CHECK(!contains(text, "~"));
 }
 
@@ -118,8 +118,9 @@ TEST_CASE("a wide not stays bitwise and wraps to its width", "[emit][expr]") {
   INFO(text);
   // No outer cast: `int`/`uint32_t` already share a rank, so `~` on an
   // already-uint32_t operand wraps to 32 bits on its own, with no
-  // promotion for a cast to undo.
-  CHECK(contains(text, "(~(((uint32_t)(a0))))"));
+  // promotion for a cast to undo. `arg1` is declared uint32_t itself, so
+  // the inner cast Trunc would otherwise add is redundant too.
+  CHECK(contains(text, "(~(arg1))"));
 }
 
 TEST_CASE("a zero-extension assigned straight to a store drops its cast",
@@ -134,8 +135,8 @@ TEST_CASE("a zero-extension assigned straight to a store drops its cast",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "= ((uint8_t)(a0));"));
-  CHECK(!contains(text, "(uint64_t)(((uint8_t)(a0)))"));
+  CHECK(contains(text, "= arg1;"));
+  CHECK(!contains(text, "(uint64_t)(arg1)"));
 }
 
 TEST_CASE("a zero-extension embedded in another operator keeps its cast",
@@ -153,7 +154,7 @@ TEST_CASE("a zero-extension embedded in another operator keeps its cast",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "(uint64_t)(((uint8_t)(a0)))"));
+  CHECK(contains(text, "(uint64_t)(arg1)"));
 }
 
 TEST_CASE("a shift forces its shifted operand to the shift's own width",
@@ -170,7 +171,7 @@ TEST_CASE("a shift forces its shifted operand to the shift's own width",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((uint64_t)(((uint32_t)(a0)))) << 0x28"));
+  CHECK(contains(text, "((uint64_t)(arg1)) << 0x28"));
 }
 
 TEST_CASE("a shift already at its own width adds no extra cast",
@@ -180,7 +181,7 @@ TEST_CASE("a shift already at its own width adds no extra cast",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "(a0 << 0x5)"));
+  CHECK(contains(text, "(arg1 << 0x5)"));
 }
 
 TEST_CASE("a signed comparison casts both operands", "[emit][expr]") {
@@ -195,8 +196,38 @@ TEST_CASE("a signed comparison casts both operands", "[emit][expr]") {
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text,
-                 "((int32_t)(((uint32_t)(a0))) < (int32_t)(((uint32_t)(a1))))"));
+  CHECK(contains(text, "((int32_t)(arg1) < (int32_t)(arg2))"));
+}
+
+TEST_CASE("a zero-extended value compared to zero drops the cast",
+          "[emit][expr]") {
+  Fixture f;
+  // Zero-extension never changes whether a value is zero, so the ZExt this
+  // builds around an 8-bit value -- the shape a byte load compared at a
+  // wider width gets -- is exactly the cast a `== 0`/`!= 0` comparison does
+  // not need: `byte == 0` already means what `(uint32_t)(byte) == 0` does.
+  const ExprId narrow =
+      f.function.cast(ExprOp::Trunc, Type::integer(8), f.entryReg("x0"));
+  const ExprId widened = f.function.cast(ExprOp::ZExt, Type::integer(32), narrow);
+  f.observe(f.function.binary(ExprOp::CmpEq, widened, f.i64(0)), 8);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "(arg1 == 0x0)"));
+  CHECK(!contains(text, "(uint32_t)"));
+}
+
+TEST_CASE("a zero-extended value compared to a nonzero constant keeps the cast",
+          "[emit][expr]") {
+  Fixture f;
+  const ExprId narrow =
+      f.function.cast(ExprOp::Trunc, Type::integer(8), f.entryReg("x0"));
+  const ExprId widened = f.function.cast(ExprOp::ZExt, Type::integer(32), narrow);
+  f.observe(f.function.binary(ExprOp::CmpEq, widened, f.i64(5)), 8);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "((uint32_t)(arg1)) == 0x5)"));
 }
 
 TEST_CASE("signed division casts both operands", "[emit][expr]") {
@@ -205,7 +236,7 @@ TEST_CASE("signed division casts both operands", "[emit][expr]") {
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((int64_t)(a0) / (int64_t)(a1))"));
+  CHECK(contains(text, "((int64_t)(arg1) / (int64_t)(arg2))"));
 }
 
 TEST_CASE("an arithmetic shift casts only the shifted operand", "[emit][expr]") {
@@ -214,7 +245,7 @@ TEST_CASE("an arithmetic shift casts only the shifted operand", "[emit][expr]") 
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((int64_t)(a0) >> 0x3)"));
+  CHECK(contains(text, "((int64_t)(arg1) >> 0x3)"));
 }
 
 TEST_CASE("an untracked register reads and writes through a named variable",
@@ -244,7 +275,7 @@ TEST_CASE("a zero-extending register view writes the whole register",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "q0 = (uint128_t)(a0);"));
+  CHECK(contains(text, "q0 = (uint128_t)(arg1);"));
 }
 
 TEST_CASE("a bit rotate calls a real, defined helper", "[emit][expr]") {
@@ -260,8 +291,8 @@ TEST_CASE("a bit rotate calls a real, defined helper", "[emit][expr]") {
   // the body just pulls the header in and calls the short name.
   CHECK(contains(text, "#include \"xdec_helpers.h\""));
   CHECK(!contains(text, "static inline uint64_t rotr64"));
-  CHECK(contains(text, "rotr64(a0, 0x3f)"));
-  CHECK(contains(text, "rotl64(a1, 0x7)"));
+  CHECK(contains(text, "rotr64(arg1, 0x3f)"));
+  CHECK(contains(text, "rotl64(arg2, 0x7)"));
   CHECK(!contains(text, "__xdec_rotr64"));
   CHECK(!contains(text, "__xdec_rotl64"));
   CHECK(!contains(text, "rotr?"));
@@ -279,7 +310,7 @@ TEST_CASE("count-trailing-zeros is a labelled embedder stub, not a silent zero",
   // header is the one place an embedder needs to look to see the whole
   // list of stubs a decompiled body might call.
   CHECK(contains(text, "#include \"xdec_helpers.h\""));
-  CHECK(contains(text, "xdec_ctz64(a0)"));
+  CHECK(contains(text, "xdec_ctz64(arg1)"));
   CHECK(!contains(text, "__xdec_ctz64"));
   CHECK(!contains(text, "ctz?"));
 }
@@ -293,7 +324,7 @@ TEST_CASE("concat places the high operand above the low operand's width",
 
   const std::string text = f.emit();
   INFO(text);
-  CHECK(contains(text, "((uint64_t)(((uint32_t)(a1))) << 32) | (uint64_t)(((uint32_t)(a0)))"));
+  CHECK(contains(text, "((uint64_t)(arg2) << 32) | (uint64_t)(arg1)"));
 }
 
 TEST_CASE("a preserving register view writes through a masked insert",

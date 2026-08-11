@@ -8,6 +8,7 @@
 
 #include "xdec/analysis/dispatcher_shape.h"
 #include "xdec/analysis/live_register_frame.h"
+#include "xdec/analysis/stack_load_fold.h"
 #include "xdec/analysis/typed_variables.h"
 #include "xdec/types/database.h"
 
@@ -561,8 +562,16 @@ VariableTable VariableTable::recover(const il::Function& function,
     table.temps_.push_back(std::move(var));
   }
 
-  // Pointer refinement: an argument or temp used as the base of a memory
-  // address points somewhere; the widest access through it types the pointee.
+  // A stack slot stack-load-fold proved is read only to be used as another
+  // access's address (see analysis::findFoldableStackLoads) points somewhere
+  // just as surely as an argument or temp does; computed once, up front, so
+  // the loop below can treat it as one more base kind alongside those two.
+  const std::unordered_map<uint32_t, FoldableStackLoad> foldableLoads =
+      findFoldableStackLoads(function, frame, {});
+
+  // Pointer refinement: an argument, temp, or spilled-pointer slot used as
+  // the base of a memory address points somewhere; the widest access
+  // through it types the pointee.
   for (const il::OpId opId : scan.memoryOps_) {
     const il::Op& op = function.op(opId);
     const auto operands = function.operands(op);
@@ -583,6 +592,23 @@ VariableTable VariableTable::recover(const il::Function& function,
       if (const auto found = table.tempByValue_.find(value.index());
           found != table.tempByValue_.end()) {
         target = &table.temps_[found->second];
+      } else if (function.hasValue(value)) {
+        // A pointer a stack slot holds -- an out-parameter's address stashed
+        // in a spill, say -- points the slot at whatever this access reads
+        // through it, the same evidence an argument or temp base is
+        // promoted from just above. Restricted to a slot stack-load-fold
+        // already proved is read *only* for this (see FoldableStackLoad's
+        // own note), so a slot also read for its own value elsewhere is
+        // left a plain integer rather than mistyped.
+        const il::OpId definition = function.value(value).definition;
+        if (const auto load = definition.valid() ? foldableLoads.find(definition.index())
+                                                  : foldableLoads.end();
+            load != foldableLoads.end() && load->second.usedAsAddress) {
+          if (const auto localFound = table.localByDelta_.find(load->second.delta);
+              localFound != table.localByDelta_.end()) {
+            target = &table.locals_[localFound->second];
+          }
+        }
       }
     }
     if (target == nullptr) {

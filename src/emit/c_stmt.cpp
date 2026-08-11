@@ -2,8 +2,10 @@
 #include "c_stmt.h"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <set>
+#include <string_view>
 #include <vector>
 
 #include "xdec/analysis/import_callee.h"
@@ -50,6 +52,14 @@ std::string StmtPrinter::exprText(il::ExprId id, std::string& out) {
 
 std::string StmtPrinter::exprInt(il::ExprId id, std::string& out) {
   std::string result = expressions_.integerOperand(id);
+  for (const std::string& decl : expressions_.takePendingDecls()) {
+    line(out, decl);
+  }
+  return result;
+}
+
+std::string StmtPrinter::exprPointer(il::ExprId id, uint32_t width, std::string& out) {
+  std::string result = expressions_.pointerOperand(id, width);
   for (const std::string& decl : expressions_.takePendingDecls()) {
     line(out, decl);
   }
@@ -129,10 +139,16 @@ void StmtPrinter::printStmt(const StmtPtr& stmt, std::string& out) {
       line(out, "continue;");
       break;
     case StmtKind::Break:
-      // No pending edge to consume: unlike a goto or continue, a dispatcher
-      // case's `Break` names no block of its own -- the code it hands
-      // control to (the switch's epilogue) prints right where the switch
-      // itself sits, not somewhere this statement has to point at.
+      // A dispatcher case's `Break` names no block of its own -- the code it
+      // hands control to (the switch's epilogue) prints right where the
+      // switch itself sits, and nothing is left pending by the time
+      // claimDispatcherCaseBody appends one. A loop's own early-exit `Break`
+      // (see Structurizer::rewriteLoopExitToBreak) keeps the block its
+      // `Goto` would have named, solely so the edge it took still gets its
+      // copies printed here, exactly as the `goto` it replaced would have.
+      if (stmt->block.valid()) {
+        consumePending(stmt->block, out);
+      }
       line(out, "break;");
       break;
   }
@@ -236,6 +252,25 @@ void StmtPrinter::printWhile(const Stmt& stmt, std::string& out) {
   last_ = header;
 }
 
+std::string StmtPrinter::doWhileCondition(il::ExprId cond, bool invertCond, std::string& out) {
+  const il::Expr& e = ctx_.function.expr(cond);
+  bool negate = invertCond;
+  il::ExprId operand{};
+  uint64_t constant = 0;
+  if (e.op == il::ExprOp::CmpNe || e.op == il::ExprOp::CmpEq) {
+    if (ctx_.function.asConstant(e.operand(1), constant) && constant == 0) {
+      operand = e.operand(0);
+    } else if (ctx_.function.asConstant(e.operand(0), constant) && constant == 0) {
+      operand = e.operand(1);
+    }
+    if (operand.valid() && e.op == il::ExprOp::CmpEq) {
+      negate = !negate;
+    }
+  }
+  const std::string text = operand.valid() ? exprInt(operand, out) : assignedText(cond, out);
+  return negate ? std::format("!({})", text) : text;
+}
+
 /// `do { body } while (cond)`: the body contains the header and the latch, so
 /// the only edge without a home is the latch's back edge. It runs on the
 /// iterating path only, which in this shape means under the condition.
@@ -247,10 +282,7 @@ void StmtPrinter::printDoWhile(const Stmt& stmt, std::string& out) {
   printStmt(stmt.body, out);
   const il::BlockId latch = last_;
   expressions_.beginScope({stmt.cond});
-  std::string condition = assignedText(stmt.cond, out);
-  if (stmt.invertCond) {
-    condition = std::format("!({})", condition);
-  }
+  const std::string condition = doWhileCondition(stmt.cond, stmt.invertCond, out);
   if (header.valid() && !edgeCopies(latch, header).empty()) {
     line(out, std::format("if ({}) {{", condition));
     ++indent_;
@@ -758,8 +790,17 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
   switch (op.code) {
     case il::OpCode::Load: {
       const std::string* temp = ctx_.tempFor(op.result);
-      const std::string lvalue =
-          memoryLvalue(operands[0], op.type.bits(), out, op.result);
+      std::string lvalue;
+      if (ctx_.exclusiveLoads.contains(opId.index())) {
+        // ldaxr/ldxr, reassembled from the reserve+load pair specs/arm64/
+        // loadstore.xspec splits it into (see analysis::findExclusiveLoads):
+        // the reservation itself is dead, folded away with no line of its own.
+        const uint32_t width = op.type.bits();
+        ctx_.helpers.insert(std::format("ldaxr{}", width));
+        lvalue = std::format("__ldaxr{}({})", width, exprPointer(operands[0], width, out));
+      } else {
+        lvalue = memoryLvalue(operands[0], op.type.bits(), out, op.result);
+      }
       line(out, std::format("{} = {};", temp == nullptr ? "/*lost*/" : *temp, lvalue));
       break;
     }
@@ -770,10 +811,39 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       // The lvalue first, always: it can hoist a temporary of its own, and one
       // hoisted under a guard would be missing on the path that skips it.
       const std::string lvalue = memoryLvalue(operands[0], op.type.bits(), out);
-      const auto assign = [&lvalue](const std::string& arm) {
-        return std::format("{} = {};", lvalue, arm);
+      // A pointer-typed stack slot (see analysis::VariableTable's stack-slot
+      // pointer refinement) needs an explicit cast on what is stored into
+      // it: the IL's value is an ordinary integer computation, and C never
+      // implicitly converts one to the pointer type the declaration now
+      // carries.
+      std::string castPrefix;
+      const analysis::AddressInfo storeAddress = ctx_.frame.classify(operands[0]);
+      const analysis::Variable* storeLocal =
+          storeAddress.kind == analysis::AddressKind::StackSlot
+              ? ctx_.variables.localAt(storeAddress.delta)
+              : nullptr;
+      if (storeLocal != nullptr && storeLocal->type.pointerDepth > 0 &&
+          storeLocal->type.width == op.type.bits()) {
+        castPrefix = std::format("({})", storeLocal->type.format());
+      }
+      const auto assign = [&lvalue, &castPrefix](const std::string& arm) {
+        return std::format("{} = {}{};", lvalue, castPrefix, arm);
       };
       if (!printSelectAssign(operands[1], out, assign)) {
+        // H2 (docs/09, docs/14 Phase 4): a plain store into a named local
+        // (no pointer cast, `lvalue` exactly the local's own bare name --
+        // ruling out a field access, an aliased local, or a width mismatch,
+        // any of which give `memoryLvalue` different text) whose value is
+        // about to be materialized as a CSE temp for the first time in this
+        // scope folds `_cseN = <expr>; var_X = _cseN;` into one `var_X =
+        // <expr>;` -- the local already carries the name a fresh `_cseN`
+        // would have needed.
+        if (castPrefix.empty() && storeLocal != nullptr && lvalue == storeLocal->name) {
+          if (const auto initializer = expressions_.materializeAs(operands[1], lvalue)) {
+            line(out, assign(*initializer));
+            break;
+          }
+        }
         line(out, assign(assignedText(operands[1], out)));
       }
       break;
@@ -799,7 +869,7 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       printCall(op, out);
       break;
     case il::OpCode::Intrinsic:
-      printIntrinsic(op, out);
+      printIntrinsic(opId, op, out);
       break;
     case il::OpCode::Unimplemented:
       line(out, std::format("__xdec_unimplemented(\"{}\");",
@@ -996,9 +1066,19 @@ std::string StmtPrinter::calleeCast(const types::TypeEntry* callee,
   return out + ")";
 }
 
-void StmtPrinter::printIntrinsic(const il::Op& op, std::string& out) {
+void StmtPrinter::printIntrinsic(il::OpId opId, const il::Op& op, std::string& out) {
   if (ctx_.function.nameOf(op.payload) == passes::kSyscallIntrinsic &&
       printSyscall(op, out)) {
+    return;
+  }
+  if (ctx_.function.nameOf(op.payload) == "aarch64.store_exclusive_status" &&
+      printExclusiveStore(opId, op, out)) {
+    return;
+  }
+  if (ctx_.function.nameOf(op.payload) == "aarch64.cas" && printCas(op, out)) {
+    return;
+  }
+  if (ctx_.options.securityHintsAsComments && printSecurityHint(op, out)) {
     return;
   }
   const auto operands = ctx_.function.operands(op);
@@ -1088,29 +1168,79 @@ bool StmtPrinter::printSyscall(const il::Op& op, std::string& out) {
   return true;
 }
 
+bool StmtPrinter::printExclusiveStore(il::OpId opId, const il::Op& op, std::string& out) {
+  const auto found = ctx_.exclusiveStoreFor.find(opId.index());
+  if (found == ctx_.exclusiveStoreFor.end()) {
+    return false;
+  }
+  const il::Op& store = ctx_.function.op(found->second);
+  const auto storeOperands = ctx_.function.operands(store);
+  const uint32_t width = store.type.bits();
+  ctx_.helpers.insert(std::format("stlxr{}", width));
+  const std::string value = assignedText(storeOperands[1], out);
+  const std::string address = exprPointer(storeOperands[0], width, out);
+  const std::string call = std::format("__stlxr{}({}, {})", width, value, address);
+  if (const std::string* temp = ctx_.tempFor(op.result)) {
+    line(out, std::format("{} = {};", *temp, call));
+  } else {
+    line(out, call + ";");
+  }
+  return true;
+}
+
+bool StmtPrinter::printCas(const il::Op& op, std::string& out) {
+  const auto operands = ctx_.function.operands(op);
+  if (operands.size() != 3) {
+    // Not the shape specs/arm64/loadstore.xspec's cas/casa/casl/casal rules
+    // produce (address, expected, new) -- lifted without the ABI attached,
+    // say, the same caveat printSyscall makes for a bare svc.
+    return false;
+  }
+  const uint32_t width = op.type.bits();
+  const std::string address = exprPointer(operands[0], width, out);
+  const std::string expected = assignedText(operands[1], out);
+  const std::string desired = assignedText(operands[2], out);
+  const std::string* temp = ctx_.tempFor(op.result);
+  const std::string oldValue = temp == nullptr ? "/*lost*/" : *temp;
+  line(out, "/* logical compare-and-swap; not one atomic step in C */");
+  line(out, std::format("{} = *{};", oldValue, address));
+  line(out, std::format("if ({} == {}) {{", expected, oldValue));
+  ++indent_;
+  line(out, std::format("*{} = {};", address, desired));
+  --indent_;
+  line(out, "}");
+  return true;
+}
+
+bool StmtPrinter::printSecurityHint(const il::Op& op, std::string& out) {
+  const std::string_view name = ctx_.function.nameOf(op.payload);
+  const auto operands = ctx_.function.operands(op);
+  if (name == "aarch64.bti") {
+    uint64_t variant = 0;
+    if (operands.empty() || !ctx_.function.asConstant(operands[0], variant)) {
+      return false;
+    }
+    static constexpr std::array<std::string_view, 4> kVariants{"", " c", " j", " jc"};
+    line(out, std::format("/* BTI{} */", variant < kVariants.size() ? kVariants[variant] : ""));
+    return true;
+  }
+  if (name == "aarch64.pac.ia" || name == "aarch64.pac.ib") {
+    line(out, std::format("/* PAC: sign with key {} */", name.back() == 'a' ? 'A' : 'B'));
+    return true;
+  }
+  if (name == "aarch64.aut.ia" || name == "aarch64.aut.ib") {
+    line(out, std::format("/* PAC: authenticate with key {} */", name.back() == 'a' ? 'A' : 'B'));
+    return true;
+  }
+  return false;
+}
+
 std::string StmtPrinter::memoryLvalue(il::ExprId address, uint32_t width,
                                       std::string& out, il::ValueId result) {
   const analysis::AddressInfo info = ctx_.frame.classify(address);
   if (info.kind == analysis::AddressKind::StackSlot) {
-    if (std::string field = ctx_.localFieldAccess(info.delta, width); !field.empty()) {
-      return field;
-    }
-    if (const analysis::Variable* local = ctx_.variables.localAt(info.delta)) {
-      if (local->aliasBase.has_value()) {
-        // An aliased local has no declaration of its own (see
-        // c_printer.cpp's declarations), so an access at some other width
-        // than the field it stands for has to be reached through the base
-        // struct's address rather than by name.
-        const analysis::Variable* base = ctx_.variables.localAt(*local->aliasBase);
-        if (base != nullptr) {
-          return std::format("(*({}*)((uint8_t*)&{} + {}))", intType(width), base->name,
-                             info.delta - *local->aliasBase);
-        }
-      }
-      if (local->type.pointerDepth == 0 && local->type.width == width) {
-        return local->name;
-      }
-      return std::format("(*({}*)(&{}))", intType(width), local->name);
+    if (std::string text = ctx_.stackSlotLvalue(info.delta, width); !text.empty()) {
+      return text;
     }
   }
   // A field of a struct a header described, where one describes this access.
@@ -1118,15 +1248,31 @@ std::string StmtPrinter::memoryLvalue(il::ExprId address, uint32_t width,
     return field;
   }
   // A fixed address is a global, and prints as one where the image can say that
-  // much. The cast stays: the same global is read at several widths in this code,
-  // so a declaration cannot carry the type and the access has to.
+  // much. The cast usually stays: the same global is read at several widths in
+  // this code, so a declaration cannot carry the type and the access has to.
   uint64_t absolute = 0;
   if (ctx_.function.asConstant(address, absolute)) {
     if (const std::string* global = ctx_.globalName(absolute)) {
+      // Exception: a byte access against the untyped fallback declaration
+      // (globalDeclarations() falls back to `uint8_t NAME[]` precisely when no
+      // header binds this address) is already reading at the array's own
+      // element type. `NAME[0]` says that directly; `(*(uint8_t*)(NAME))`
+      // would only be undoing the very array-to-pointer decay it started
+      // from. A header-bound address may not be an array at all, so this
+      // stays only for the fallback declaration.
+      const types::TypeBinder* binder = ctx_.binder();
+      const bool headerTyped = binder != nullptr && binder->at(absolute).valid();
+      if (width == 8 && !headerTyped) {
+        return std::format("{}[0]", *global);
+      }
       return std::format("(*({}*)({}))", intType(width), *global);
     }
   }
-  return std::format("(*({}*)({}))", intType(width), assignedInt(address, out));
+  // A bare pointer (an argument, a typed field) needs no round trip through
+  // an integer just to be dereferenced: `exprPointer` already casts it where
+  // it is not one, the same cast `assignedInt` would have produced here, so
+  // nothing this could dereference is any less honest for skipping it.
+  return std::format("(*{})", exprPointer(address, width, out));
 }
 
 std::string StmtPrinter::registerRead(il::RegId reg) {

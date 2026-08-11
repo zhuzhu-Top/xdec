@@ -74,6 +74,13 @@ class StmtPrinter {
   void printIf(const Stmt& stmt, std::string& out);
   void printWhile(const Stmt& stmt, std::string& out);
   void printDoWhile(const Stmt& stmt, std::string& out);
+  /// A do-while condition of exactly `cmp.ne(x, 0)`/`cmp.eq(x, 0)` is a plain
+  /// truthiness test in disguise -- `while (status)` rather than `while
+  /// (status != 0x0)`, the way a human (or Binary Ninja) writes the same
+  /// latch check. `invertCond` is folded in as it would be for any other
+  /// condition; anything else prints exactly as `assignedText` always has.
+  [[nodiscard]] std::string doWhileCondition(il::ExprId cond, bool invertCond,
+                                             std::string& out);
   /// `openScope` is false only when `printStmt`'s Sequence handler has
   /// already folded this switch's discriminant into the CSE scope its
   /// immediately preceding paired block opened (see printBlock's
@@ -155,11 +162,27 @@ class StmtPrinter {
   /// remaining trace, same as any other dead op that never gets its own
   /// statement. False for every other Store, and then nothing is printed.
   [[nodiscard]] bool printFoldedImportStore(const il::Op& op, std::string& out);
-  void printIntrinsic(const il::Op& op, std::string& out);
+  void printIntrinsic(il::OpId opId, const il::Op& op, std::string& out);
   /// The `svc` intrinsic as a syscall. False when this op is not one, or when
   /// nothing is known about the number, and then nothing has been printed and
   /// the caller falls back to the generic intrinsic form.
   bool printSyscall(const il::Op& op, std::string& out);
+  /// `aarch64.store_exclusive_status` as `__stlxrN(value, ptr)`, reading the
+  /// address and value from the `Store` `ctx_.exclusiveStoreFor` pairs it
+  /// with (see analysis::findExclusiveStores). False when this op is not
+  /// one of those, and then nothing has been printed.
+  bool printExclusiveStore(il::OpId opId, const il::Op& op, std::string& out);
+  /// `aarch64.cas` as the compare-then-conditionally-store it names: `old =
+  /// *ptr; if (expected == old) *ptr = desired;`, with `old` also the op's
+  /// own result. False when this op is not one, or its operand count does
+  /// not match (see specs/arm64/loadstore.xspec's `cas`/`casa`/`casl`/
+  /// `casal` rules), and then nothing has been printed.
+  bool printCas(const il::Op& op, std::string& out);
+  /// A BTI or PAC/AUT hint as the block comment `COptions::securityHintsAsComments`
+  /// asks for (see specs/arm64/system.xspec): neither ever defines a value,
+  /// so a comment loses nothing a statement would have carried. False when
+  /// this op is not one of those, and then nothing has been printed.
+  bool printSecurityHint(const il::Op& op, std::string& out);
 
   /// A memory access as an lvalue: the local variable for a stack slot, a
   /// field of an imported struct where one describes the address, a typed
@@ -181,6 +204,10 @@ class StmtPrinter {
   // that first needs it, instead of duplicated inline.
   [[nodiscard]] std::string exprText(il::ExprId id, std::string& out);
   [[nodiscard]] std::string exprInt(il::ExprId id, std::string& out);
+  /// Like exprText/exprInt, for an address handed to something that itself
+  /// takes a pointer rather than dereferencing it (see
+  /// ExprPrinter::pointerOperand).
+  [[nodiscard]] std::string exprPointer(il::ExprId id, uint32_t width, std::string& out);
 
   /// Like exprText/exprInt, but for a call site that hands the WHOLE value
   /// to a genuine C conversion -- a plain assignment, a return, an

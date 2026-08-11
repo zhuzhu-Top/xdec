@@ -18,6 +18,17 @@ std::string ExprPrinter::integerOperand(il::ExprId id) {
   return operand.text;
 }
 
+std::string ExprPrinter::pointerOperand(il::ExprId id, uint32_t width) {
+  const Text operand = value(id);
+  if (operand.pointer) {
+    return operand.text;
+  }
+  // A C-style cast already binds tighter than dereference or a call's comma,
+  // the two contexts this is used in, so no outer parens are needed to keep
+  // `*{result}` or `f({result})` reading the way the cast alone would.
+  return std::format("({}*)({})", intType(width), operand.text);
+}
+
 bool ExprPrinter::isRedundantRootZext(const il::Expr& expr) const {
   return expr.op == il::ExprOp::ZExt &&
          ctx_.function.expr(expr.operand(0)).type.isScalarInteger();
@@ -83,6 +94,35 @@ ExprPrinter::Text ExprPrinter::value(il::ExprId id) {
     if (const auto snapshot = ctx_.snapshots.find(valueId.index());
         snapshot != ctx_.snapshots.end()) {
       return {snapshot->second, false};
+    }
+    // A load stack-load-fold proved has exactly one reader, this one: its
+    // own statement never printed (see CContext's constructor and
+    // `deadOps`), so what would have been its temporary reads the slot's
+    // own text directly instead.
+    if (const auto inlined = ctx_.inlinedStackLoads.find(valueId.index());
+        inlined != ctx_.inlinedStackLoads.end()) {
+      return {inlined->second.text, inlined->second.pointer};
+    }
+    // A load load-inline proved has exactly one reader through a Global or
+    // Other address: same shape as the stack-slot case just above, but the
+    // substitution text has no name fixed ahead of printing, so it is
+    // rendered here exactly the way StmtPrinter::memoryLvalue would have
+    // printed it at the load's own (now-dead) statement -- struct field
+    // first, then a named global, then the generic cast dereference.
+    if (const auto inlined = ctx_.inlinedMemoryLoads.find(valueId.index());
+        inlined != ctx_.inlinedMemoryLoads.end()) {
+      const il::ExprId address = inlined->second.address;
+      const uint32_t width = inlined->second.width;
+      if (std::string field = ctx_.fieldAccess(address, width, valueId); !field.empty()) {
+        return {field, false};
+      }
+      uint64_t absolute = 0;
+      if (ctx_.function.asConstant(address, absolute)) {
+        if (const std::string* global = ctx_.globalName(absolute)) {
+          return {std::format("(*({}*)({}))", intType(width), *global), false};
+        }
+      }
+      return {std::format("(*({}*)({}))", intType(width), rootInteger(address)), false};
     }
     // A load a header typed: named through tempNames, and declared as the
     // pointer the field is, so arithmetic on it needs the cast back.
@@ -171,6 +211,23 @@ ExprPrinter::Text ExprPrinter::materialized(il::ExprId id) {
   const Text result{name, false};
   materializedText_.emplace(id.index(), result);
   return result;
+}
+
+std::optional<std::string> ExprPrinter::materializeAs(il::ExprId id,
+                                                       const std::string& preferredName) {
+  if (materializedText_.contains(id.index())) {
+    return std::nullopt;
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (!isShared(id, expr)) {
+    return std::nullopt;
+  }
+  // Same initializer `materialized()` would compute for a fresh `_cseN`;
+  // only the name that gets cached for later references differs.
+  std::string initializer =
+      isRedundantRootZext(expr) ? integerOperand(expr.operand(0)) : inner(id);
+  materializedText_.emplace(id.index(), Text{preferredName, false});
+  return initializer;
 }
 
 /// The operand of a signed operation, in the signed type of `width`. C would
@@ -322,6 +379,20 @@ std::string ExprPrinter::inner(il::ExprId id) {
       if (source.type.isScalarInteger() && source.type.bits() == e.type.bits()) {
         return integerOperand(e.operand(0));
       }
+      // Same "already has that width" case as just above, just seen through
+      // the argument's own C declaration rather than the raw register's:
+      // `arg1`'s type in the signature already IS this width whenever
+      // nothing more specific (a header's prototype) claims otherwise, so
+      // its bare name promotes exactly as `(uint32_t)(arg1)` would have --
+      // safe for the same reason dropping the cast above is.
+      if (source.op == il::ExprOp::EntryReg) {
+        const il::RegId root{static_cast<uint32_t>(source.immediate)};
+        if (const analysis::Variable* arg = ctx_.variables.argumentFor(root);
+            arg != nullptr && arg->type.pointerDepth == 0 &&
+            arg->type.width == e.type.bits() && !ctx_.argumentType(*arg).valid()) {
+          return integerOperand(e.operand(0));
+        }
+      }
       return std::format("(({})({}))", intType(e.type.bits()),
                          integerOperand(e.operand(0)));
     }
@@ -413,12 +484,32 @@ std::string ExprPrinter::shift(il::ExprId id, std::string_view op) {
       e, std::format("({} {} {})", left, op, integerOperand(e.operand(1))), false);
 }
 
+namespace {
+[[nodiscard]] bool isZeroConstant(const il::Expr& expr) {
+  return expr.op == il::ExprOp::Const && expr.immediate == 0;
+}
+}  // namespace
+
+std::string ExprPrinter::equalityOperand(il::ExprId id, bool comparedToZero) {
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (comparedToZero && expr.op == il::ExprOp::ZExt) {
+    return integerOperand(expr.operand(0));
+  }
+  return integerOperand(id);
+}
+
 /// Comparisons take their width from the operands, not from the i1 result.
 std::string ExprPrinter::compare(il::ExprId id, std::string_view op, bool sign) {
   const il::Expr& e = ctx_.function.expr(id);
   const il::Expr& lhs = ctx_.function.expr(e.operand(0));
   const uint32_t width = lhs.type.isScalarInteger() ? lhs.type.bits() : 64;
   if (!sign) {
+    if (op == "==" || op == "!=") {
+      const bool leftIsZero = isZeroConstant(lhs);
+      const bool rightIsZero = isZeroConstant(ctx_.function.expr(e.operand(1)));
+      return std::format("({} {} {})", equalityOperand(e.operand(0), rightIsZero),
+                         op, equalityOperand(e.operand(1), leftIsZero));
+    }
     return std::format("({} {} {})", integerOperand(e.operand(0)), op,
                        integerOperand(e.operand(1)));
   }

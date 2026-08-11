@@ -703,3 +703,225 @@ switch 里，`break;` 会错误地跳出外层 `while`，而不是像 case 里�
 `samples/score.py` 的 `__xdec_` 前缀过滤（防止 helper 定义被误认成目标函数）不用改：
 helper 现在只有声明和 `#include`，不再有带函数体的内联定义，这条防线本来就用不上了，
 留着无害。
+
+## 2026-08-10：单次栈 Load 物化噪声（stack-load-fold）
+
+`0x2a2428` 的 MBA 直线代码里，一次性读回的栈槽本该直接以变量名出现在算式里，却因为
+`nameResultTemps` 无条件给每个 `Load` 分配临时量，印成了 `t293 = var_984; ...;
+(*(uint32_t*)(t294)) = (_cse561 + t293);` 这种「先拷贝、再用」的两步——`--reuse-report`
+现有的两种可判定形状（`docs/09` 的 A/B）都看不到这个问题：既没有第二个 `ExprId`，也没有
+第二次 `Load`，只是**同一次读被印了两遍**。详见 `docs/09` 新增的形状 F 与
+`docs/12-stack-load-fold.md`（算法、安全规则、与 `stack_prop.cpp` 的边界）。
+
+### 结果（同一份 `0x2a2428`，参数一致）
+
+| 指标 | 之前 | 之后 |
+|------|-----:|-----:|
+| 总行数 | 4103 | **3715** |
+| `tN = var_XXX;` | 385 | **95** |
+| `(*(T*)tN) = ...` | 42 | **1** |
+| 提升为指针类型的栈局部变量 | 0 | **10** |
+
+剩下的 95 处 `tN = var_XXX` 是分析故意保守的地方：读者在另一个 block（跨 block 转发不是
+本方案目标），或读之前那个 slot 在同一 block 内又被写过一次（新鲜度检查正确拒绝）。
+
+### 实现落点（三层，均为 emit/analysis 层，未新增 IL pass）
+
+- `analysis::findFoldableStackLoads`（新增 `analysis/stack_load_fold.h`/`.cpp`）：判定
+  一个 `Load` 是否「地址是栈槽、每个活跃读者都在同一 block 内且在 load 之后、两者之间
+  没有可能的写入/调用能改变槽内容」，满足则可折叠；额外标注 `usedAsAddress`（是否所有
+  读者都只把结果当地址用，而非取值参与运算）。
+- `emit::CContext` 构造函数把折叠结果记进 `inlinedStackLoads`，对应 `Load` 的 `OpId` 并入
+  `deadOps`；`ExprPrinter::value`（`c_expr.cpp`）在查普通临时量之前先查这张表，命中就直接
+  返回槽位自己的打印文本——`memoryLvalue` 原有的 `(*(T*)...)` 兜底路径不需要单独改动，
+  替换进去的名字本身就够。
+- `analysis::VariableTable::recover`（`variables.cpp`）复用同一份分析（`deadOps` 传空，
+  因为变量恢复跑在 `emit` 阶段填满 `deadOps` 之前）：`usedAsAddress` 为真的栈槽被提升为
+  指针类型，`c_stmt.cpp` 的 `Store` 分支相应地在写入槽位本身时补上必要的 `(T*)` 显式转换。
+
+### 回归
+
+新增 `tests/analysis/test_stack_load_fold.cpp`（9 用例：单读折叠、store/call/跨 block 各自
+挡住折叠、global 地址不处理、两个活跃读者都能折叠、已死读者不计入、`usedAsAddress` 的
+正反两个例子）与 `tests/emit/test_c_stack_load_inline.cpp`（3 用例：标量单读直接印变量名、
+仅作地址用的读提升指针类型、两个活跃读者都不需要临时量）。`xdec_tests.exe` 495 个用例、
+131,215 个断言全过；`eval/` baseline 96/96、typed 36/36 无回归；`samples/` 4/4（含
+`sample_core_mba`，即 `0x2a2428`）无回归。
+
+## 2026-08-10：Emit Redundancy Elimination（ERE）框架 + 写端死 spill 消除（H1）
+
+用户指出 `_cse8 = bswap32(t32); var_aa8 = _cse8;`（`var_aa8` 全文件仅此一次赋值、
+再无读者）是 stack-load-fold 没覆盖的**写端**冗余，并要求系统性排查而非逐个模式打补丁。
+按「中间变量系统性消除方案」（`中间变量系统性消除_dbc46949.plan.md`）分阶段实施：
+
+**Phase 0（度量基础设施）：** 新增 `analysis::EmitRedundancyReport`
+（`include/xdec/analysis/emit_redundancy.h`、`src/analysis/emit_redundancy.cpp`），
+IL 层统计栈 Load/Store 折叠比例与 write-only 局部变量数，接入
+`xdec decompile --emit-report`；新增 `tools/emit_metrics.ps1` 做文本层互补统计
+（`_cseN = ...`、`var_X = _cseN;`、`tN = var_XXX;` 等行数）；`docs/09` 补入形状
+G–J（非栈单读 Load、CSE 写端 spill、refCount 虚高、dispatcher relay），新增
+`docs/14-emit-redundancy.md` 作为框架总览。
+
+**Phase 1（写端死 spill 消除，H1）：** 新增 `analysis::findDeadStackStores`
+（`include/xdec/analysis/stack_store_fold.h`、`src/analysis/stack_store_fold.cpp`）：
+一个写栈槽的 `Store`，若全函数没有任何 `Load` 读同一 delta、地址从未逃逸（未被当作
+`Call`/`Intrinsic` 参数或另存为某处的值）、不是别名字段、也不是 `VariableTable::recover`
+专门提升的 `state` 槽（该槽故意只写不读，见 `variables.cpp` 自己的注释——真实
+dispatcher 的状态值常常活在寄存器/phi 里，这个槽存在只是为了让读者看出"这是状态槽"，
+折叠掉它的写入会抹掉这个提升唯一的用处），则判定为死，其 `OpId` 并入 `CContext::deadOps`
+（`c_context.cpp`）。因为该分析证明的是"整个槽死"而非"某一次写死"，死槽的 delta 额外记入
+新增的 `deadLocalStackDeltas`，`c_printer.cpp` 的 `declarations()` 据此跳过声明——
+一个再没有赋值也没有读者的局部变量，不该再有声明。
+
+`StmtPrinter::printBlock` 收集 CSE scope roots 时已经先跳过 `deadOps`
+再调用 `addExprRoots`（`c_stmt.cpp`），所以 shape I1（死 spill 抬高共享表达式的
+refCount）**不需要额外机制**，只需验证：`_cse8` 这类节点在真实语料里全部还有别的
+活引用（`0x2a2428` 里 `bswap32(t32)` 除死 store 外还被 3 处 MBA 算式引用），所以去掉
+死 store 自己的贡献从未把一个真正共享的节点降格成内联表达式。
+
+### 结果（同一份 `0x2a2428`，参数一致）
+
+| 指标 | Phase 0 后 | Phase 1 后 |
+|------|-----:|-----:|
+| 总行数 | 3715 | **3446** |
+| `var_X = _cseN;`（H1/H2） | 277 | **185** |
+| `_cseN = ...`（I3，含 I1 级联） | 1179 | **1138** |
+| write-only 局部变量（仅声明、从无赋值或读者） | 105 | **0** |
+| IL report：栈 store 判死 / 总数 | 0/665 | **105/665** |
+
+### 回归
+
+新增 `tests/analysis/test_stack_store_fold.cpp`（7 用例：无读者即死、后有 Load 则非死、
+地址传给 intrinsic 则非死、地址被存成另一处的值则非死、同槽两次写一起判死、`state` 槽
+即使无读者也保留、global 地址不处理）与 `tests/analysis/test_emit_redundancy.cpp`
+（IL report 字段的一个综合用例）。三个既有测试
+（`test_c_printer.cpp` 的 diamond/assigned-select/nested-ternary 三个用例、
+`test_c_expr_reuse.cpp` 的 dispatcher-state-store 用例）原本的栈槽写入在各自 fixture
+里从未被读回，恰好落进新折叠的形状——补一次读回（或，对 dispatcher 用例，补一次代表
+"下一轮循环读回状态"的 Load）后各自验证的原有断言不变。`xdec_tests.exe` 503 个用例、
+131,231 个断言全过；`eval/` baseline 96/96、typed 36/36 无回归；`samples/` 4/4（含
+一次因 `state` 槽被误判为死而回归、加上述例外后修复的 `sample_afRDLog`）无回归。
+
+详见 `docs/13-stack-store-fold.md`（算法、安全规则、与 `state` 槽的边界）与
+`docs/14-emit-redundancy.md`（ERE 框架总览、分形状进度表）。
+
+## 2026-08-10：读端非栈单读 Load 内联（G）
+
+`docs/09` 形状 G：`t32 = (*(uint32_t*)(a1+0x18)); bswap32(t32)` 这类非栈地址的
+单读 Load，与已修的形状 F（栈槽单读）对称，`nameResultTemps` 同样无条件给它
+分配临时量。新增 `analysis::findFoldableMemoryLoads`
+（`include/xdec/analysis/load_inline.h`、`src/analysis/load_inline.cpp`）：
+与 `findFoldableStackLoads` 完全相同的安全规则（活跃读者都在同一 block、都在
+load 之后、两者之间无可能的写入/调用），只是把地址类从"必须是 StackSlot"放宽
+到"只要不是 StackSlot"——`frame.mayAlias` 本就对 `Global`/`Other` 地址一样保守
+地判断别名，不需要为这两类地址单独收紧规则。
+
+栈槽的替换文本（局部变量名）在分析阶段就能定下来；`Global`/`Other` 地址没有
+这样的名字，所以 `CContext` 只记下地址 `ExprId` 与宽度（`inlinedMemoryLoads`），
+`ExprPrinter::value` 在替换点按 `StmtPrinter::memoryLvalue` 同样的顺序重新
+渲染——先试 `fieldAccess`（结构体字段名），再试 `globalName`（具名全局），
+最后才是裸的 `(*(T*)...)` 转换。新增一条形状 F 不需要的排除规则：一个读者若把
+该 Load 的结果当作*另一次* Load/Store 的地址（`isAddressOperand`），则不折叠——
+这正是 `fieldAccess` 靠给基址值查名字来识别 `n->next->value` 链式访问的形状,
+折叠掉会把字段名换成裸指针算术,是退步不是进步(用
+`tests/emit/test_c_types.cpp` 的"指针字段携带类型"回归验证过这条排除的必要性)。
+
+### 结果（同一份 `0x2a2428`，参数一致）
+
+| 指标 | Phase 1 后 | Phase 3 后 |
+|------|-----:|-----:|
+| 总行数 | 3446 | **3253** |
+| `tN = (*(T*)...);`（G） | 243 | **79** |
+| `_cseN = ...`（I3，含 I1 级联） | 1138 | **1131** |
+
+剩下的 79 处与形状 F 剩余的 95 处 `tN = var_XXX` 同类：读者在另一个 block、
+两者之间有 clobber，或读者把结果当地址用（`fieldAccess` 命名排除）。
+
+### 回归
+
+新增 `tests/analysis/test_load_inline.cpp`（8 用例：global/arg+offset 单读折叠、
+栈槽地址留给 stack_load_fold、store/call/跨 block 各自挡住折叠、当地址用不折叠
+及其与纯值读混合的情形、已死读者不计入）与 `tests/emit/test_c_load_inline.cpp`
+（3 用例：global 单读内联、arg+offset 单读内联、call 阻断内联）。`xdec_tests.exe`
+514 个用例、131,243 个断言全过；`eval/` baseline 96/96、typed 36/36 无回归；
+`samples/` 4/4（含 `sample_core_mba`）无回归。
+
+## 2026-08-10：写端 CSE 合并打印（H2）
+
+`docs/09` 形状 H2：一个活着的（后续确实被读的）栈槽 store，其值恰好也是一个
+共享节点，于是先被 `ExprPrinter::materialized()` 无条件命名成 `_cseN`，store
+再把 `_cseN` 抄进 `var_X`——两行说的是同一件事：
+
+```c
+_cse9 = bswap32(t30);
+var_abc = _cse9;
+```
+
+这与 Phase 1 处理的 H1（写了从不读的 dead spill）不同：这里 `var_abc` 确实有
+后续读者，不能整句删掉，能省的只是「先起个 `_cseN` 名字、再抄一遍」这一步。
+
+新增 `ExprPrinter::materializeAs`（`src/emit/c_expr.h`/`.cpp`）：在
+`printOp` 的 `Store` 分支里，抢在 `materialized()` 给 store 的值节点分配
+`_cseN` 之前，检查这次命名是不是「本作用域第一次给这个共享节点起名」，如果是，
+且 store 目标是一个「裸名」局部变量——`lvalue == local->name`，用这一个等式就
+排除了字段访问、别名局部、宽度不匹配（这三种情况 `memoryLvalue`/`stackSlotLvalue`
+会打印出不同的文本，不等于裸名）——并且没有指针 cast 前缀，就直接把这个节点
+命名成 `var_X` 而不是 `_cseN`，一行打印 `var_X = <expr>;`。因为命名结果照旧写进
+`ExprPrinter` 自己的 `materializedText_` 缓存，本作用域里对同一节点的后续引用
+（`rootText`/`rootInteger`/`materialized` 都先查这个缓存）自动读到 `var_X`，
+不会另起 `_cseN`。这是 ERE 框架里目前唯一不挂在 `CContext` 三个字段上的机制：
+一个节点算不算"共享"是 `ExprPrinter` 自己按打印顺序做的引用计数，`CContext`
+的预扫描分析（`findFoldableStackLoads` 那一类）看不到这个信息，也就没法把这
+个判断挪到 `CContext` 里去做。
+
+`0x2a2428` 的效果比预想更好：不少 case 里 store 的值本身就是巨大的 MBA 求和树，
+合并后不只省了一行——像 `var_a0c = ((_cse8 + (_cse42 + ...)) + ...);`
+这类合并结果，后面一条式子还会直接用 `rotr32(var_a1c, ...)` 读回上一次合并
+产生的 `var_a1c`，而不是再起一个 `_cseN`，省的行数比单纯「两行并一行」更多。
+
+### 结果（同一份 `0x2a2428`）
+
+| 指标 | Phase 3 后 | Phase 4 后 |
+|------|-----:|-----:|
+| 总行数 | 3253 | **3169** |
+| `var_X = _cseN;`（H1/H2） | 185 | **60** |
+| `_cseN = ...`（I3，含 I1 级联） | 1131 | **1054** |
+
+剩下的 60 处是 `materializeAs` 主动放弃合并的情形：该共享节点在本作用域内已被
+更早的语句命名过（名字已经定了，不能事后改），或 store 目标不是纯裸名局部
+（指针 cast 槽、字段访问、别名/宽度不匹配局部）。IL 层报告（`--emit-report`）
+不变——`materializeAs` 只是打印层重命名，不影响 `findDeadStackStores`/
+`findFoldableMemoryLoads` 能从 IL 本身证明什么。
+
+### 回归
+
+修改 `tests/emit/test_c_expr_reuse.cpp` 中一条既有用例（原先断言
+`switch (_cse0)` 恰好出现一次；合并后该共享值直接以 `var_10` 命名，`switch`
+和回读都直接用 `var_10`，全文件不再出现任何 `_cse`，断言相应更新为检查
+`var_10 = (a0 + 0x1000);`、`switch (var_10)` 各恰好一次、`_cse` 出现零次）。
+`xdec_tests.exe` 514 个用例、131,243 个断言全过；`eval/` baseline 96/96、
+typed 36/36 无回归；`samples/` 4/4（含 `sample_core_mba`）无回归。
+
+## 2026-08-10：跨 scope 重复 expr 检测（I2，仅度量，不做 hoist）
+
+计划把 Phase 5 拆成两半：识别互斥 switch arm 间打印文本相同的 `_cseN` RHS（要做），
+以及把它 hoist 到 dispatcher loop 共享 prologue（计划自己标注为"可选 emit"）。
+这里只做前一半。
+
+给 `tools/emit_metrics.ps1` 加了 `duplicate_cse_rhs_groups` /
+`duplicate_cse_rhs_occurrences`：按 `_cseN = <expr>;` 这一行的 RHS 原始打印
+文本分组，统计有多少组出现 ≥2 次、总共出现多少次。`0x2a2428` 上是 **19 组、
+181 次**，和方案原文的估计（"20 种 RHS 重复 ≥2 次"）量级一致。
+
+没有做实际的 hoist，是有意的决定，不是因为工期不够简单跳过：Phase 1–4 的每
+一步都是"从 IL 事实能直接证明安全"的纯打印决策（一个 load 的读者集合、一个
+store 的读者集合、一个 scope 自己的引用计数），出错了最多是少省几行；跨
+scope hoist 不一样，它是真正的代码搬移——把只在某几个互斥 switch arm 里执行
+的计算，搬到一个所有路径（包括原来不执行这段计算的路径）都会经过的共享
+prologue 里。方案自己写的安全约束（docs/09 形状 D）要求证明"所有到达这个
+switch 的路径都已经执行过等价计算"，这是一个全函数可达性论证，不是
+`ExprPrinter` 现在这套按打印顺序做的逐 scope 引用计数（Phase 1–4 全部机制的
+共同基础）能回答的问题。证明做错了是悄悄改变行为，而不是只影响可读性，风险
+类别和这个方案里其他形状都不一样。鉴于方案原文本就把这步标成可选，而上面的
+统计已经回答了"还剩多少"，这里选择把 hoist 留作后续工作，而不是在没有把安全
+证明做扎实的情况下强行实现一个正确性敏感的重写。

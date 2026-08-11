@@ -47,16 +47,18 @@ struct Fixture {
     return function.entryReg(function.registers().find(name));
   }
 
-  std::string emit() {
+  std::string emit() { return emit(xdec::emit::COptions{}); }
+
+  std::string emit(const xdec::emit::COptions& options) {
     function.rebuildEdges();
     const StackFrame frame = StackFrame::compute(function);
     const VariableTable variables = VariableTable::recover(function, frame);
     const Dominators dominators = Dominators::compute(function);
     const PostDominators postDominators = PostDominators::compute(function);
     const std::vector<NaturalLoop> loops = naturalLoops(function, dominators);
-    return printFunction(function, variables, frame,
-                         structureFunction(function, dominators, postDominators,
-                                           loops));
+    return printFunction(
+        function, variables, frame,
+        structureFunction(function, dominators, postDominators, loops), options);
   }
 
   Function function;
@@ -103,8 +105,8 @@ TEST_CASE("arguments and a direct call print with the recovered prototype",
   f.function.appendReturn(f.entry, 0x1004);
 
   const std::string text = f.emit();
-  CHECK(contains(text, "void sub_1000(uint64_t a0, uint64_t a1)"));
-  CHECK(contains(text, "sub_5000(a0, a1);"));
+  CHECK(contains(text, "void sub_1000(uint64_t arg1, uint64_t arg2)"));
+  CHECK(contains(text, "sub_5000(arg1, arg2);"));
 }
 
 TEST_CASE("an indirect call prints a typed function pointer", "[emit][print]") {
@@ -116,7 +118,7 @@ TEST_CASE("an indirect call prints a typed function pointer", "[emit][print]") {
   f.function.appendReturn(f.entry, 0x1004);
 
   const std::string text = f.emit();
-  CHECK(contains(text, "((void (*)(uint64_t))a0)(a1);"));
+  CHECK(contains(text, "((void (*)(uint64_t))arg1)(arg2);"));
 }
 
 TEST_CASE("a diamond prints as if-else without gotos", "[emit][print]") {
@@ -133,10 +135,16 @@ TEST_CASE("a diamond prints as if-else without gotos", "[emit][print]") {
   f.function.appendStore(right, 0x3000, Type::integer(64), f.slot(-0x18),
                          f.i64(2));
   f.function.appendBranch(right, 0x3008, merge);
-  f.function.appendReturn(merge, 0x4000);
+  // Read back at the merge, the way real code that bothers with a diamond
+  // always does -- otherwise neither store is observable and
+  // findDeadStackStores (correctly) folds both away.
+  const il::ValueId chosen =
+      f.function.appendLoad(merge, 0x4000, Type::integer(64), f.slot(-0x18));
+  const il::OpId ret = f.function.appendReturn(merge, 0x4004);
+  f.function.setOperands(ret, std::vector<ExprId>{f.function.valueRef(chosen)});
 
   const std::string text = f.emit();
-  CHECK(contains(text, "if ((a0 != 0x0)) {"));
+  CHECK(contains(text, "if ((arg1 != 0x0)) {"));
   CHECK(contains(text, "var_18 = 0x1;"));
   CHECK(contains(text, "} else {"));
   CHECK(contains(text, "var_18 = 0x2;"));
@@ -152,14 +160,62 @@ TEST_CASE("global memory prints as a typed dereference", "[emit][print]") {
                                          f.function.valueRef(loaded)));
   f.function.appendReturn(f.entry, 0x1008);
 
+  // The load's one reader is the very next statement in the same block, so
+  // load-inline (analysis::findFoldableMemoryLoads) folds the temporary
+  // away and reprints the dereference directly at that use.
   const std::string text = f.emit();
-  CHECK(contains(text, "t0 = (*(uint64_t*)(0x400900));"));
-  CHECK(contains(text, "(*(uint32_t*)(0x400910)) = ((uint32_t)(t0));"));
+  CHECK(contains(text, "(*(uint32_t*)(0x400910)) = ((uint32_t)((*(uint64_t*)(0x400900))));"));
+}
+
+// A named global with no header binding falls back to `extern uint8_t
+// NAME[];` (globalDeclarations()), which is exactly a byte access's own
+// element type: a byte load through it needs no cast at all. A wider access
+// to the same address still does, since the fallback declaration is not that
+// width.
+TEST_CASE("a byte access to an untyped global indexes it instead of casting",
+          "[emit][print]") {
+  Fixture f;
+  f.function.appendStore(f.entry, 0x1000, Type::integer(8), f.i64(0x400900),
+                         f.entryReg("x0"));
+  f.function.appendReturn(f.entry, 0x1004);
+
+  xdec::emit::COptions options;
+  options.addresses = [](uint64_t) {
+    xdec::emit::AddressFacts facts;
+    facts.mapped = true;
+    facts.writable = true;
+    facts.variable = true;
+    return facts;
+  };
+  const std::string text = f.emit(options);
+  INFO(text);
+  CHECK(contains(text, "g_400900[0] = arg1;"));
+  CHECK(!contains(text, "*(uint8_t*)(g_400900)"));
+}
+
+TEST_CASE("a wider access to the same untyped global still casts",
+          "[emit][print]") {
+  Fixture f;
+  f.function.appendStore(f.entry, 0x1000, Type::integer(32), f.i64(0x400900),
+                         f.entryReg("x0"));
+  f.function.appendReturn(f.entry, 0x1004);
+
+  xdec::emit::COptions options;
+  options.addresses = [](uint64_t) {
+    xdec::emit::AddressFacts facts;
+    facts.mapped = true;
+    facts.writable = true;
+    facts.variable = true;
+    return facts;
+  };
+  const std::string text = f.emit(options);
+  INFO(text);
+  CHECK(contains(text, "(*(uint32_t*)(g_400900)) = arg1;"));
 }
 
 TEST_CASE("a residual flag condition prints its exact helper", "[emit][print]") {
   Fixture f;
-  // flagcond:lt(flagdef:sub.32(a0, 1)) — the opaque-predicate shape.
+  // flagcond:lt(flagdef:sub.32(arg1, 1)) — the opaque-predicate shape.
   const ExprId a0 = f.entryReg("x0");
   const ExprId one = f.function.constant(Type::integer(32), 1);
   const ExprId def = f.function.flagDef(
@@ -174,7 +230,7 @@ TEST_CASE("a residual flag condition prints its exact helper", "[emit][print]") 
   f.function.appendReturn(right, 0x3000);
 
   const std::string text = f.emit();
-  CHECK(contains(text, "cc_lt32(((uint32_t)(a0)), 0x1)"));
+  CHECK(contains(text, "cc_lt32(arg1, 0x1)"));
   // Defined once in xdec_helpers.h, pulled in by one `#include` -- not
   // repeated as a `static inline` block in this file's own preamble.
   CHECK(contains(text, "#include \"xdec_helpers.h\""));
@@ -221,17 +277,22 @@ TEST_CASE("an assigned select prints as an if/else over the same lvalue",
       f.function.select(f.function.binary(ExprOp::CmpEq, f.entryReg("x0"), f.i64(0)),
                         f.entryReg("x1"), f.entryReg("x2"));
   f.function.appendStore(f.entry, 0x1000, Type::integer(64), f.slot(-0x10), chosen);
-  f.function.appendReturn(f.entry, 0x1004);
+  // Read back before returning -- otherwise the store is unobservable and
+  // findDeadStackStores (correctly) folds it away.
+  const il::ValueId reloaded =
+      f.function.appendLoad(f.entry, 0x1004, Type::integer(64), f.slot(-0x10));
+  const il::OpId ret = f.function.appendReturn(f.entry, 0x1008);
+  f.function.setOperands(ret, std::vector<ExprId>{f.function.valueRef(reloaded)});
 
   const std::string text = f.emit();
   INFO(text);
   CHECK_FALSE(contains(text, "?"));
   // The else is what makes this different from the returned form: an assignment
   // does not leave the statement, so the arms have to exclude each other.
-  CHECK(contains(text, "if ((a0 == 0x0)) {"));
-  CHECK(contains(text, "var_10 = a1;"));
+  CHECK(contains(text, "if ((arg1 == 0x0)) {"));
+  CHECK(contains(text, "var_10 = arg2;"));
   CHECK(contains(text, "} else {"));
-  CHECK(contains(text, "var_10 = a2;"));
+  CHECK(contains(text, "var_10 = arg3;"));
 }
 
 TEST_CASE("a select nested in a larger value stays a ternary", "[emit][print]") {
@@ -244,12 +305,17 @@ TEST_CASE("a select nested in a larger value stays a ternary", "[emit][print]") 
                         f.entryReg("x2"), f.i64(0));
   const ExprId combined = f.function.binary(ExprOp::Xor, f.entryReg("x1"), masked);
   f.function.appendStore(f.entry, 0x1000, Type::integer(64), f.slot(-0x10), combined);
-  f.function.appendReturn(f.entry, 0x1004);
+  // Read back before returning -- otherwise the store is unobservable and
+  // findDeadStackStores (correctly) folds it away.
+  const il::ValueId reloaded =
+      f.function.appendLoad(f.entry, 0x1004, Type::integer(64), f.slot(-0x10));
+  const il::OpId ret = f.function.appendReturn(f.entry, 0x1008);
+  f.function.setOperands(ret, std::vector<ExprId>{f.function.valueRef(reloaded)});
 
   const std::string text = f.emit();
   INFO(text);
   CHECK(contains(text, "?"));
-  CHECK(contains(text, "var_10 = (a1 ^ ((a0 == 0x0) ? a2 : 0x0));"));
+  CHECK(contains(text, "var_10 = (arg2 ^ ((arg1 == 0x0) ? arg3 : 0x0));"));
 }
 
 }  // namespace

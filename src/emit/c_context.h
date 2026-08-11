@@ -59,6 +59,29 @@ struct RegVar {
   uint32_t width = 64;
 };
 
+/// A `Value` substituted directly with the text of the stack slot a
+/// `analysis::findFoldableStackLoads` load reads, in place of a temporary:
+/// `var_980` where the ordinary path would have declared `t294 = var_980;`
+/// and every use of `t294` read the temporary back. `pointer` mirrors the
+/// same fact `tempFor`'s own pointer temps carry, so a use of this text in
+/// address arithmetic still casts back to an integer where it needs to (see
+/// ExprPrinter::integerOperand).
+struct InlinedStackLoad {
+  std::string text;
+  bool pointer = false;
+};
+
+/// A `Value` substituted with a freshly re-rendered `(*(T*)ADDR)`, for a
+/// `analysis::findFoldableMemoryLoads` load whose address is not a stack
+/// slot: unlike a stack slot, there is no fixed name to precompute at
+/// analysis time, so this carries just the address expression and width,
+/// and `ExprPrinter::value` renders the dereference itself at the point of
+/// substitution (see that function).
+struct InlinedMemoryLoad {
+  il::ExprId address;
+  uint32_t width = 0;  // bits
+};
+
 class CContext {
  public:
   CContext(const il::Function& theFunction,
@@ -115,6 +138,41 @@ class CContext {
   /// `StmtPrinter` walks the same ops deciding what to print, so a
   /// declared-but-never-assigned temporary can never happen.
   std::unordered_set<uint32_t> deadOps;
+
+  /// Load op indices to print through an ACLE `__ldaxrN` call instead of a
+  /// plain dereference (see analysis::findExclusiveLoads): the paired
+  /// `aarch64.reserve` intrinsic is already folded into `deadOps`, and this
+  /// set is what tells StmtPrinter's Load case to spell the reassembled
+  /// operation the way ldaxr/ldxr's ACLE name does, not as an ordinary read.
+  std::unordered_set<uint32_t> exclusiveLoads;
+
+  /// `aarch64.store_exclusive_status` intrinsic op index -> the `Store`
+  /// immediately before it in the same block (see
+  /// analysis::findExclusiveStores), already folded into `deadOps`. Gives
+  /// the intrinsic's own print the address and value ACLE's `__stlxrN`
+  /// takes, which its own (empty) operand list does not carry.
+  std::map<uint32_t, il::OpId> exclusiveStoreFor;
+
+  /// Value index -> the slot text substituted for a folded stack load's
+  /// result (see analysis::findFoldableStackLoads). Checked by
+  /// ExprPrinter::value ahead of tempFor, so a value in here is never
+  /// declared as its own temporary either -- its defining Load's OpId is in
+  /// `deadOps` for exactly this reason, filled in by this constructor
+  /// alongside this map.
+  std::map<uint32_t, InlinedStackLoad> inlinedStackLoads;
+
+  /// Value index -> the address/width substituted for a folded non-stack
+  /// load's result (see analysis::findFoldableMemoryLoads). Checked by
+  /// ExprPrinter::value alongside `inlinedStackLoads`; its defining Load's
+  /// OpId is in `deadOps` for the same reason.
+  std::map<uint32_t, InlinedMemoryLoad> inlinedMemoryLoads;
+
+  /// Stack deltas analysis::findDeadStackStores proved entirely dead: every
+  /// Store to this slot is one `deadOps` above already excludes, so nothing
+  /// in the body ever assigns or reads it. Checked by c_printer.cpp's
+  /// declarations() so a local in this state gets no declaration either --
+  /// one nothing writes and nothing reads has no fact left worth naming.
+  std::unordered_set<int64_t> deadLocalStackDeltas;
 
   /// The temporary standing for a value, or nullptr when the value has none.
   [[nodiscard]] const std::string* tempFor(il::ValueId value) const;
@@ -191,6 +249,15 @@ class CContext {
   /// would read variables the signature never declared.
   [[nodiscard]] std::string argumentName(const analysis::Variable& variable) const;
 
+  /// What to call parameter `position` (0-based) when nothing else names it:
+  /// a header's own parameter name, and inference's own name for a Variable
+  /// the body actually reads, both outrank this everywhere they apply (see
+  /// `argumentName`). Only the two leftover spots reach here directly --
+  /// c_printer.cpp's own "position nothing in the body reads" and "header
+  /// parameter with no name of its own" cases -- so both read the same
+  /// `COptions::indexedArgumentNames` choice `argumentName` does.
+  [[nodiscard]] std::string positionalArgumentName(int position) const;
+
   /// Whether an argument is declared as a pointer, so that arithmetic on it
   /// has to cast back to an integer first. True when inference found one, and
   /// also when only the header says so -- the declaration is what the C
@@ -229,6 +296,15 @@ class CContext {
   /// width than any single field, which is memoryLvalue's cast fallback to
   /// handle, the same as it would for a local with no imported type at all.
   [[nodiscard]] std::string localFieldAccess(int64_t delta, uint32_t width) const;
+
+  /// The lvalue text for a `width`-bit StackSlot access at `delta`: a named
+  /// local, its aliased struct field, or a cast dereference of the local's
+  /// address -- whichever `memoryLvalue`'s own StackSlot branch would have
+  /// printed. Empty when no local was recovered there. Factored out so the
+  /// constructor's stack-load-fold prepass can compute the identical text a
+  /// folded load's one use should read instead of a temporary (see
+  /// `inlinedStackLoads`).
+  [[nodiscard]] std::string stackSlotLvalue(int64_t delta, uint32_t width) const;
 
   /// Names, and on first sight declares, the variable for a full register.
   [[nodiscard]] const RegVar& registerVariable(il::RegId root);

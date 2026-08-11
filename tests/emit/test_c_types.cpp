@@ -149,7 +149,7 @@ TEST_CASE("no header leaves the inferred signature alone", "[emit][types]") {
 
   const std::string text = f.emit(nullptr);
   INFO(text);
-  CHECK(contains(text, "probe(uint32_t* a0)"));
+  CHECK(contains(text, "probe(uint32_t* arg1)"));
   CHECK(!contains(text, "Node"));
 }
 

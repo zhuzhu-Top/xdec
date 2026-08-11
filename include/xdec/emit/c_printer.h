@@ -117,6 +117,21 @@ struct COptions {
   /// would move a computation across code that may depend on where it sat --
   /// and because `x ^ (c ? y : 0)` is what the source looked like too.
   bool preferIfOverTernary = true;
+  /// What to call a recovered argument when no header names it: `arg1`,
+  /// `arg2`, ... (BN/Hex-Rays' one-based convention) by default, or
+  /// inference's own `a0`, `a1`, ... when this is false. Only changes that
+  /// one fallback spelling (see CContext::argumentName/positionalArgumentName)
+  /// -- a header's own parameter name always wins either way.
+  bool indexedArgumentNames = true;
+  /// Print BTI and pointer-authentication (PAC) intrinsics as a block
+  /// comment naming the hint (`/* BTI c */`) instead of the raw
+  /// `__xdec_intrin_aarch64.*` call. Both spellings carry the same
+  /// information -- neither op ever defines a value another statement
+  /// reads (see specs/arm64/system.xspec) -- so the comment is strictly a
+  /// question of whether these security hints are worth their own
+  /// statement in a reader's way; `false` is for a caller that wants every
+  /// intrinsic to look the same.
+  bool securityHintsAsComments = true;
   /// How to name addresses: callees, and the function itself. Absent means
   /// every address prints as a bare number, which is where this started.
   SymbolResolver symbols;

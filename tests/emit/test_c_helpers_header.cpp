@@ -99,7 +99,7 @@ TEST_CASE("a byte swap also pulls in the helpers header", "[emit][helpers-header
   const std::string text = f.emit();
   INFO(text);
   CHECK(contains(text, "#include \"xdec_helpers.h\""));
-  CHECK(contains(text, "bswap64(a0)"));
+  CHECK(contains(text, "bswap64(arg1)"));
 }
 
 TEST_CASE("an embedder stub also pulls in the helpers header",
@@ -113,7 +113,7 @@ TEST_CASE("an embedder stub also pulls in the helpers header",
   const std::string text = f.emit();
   INFO(text);
   CHECK(contains(text, "#include \"xdec_helpers.h\""));
-  CHECK(contains(text, "xdec_clz64(a0)"));
+  CHECK(contains(text, "xdec_clz64(arg1)"));
 }
 
 TEST_CASE("an unknown syscall alone does not pull in the helpers header",
@@ -159,5 +159,5 @@ TEST_CASE("an empty helpersHeader suppresses the include entirely",
   const std::string text = f.emit(options);
   INFO(text);
   CHECK(!contains(text, "xdec_helpers.h"));
-  CHECK(contains(text, "rotr64(a0, 0x3)"));
+  CHECK(contains(text, "rotr64(arg1, 0x3)"));
 }
