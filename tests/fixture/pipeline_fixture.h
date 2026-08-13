@@ -22,7 +22,10 @@
 #include <string>
 #include <utility>
 
+#include "xdec/analysis/dominators.h"
+#include "xdec/analysis/loops.h"
 #include "xdec/decompile/emit.h"
+#include "xdec/emit/structure.h"
 #include "xdec/il/function.h"
 #include "xdec/passes/builtin.h"
 #include "xdec/spec/compile.h"
@@ -103,6 +106,22 @@ class FlatProgram {
   options.driver.target = il::Maturity::Vars;
   pass::Registry registry = builtinRegistry();
   return decompile::decompileToC(arm64Engine(), reader, entry, registry, options);
+}
+
+/// Structures `function` from scratch: dominators, post-dominators, and
+/// natural loops, then emit::structureFunction() over them. Every structure
+/// test used to re-type this same four-line sequence itself as a local
+/// `run()` helper (see e.g. tests/emit/test_structure.cpp); this is that
+/// boilerplate extracted once, for a test that has no reason to inspect the
+/// intermediate analyses. A test that does (walking dominators directly,
+/// say) still calls emit::structureFunction() itself rather than through
+/// this wrapper.
+[[nodiscard]] inline emit::StructuredFunction structureFunction(
+    const il::Function& function, const emit::StructureOptions& options = {}) {
+  const analysis::Dominators dominators = analysis::Dominators::compute(function);
+  const analysis::PostDominators postDominators = analysis::PostDominators::compute(function);
+  const std::vector<analysis::NaturalLoop> loops = analysis::naturalLoops(function, dominators);
+  return xdec::emit::structureFunction(function, dominators, postDominators, loops, options);
 }
 
 }  // namespace xdec::testing

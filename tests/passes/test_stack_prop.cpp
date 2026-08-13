@@ -229,4 +229,117 @@ TEST_CASE("a reload of an untouched global is the first load's value", "[passes]
   CHECK(b.function.op(block.ops[0]).code == OpCode::Load);
 }
 
+//   entry: a = load [0x30c420]; x2 = a; branch mid
+//   mid:   b = load [0x30c420]; store (x2+b) -> [0x9000]
+//
+// `a` is carried across the branch through a register write/read (not a raw
+// shared ExprId), matching how a value actually crosses a block boundary
+// before SSA construction turns the register into a value the pass can see
+// is the same one.
+TEST_CASE("a reload of an untouched global from a different block is the first load's value",
+          "[passes][stackprop]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId mid = b.block(0x1008);
+  const ExprId first =
+      b.function.valueRef(b.function.appendLoad(entry, 0x1000, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendWriteReg(entry, 0x1004, b.reg("x2"), first);
+  b.function.appendBranch(entry, 0x1008, mid);
+  const ExprId firstInMid = b.read(mid, b.reg("x2"), 0x1008);
+  const ExprId second =
+      b.function.valueRef(b.function.appendLoad(mid, 0x100c, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendStore(mid, 0x1010, Type::integer(64), b.i64(0x9000),
+                         b.function.binary(ExprOp::Add, firstInMid, second));
+  b.function.appendReturn(mid, 0x1014);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  // The second block's load is gone: its value is the entry block's load.
+  bool sawLoad = false;
+  for (const il::OpId opId : b.function.block(mid).ops) {
+    sawLoad = sawLoad || b.function.op(opId).code == OpCode::Load;
+  }
+  CHECK(!sawLoad);
+  const il::Op& sink = b.function.op(b.function.block(mid).ops[0]);
+  const il::Expr& sum = b.function.expr(b.function.operands(sink)[1]);
+  REQUIRE(sum.op == ExprOp::Add);
+  CHECK(sum.operands[0] == sum.operands[1]);
+}
+
+//   entry: a = load [0x30c420]; x2 = a; call f; branch mid
+//   mid:   b = load [0x30c420]; store (x2+b) -> [0x9000]
+TEST_CASE("a call anywhere in the function bars cross-block global reuse",
+          "[passes][stackprop]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId mid = b.block(0x100c);
+  const ExprId first =
+      b.function.valueRef(b.function.appendLoad(entry, 0x1000, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendWriteReg(entry, 0x1004, b.reg("x2"), first);
+  b.function.appendCall(entry, 0x1008, b.i64(0x8000));
+  b.function.appendBranch(entry, 0x100c, mid);
+  const ExprId firstInMid = b.read(mid, b.reg("x2"), 0x100c);
+  const ExprId second =
+      b.function.valueRef(b.function.appendLoad(mid, 0x1010, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendStore(mid, 0x1014, Type::integer(64), b.i64(0x9000),
+                         b.function.binary(ExprOp::Add, firstInMid, second));
+  b.function.appendReturn(mid, 0x1018);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  // The call may have written the global: the second block's load survives.
+  bool sawLoad = false;
+  for (const il::OpId opId : b.function.block(mid).ops) {
+    sawLoad = sawLoad || b.function.op(opId).code == OpCode::Load;
+  }
+  CHECK(sawLoad);
+}
+
+//   entry: a = load [0x30c420]; x2 = a; condbranch (x0 != 0) ? mid : other
+//   mid:   b = load [0x30c420]; store (x2+b) -> [0x9000]; ret
+//   other: store x1 -> [0x30c420]; ret
+//
+// The store never actually reaches `mid` on any real path, but the analysis
+// does not do path-sensitive reasoning -- it is a whole-function precondition
+// by design, the same way a call anywhere bars it. Proving that is the point:
+// a smarter, path-aware version is a possible future extension, not a bug in
+// this one.
+TEST_CASE("a store to the global anywhere in the function bars cross-block reuse",
+          "[passes][stackprop]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId mid = b.block(0x100c);
+  const BlockId other = b.block(0x1010);
+  const ExprId first =
+      b.function.valueRef(b.function.appendLoad(entry, 0x1000, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendWriteReg(entry, 0x1004, b.reg("x2"), first);
+  const ExprId cond = b.function.binary(ExprOp::CmpNe, b.read(entry, b.reg("x0"), 0x1008),
+                                        b.i64(0));
+  b.function.appendCondBranch(entry, 0x1008, cond, mid, other);
+  const ExprId firstInMid = b.read(mid, b.reg("x2"), 0x100c);
+  const ExprId second =
+      b.function.valueRef(b.function.appendLoad(mid, 0x100c, Type::integer(64), b.i64(0x30c420)));
+  b.function.appendStore(mid, 0x1010, Type::integer(64), b.i64(0x9000),
+                         b.function.binary(ExprOp::Add, firstInMid, second));
+  b.function.appendReturn(mid, 0x1014);
+  b.function.appendStore(other, 0x1010, Type::integer(64), b.i64(0x30c420),
+                         b.read(other, b.reg("x1"), 0x1010));
+  b.function.appendReturn(other, 0x1014);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  // The store may reach `mid` for all the analysis knows: the load survives.
+  bool sawLoad = false;
+  for (const il::OpId opId : b.function.block(mid).ops) {
+    sawLoad = sawLoad || b.function.op(opId).code == OpCode::Load;
+  }
+  CHECK(sawLoad);
+}
+
 }  // namespace

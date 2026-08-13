@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "xdec/analysis/emit_redundancy.h"
+#include "xdec/analysis/profile.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/binary/target_profile.h"
@@ -79,6 +80,14 @@ struct DecompileReport {
   /// always has, rather than always paying for it inside every
   /// decompileToC() call.
   std::optional<analysis::EmitRedundancyReport> emitRedundancy;
+  /// Only present when `DecompileToCOptions::computeObfuscationProfile`
+  /// asked for it -- see analysis::profile. Reported alongside
+  /// `emitRedundancy` under the CLI's `--emit-report` flag: one number set
+  /// says how obfuscated the input looked, the other says how much
+  /// redundant-temp noise emission still carries, and a caller diagnosing a
+  /// large flattened function (libscplugin-scale dispatchers, say) wants
+  /// both without re-deriving either from the printed C.
+  std::optional<analysis::ObfuscationProfile> obfuscationProfile;
 };
 
 struct DecompileToCOptions {
@@ -97,6 +106,14 @@ struct DecompileToCOptions {
   /// declarations, and they must be the same TypeDatabase or the two halves
   /// of one decompilation could disagree about a callee's signature.
   emit::COptions emit;
+  /// See emit::StructureOptions. `minRegionSites`/`deferRegionCollapse`'s own
+  /// defaults already drive J1's collapse-defer gate through every caller of
+  /// decompileToC(); `regionStructuring` (see its own comment, and J2 --
+  /// docs/architecture-optimization-eval-prompt.md §3 Phase 3) is the one
+  /// field here a caller might actually want to flip, since flipping it is
+  /// the only way to observe collapseRegionDispatchTree's effect outside a
+  /// unit test.
+  emit::StructureOptions structure;
   /// Platform hints for typed-variable recovery's import-slot aliasing (see
   /// analysis::TypedVariables::recover's `profile` parameter). Absent skips
   /// aliasing, same as a caller with no better guess.
@@ -104,6 +121,10 @@ struct DecompileToCOptions {
   /// See DecompileReport::emitRedundancy. Off by default: the scan is only
   /// worth its cost when something is actually going to read the report.
   bool computeEmitRedundancy = false;
+  /// See DecompileReport::obfuscationProfile. Off by default for the same
+  /// reason: profiling walks every block and every hash-consed expression
+  /// once, which is only worth paying for when something reads the result.
+  bool computeObfuscationProfile = false;
 };
 
 struct DecompileToCResult {

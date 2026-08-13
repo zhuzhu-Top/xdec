@@ -56,10 +56,35 @@ bool edgesAgree(const il::Function& function, il::BlockId target,
   return true;
 }
 
+/// A `Stmt::make(StmtKind::Continue)` naming `header`, for a case/default arm
+/// whose only mention of it is the bare `BlockId` `StmtPrinter::printSwitch`
+/// prints as a `goto` when it finds no body of its own -- there is no `Goto`
+/// node there for `continueAtBackEdges` to find and flip, so this gives it
+/// one that prints the same way `Continue` already does everywhere else:
+/// `printEdge` for that case's own edge runs first either way (see
+/// `printSwitch`), and `Continue`'s own `consumePending` is a no-op right
+/// after, since `printSwitch` always clears `pending_` immediately before
+/// printing whatever this replaces.
+StmtPtr continueTo(il::BlockId header) {
+  auto stmt = Stmt::make(StmtKind::Continue);
+  stmt->block = header;
+  return stmt;
+}
+
+}  // namespace
+
 /// Turns every jump back to `header` inside `node` into a `continue`, and says
 /// whether it found any. Nested loops are left alone: a `continue` written
-/// inside one belongs to it, not to the loop being built here.
-bool continueAtBackEdges(Stmt* node, il::BlockId header) {
+/// inside one belongs to it, not to the loop being built here. A `Switch`
+/// case/default arm with no body of its own names its target as a bare
+/// `BlockId` instead of a `Goto` node (see `StmtPrinter::printSwitch`'s own
+/// fallback) -- given one here via `continueTo`, exactly as if `claimCaseBody`
+/// had handed it a body all along. Shared with structure.cpp's
+/// `collapseLabeledNaturalLoops` (J2f) -- both callers hand this the
+/// *finished* body of a loop that has already claimed every block it will
+/// ever contain, so there is nothing here that needs to know which of the two
+/// built that body.
+bool Structurizer::continueAtBackEdges(Stmt* node, il::BlockId header) {
   if (node == nullptr) {
     return false;
   }
@@ -71,19 +96,34 @@ bool continueAtBackEdges(Stmt* node, il::BlockId header) {
     return false;
   }
   bool found = false;
+  if (node->kind == StmtKind::Switch) {
+    for (std::size_t index = 0; index < node->cases.size(); ++index) {
+      if (index < node->caseBodies.size() && node->caseBodies[index]) {
+        found |= continueAtBackEdges(node->caseBodies[index].get(), header);
+      } else if (node->cases[index] == header) {
+        if (index >= node->caseBodies.size()) {
+          node->caseBodies.resize(node->cases.size());
+        }
+        node->caseBodies[index] = continueTo(header);
+        found = true;
+      }
+    }
+    if (node->defaultBody) {
+      found |= continueAtBackEdges(node->defaultBody.get(), header);
+    } else if (node->defaultCase == header) {
+      node->defaultBody = continueTo(header);
+      found = true;
+    }
+    found |= continueAtBackEdges(node->epilogue.get(), header);
+    return found;
+  }
   for (const StmtPtr& item : node->items) {
     found |= continueAtBackEdges(item.get(), header);
   }
   found |= continueAtBackEdges(node->thenArm.get(), header);
   found |= continueAtBackEdges(node->elseArm.get(), header);
-  for (const StmtPtr& body : node->caseBodies) {
-    found |= continueAtBackEdges(body.get(), header);
-  }
-  found |= continueAtBackEdges(node->defaultBody.get(), header);
   return found;
 }
-
-}  // namespace
 
 std::optional<Structurizer::ValueTest> Structurizer::matchValueTest(
     il::BlockId blockId, bool allowPhis) const {

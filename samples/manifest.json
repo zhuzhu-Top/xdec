@@ -68,6 +68,21 @@
         "max_encrypted_dispatch_calls": 85,
         "min_state_named": 1
       }
+    },
+    {
+      "name": "sample_libscplugin",
+      "category": "ollvm-mega",
+      "binary": "libscplugin",
+      "address": "0x1164f8",
+      "decompile_args": ["--allow-unresolved"],
+      "comment": "L2: a real app's large OLLVM-flattened function, registered per docs/18-architecture-optimization-plan.md as an observational, non-blocking regression guard. Before the resolved-binary-dispatch collapse (see structure.cpp's switchFor and analysis::matchDispatchValues), every one of this function's 244 table-mode switches turned out to be exactly two-way -- an obfuscator's original `if` reaching its two arms through a shared jump table once value-set analysis narrows the table to the two live entries a preceding select's own two constants produce. Recognising that shape and printing `if (cond) A else B` instead of a numbered two-case switch took switches from 244 to 0 and loops (while(true)) from 5 to 43. J1 (docs/18's §5.2, structure.cpp's StructureOptions::minRegionSites) then deferred that collapse specifically for this function's one 234-site analysis::DispatchRegion (sharedTail=false, so nothing else consumes it yet) -- switches went back to 234 (matching this table's original shape almost exactly) and, as a direct consequence, the if-chain-driven loop recognition that had produced 43 while(true) wrappers no longer fires on these now-uncollapsed sites, dropping loops_while_true to 2. That is the plan's own §11.2 stated direction for this metric (39 trending toward <15 as Track B lands, not a floor to hold), so min_loops_while_true is not tracked here any more -- min_switches guards the actual J1 win instead. The thresholds below are the post-J1 shape with light slack, not a target for J2-J5 -- tighten them (and samples/baseline.json via -UpdateBaseline) as those land, per samples/README.md's 'increment slowly' rule.",
+      "rounds": 128,
+      "expect": {
+        "max_unresolved_branches": 0,
+        "max_gotos": 420,
+        "min_switches": 220,
+        "max_lines": 6600
+      }
     }
   ]
 }

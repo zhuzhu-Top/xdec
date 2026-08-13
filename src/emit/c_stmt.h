@@ -43,19 +43,70 @@ namespace xdec::emit {
 [[nodiscard]] il::OpId deadJumpTableLoad(const il::Function& function, il::BlockId block,
                                          bool tableMode, il::ExprId cond);
 
+/// The Store a resolved computed branch's own block makes to a plain local
+/// (docs/09 shape A's H2 fold: `var_X = <expr>;`), when the very next
+/// statement is the switch built from that block's terminator and `cond` --
+/// its discriminant -- is that store's value operand, the exact same
+/// `ExprId`. Phase 3.2 of the OLLVM plan folds that pair one step further
+/// than H2 already does: instead of printing the assignment on its own line
+/// and reading the local back for the switch (`var_X = <expr>; switch
+/// (var_X) {`), the assignment moves into the switch's own parens (`switch
+/// (var_X = <expr>) {`) and this Store never gets a line of its own -- see
+/// `StmtPrinter::printSwitch`'s `assignDiscriminantTo`.
+///
+/// Only offered for an `enumerated` switch (table mode or a resolved case
+/// list): the compare-chain fallback repeats its discriminant once per arm,
+/// and embedding the assignment there would recompute (and reassign) it on
+/// every comparison instead of once. A plain local exactly the way H2 itself
+/// requires -- no pointer cast, no aliased field, the whole slot at the
+/// store's own width -- so this is strictly a subset of what H2 would have
+/// folded anyway; the local's declaration and its liveness are untouched
+/// (`analysis::findDeadStackStores` reads the raw IL, not `deadOps`, so a
+/// later read of the same slot elsewhere still keeps it declared). Invalid
+/// when no such store exists, and then the pair prints exactly as H2 always
+/// has.
+[[nodiscard]] il::OpId deadStateDiscriminantStore(const il::Function& function,
+                                                  const analysis::StackFrame& frame,
+                                                  const analysis::VariableTable& variables,
+                                                  bool enumerated, il::BlockId block,
+                                                  il::ExprId cond);
+
+/// A `Store` in `block` whose value is exactly `select(ifCond, A, B)` for two
+/// compile-time literals `A`/`B` into a plain local (the same plain-local
+/// gate `deadStateDiscriminantStore` uses) -- J3 (docs/architecture-
+/// optimization-eval-prompt.md §6.6): an obfuscator's routing decision
+/// compiled twice, once into this store (which only ever feeds a `switch` on
+/// the very local it writes, elsewhere) and again into `block`'s own real
+/// terminator, over the exact same `ifCond`. `ifArmsLeaveDirectly` -- whether
+/// the `if` that terminator lowers to just transfers control straight to the
+/// two targets this store's own two arms would have dispatched to anyway
+/// (see structure.cpp's `gotoChain`) -- is the caller's to check, since only
+/// it has the structured `if`'s own arms to look at; this stays false-safe
+/// (never valid) when it is not. Invalid whenever anything later in `block`
+/// still reads the local, and then the store prints exactly as it always
+/// has.
+[[nodiscard]] il::OpId deadRoutingStateStore(const il::Function& function,
+                                             const analysis::StackFrame& frame,
+                                             const analysis::VariableTable& variables,
+                                             il::BlockId block, il::ExprId ifCond,
+                                             bool ifArmsLeaveDirectly);
+
 /// Walks the whole structured tree for every Block-immediately-followed-by-
-/// its-own-Switch pairing (see `deadJumpTableLoad`), wherever it is nested --
-/// inside a loop body, an if arm, another switch's case -- and for every
-/// import-accessor call a later Store in the same block folds into itself
-/// (see `printOp`'s Store case and docs/10-import-resolution.md's errno
-/// idiom: `t = __errno_location(); *(uint32_t*)t = -ret;` becomes
-/// `*__errno_location() = -ret;`, and the call's own temporary is one this
-/// set marks dead the same way a vestigial jump-table load is). Computed
-/// once, up front: `c_printer.cpp`'s declaration pass must not declare a
-/// temporary for an op the body will never print, and `StmtPrinter::printOp`
-/// must skip (or fold away) that same op, so both read this one answer
-/// instead of risking two independently-reasoned ones drifting apart.
+/// its-own-Switch pairing (see `deadJumpTableLoad` and
+/// `deadStateDiscriminantStore`), wherever it is nested -- inside a loop
+/// body, an if arm, another switch's case -- and for every import-accessor
+/// call a later Store in the same block folds into itself (see `printOp`'s
+/// Store case and docs/10-import-resolution.md's errno idiom: `t =
+/// __errno_location(); *(uint32_t*)t = -ret;` becomes `*__errno_location() =
+/// -ret;`, and the call's own temporary is one this set marks dead the same
+/// way a vestigial jump-table load is). Computed once, up front:
+/// `c_printer.cpp`'s declaration pass must not declare a temporary for an op
+/// the body will never print, and `StmtPrinter::printOp` must skip (or fold
+/// away) that same op, so both read this one answer instead of risking two
+/// independently-reasoned ones drifting apart.
 [[nodiscard]] std::unordered_set<uint32_t> collectDeadOps(const il::Function& function,
+                                                          const analysis::StackFrame& frame,
+                                                          const analysis::VariableTable& variables,
                                                           const Stmt& root,
                                                           const COptions& options);
 
@@ -87,7 +138,13 @@ class StmtPrinter {
   /// `extraRoots` and the Sequence case below): the switch then reuses that
   /// scope instead of resetting it, so a value the block already shares
   /// with the discriminant is named once, not twice.
-  void printSwitch(const Stmt& stmt, std::string& out, bool openScope = true);
+  ///
+  /// `assignDiscriminantTo`, when non-empty, is the local `deadStateDiscri-
+  /// minantStore` found: the paired block's own store into it never prints
+  /// (see `collectDeadOps`), so this prints the assignment itself, once,
+  /// as the switch's own condition (`switch (var_X = <expr>) {`) instead.
+  void printSwitch(const Stmt& stmt, std::string& out, bool openScope = true,
+                   const std::string& assignDiscriminantTo = {});
 
   /// `stmt.frame`, printed once as `shadow[i] = live[i]` for every slot,
   /// right before the switch it belongs to. Establishes the invariant that
@@ -150,7 +207,13 @@ class StmtPrinter {
   /// analysis noted about it (il::Function::noteOn), and a note is keyed by
   /// handle.
   void printOp(il::OpId opId, std::string& out);
-  void printCall(const il::Op& op, std::string& out);
+  /// Takes the handle for the same reason `printOp` does: `ctx_.vtableCalls`
+  /// (see analysis::findConfirmedVtableCalls) is keyed by it, so a computed
+  /// call confirmed as a vtable dispatch gets a `/* vtable slot ... */` note
+  /// naming the object and offset -- the general fact the analysis proves --
+  /// without inventing a struct or class name neither it nor this printer
+  /// has any evidence for.
+  void printCall(il::OpId opId, const il::Op& op, std::string& out);
   /// One call argument's text: a recovered local's own address ahead of
   /// everything else (see CContext::addressOfLocal, unconditional on the
   /// callee's own type same as it always was); otherwise, where `callee`

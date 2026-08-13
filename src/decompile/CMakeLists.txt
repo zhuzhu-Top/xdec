@@ -8,6 +8,7 @@
 # so the two-way rule the comment above states still holds.
 xdec_add_library(xdec_decompile
   SOURCES
+    analysis_cache_observer.cpp
     driver.cpp
     emit.cpp
   DEPS

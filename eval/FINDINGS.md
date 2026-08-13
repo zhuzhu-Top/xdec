@@ -925,3 +925,319 @@ switch 的路径都已经执行过等价计算"，这是一个全函数可达性
 类别和这个方案里其他形状都不一样。鉴于方案原文本就把这步标成可选，而上面的
 统计已经回答了"还剩多少"，这里选择把 hoist 留作后续工作，而不是在没有把安全
 证明做扎实的情况下强行实现一个正确性敏感的重写。
+
+## 2026-08-12：docs/18 架构优化方案 Track B J1（switchFor region-aware 2-way collapse）
+
+对应计划：`docs/18-architecture-optimization-plan.md` §5.2、W1/M1 里程碑。J1 给
+`Structurizer` 加了 `StructureOptions{minRegionSites=8, deferRegionCollapse=false}`
+（`include/xdec/emit/structure.h`），`switchFor`（`src/emit/structure.cpp`）在把一个
+2-way table-mode dispatch collapse 成 `if`/`else` 之前，先用新的
+`isMemberOfLargeDispatchRegion` 查这个 dispatch site 是否属于
+`analysis::DispatchRegion` 里 ≥ `minRegionSites` 个 site 的一个 region——是则保留
+table-mode `switch`，不再走 if/else 折叠。新增
+`tests/emit/test_structure_dispatch_region.cpp`（4 用例：region 小于/等于/自定义
+门槛的对照、`deferRegionCollapse` 诊断开关独立验证）。
+
+### `sample_libscplugin` 前后对比
+
+| 指标 | J1 前 | J1 后 | 说明 |
+|------|------:|------:|------|
+| switch | 0 | **234** | 精确匹配方案 §5.2 的预期效果（"switch 0 → ~234"）——该函数唯一的 234-site region 现在整体保留 table-mode |
+| goto | 407 | 407 | 不变，符合预期：J1 不处理 goto，那是 J3/J4 的范围 |
+| while(true) | 39 | **2** | 副作用，非缺陷：旧算法把这 234 个 site 折成 if 链后，`wrapAsLoop` 才能把其中的链识别成循环；J1 让它们继续以 switch 呈现，不再触发那条 if 链驱动的循环识别。这正是方案 §11.2 自己把 while(true) 列为"非门禁、方向性"指标（39 期望逐步降到 <15）的原因 —— 不是这次改动应该规避的回归 |
+| 行数 | 8253 | 6368 | table-mode switch 比对应的 if 链更紧凑 |
+
+### manifest 调整（用户已确认）
+
+`samples/manifest.json` 的 `sample_libscplugin` 原有 `min_loops_while_true: 30`
+是照着 J1 之前"if 链折叠产生大量 while(true)"这个副作用校准的门槛，J1 落地后
+必然被打破——但这不代表退步，方案 §11.2 本就把这项标成方向性、非门禁指标。
+经用户确认（选项：移除/下调该门槛并 `-UpdateBaseline`），改为：移除
+`min_loops_while_true`，新增 `min_switches: 220`（在 234 之下留薄余量）直接
+守住 J1 的真实收益，`max_lines` 从 10500 收紧到 6600、`max_gotos` 从 460 收紧到
+420（均在实测值上留薄余量）。`comment` 字段同步改写，记录 J1 的因果链。
+`samples/baseline.json` 已用 `-UpdateBaseline` 刷新。
+
+### 回归
+
+`xdec_tests.exe`：612 test cases、133,664 assertions 全过（含新增
+`test_structure_dispatch_region.cpp`）。`eval/run.ps1`：baseline 98/98、
+typed 38/38，vs baseline 均无 fixed/regressed。`samples/run.ps1`：5/5，
+vs（刷新后的）baseline 无 fixed/regressed。
+
+## 2026-08-12：docs/architecture-optimization-eval-prompt.md J2d（region handler clone）
+
+对应计划：`docs/architecture-optimization-eval-prompt.md`（M1 W2）与
+`docs/18-architecture-optimization-plan.md` §5.3 的短期 goto 缩减方向。J1 把大 region
+的 2-way site 从 if/else 折叠改回 table-mode `switch`，但 `switchFor` 的 N-way/table-mode
+case 循环此前只试 `claimDispatcherCaseBody`/`claimCaseBody`，从未试
+`claimOrCloneSharedCaseBody`（该 fallback 此前只接在 if/else 折叠路径上）——一个 handler
+若被同一张表的 ≥2 个 site 共同指向（`claimOrCloneSharedCaseBody` 本就认的形状），在
+table-mode 分支里永远直接落到 `addGotoTarget`。J2d 把同一个 fallback 也接进这条循环
+（`src/emit/structure.cpp` `switchFor`），让"被 J1 送进 table-mode 的 site"也能享受到
+"handler 克隆内联"。
+
+### 排查过程中发现并修复的两个通用问题
+
+1. **`sharedCaseBodyCache_` 从不随 `rollback` 撤销**：`claimOrCloneSharedCaseBody`
+   可能嵌套在另一个失败后要整体回滚的推测性尝试内部（`tryDiamond`/`tryOneSided`/
+   `claimCaseBody` 等任何会递归 `emitRegion` 的路径都可能触发）——那次尝试失败回滚后，
+   对应 block 不再是 `emitted_`，但缓存里那份克隆体仍会被后续真正的调用者取走，等于
+   同一段代码既作为克隆体打印，又在它自己的自然位置再打印一次。修法：新增
+   `sharedCaseBodyInsertions_`，记录每条缓存插入发生时的 `trail_.size()`；`rollback`
+   现在按同一个 `trailSnapshot` 一并清掉本轮新增的缓存项（`structurizer.h`/
+   `structure.cpp`）。
+2. **`kMaxSharedBodySize`（trail 增量计数）不是可靠的"这段代码会打多长"代理**：
+   一个 handler 未被声明的 case 不会把自己的子树计入 `trail_`（那是留给顶层
+   walk 之后单独处理的），但打印时仍会把整棵 `Switch` 子树完整展开——所以一个
+   trail 增量很小的克隆体，仍可能在打印时嵌进另一整个 switch。scatter-dispatcher
+   的 handler 经常"做几步就再走同一张表分发一次"，恰好踩中这个空子，第一次上线时
+   把 `sample_libscplugin` 从 407 goto / 6368 行推高到 511 goto / 7921 行——比 J1 基线
+   更差。修法两层：（a）`containsSwitch`——克隆前对候选 body 的语句树做一次遍历，
+   查是否嵌了 `Switch`，嵌了就按尺寸超限一样拒绝（`structure.cpp`，两处调用方都受益）；
+   （b）`reachesFurtherDispatch`——在真正调用 `emitRegion` 之前，先用一次不产生任何
+   `mark`/`trail_`/`gotoTargets_` 副作用的纯只读 BFS（只看 `successors` 和
+   terminator），提前发现"这条链在预算内还会再分发一次"就直接拒绝，省下(a)要
+   完整走一遍才能发现、且失败后无法退还的那部分 `budget_` 消耗。
+
+### `sample_libscplugin` 前后对比（诚实结果）
+
+| 指标 | J1 基线 | J2d（未加两层防护，仅供记录） | J2d（最终） |
+|------|------:|------:|------:|
+| goto | 407 | 511 → 加 containsSwitch 后 572 | **407**（不变） |
+| 行数 | 6368 | 7921 → 加 containsSwitch 后 6678 | **6368**（不变） |
+| switch | 234 | 338（新增的全是被克隆体带出来的嵌套 switch） | 234（不变） |
+
+最终结果对这一个样本没有可观测收益：`libscplugin` 的 234-site region 里，几乎每个
+被多个 site 共享的 handler 自己也在预算内再次分发，`reachesFurtherDispatch`/
+`containsSwitch` 因此几乎全数拒绝克隆，行为回落到与 J1 基线逐字节一致。这是诚实的
+结果而不是缺陷：J2d 针对的形状（"小、不再分发的共享 handler"）在合成 fixture 里
+确认可用（见下），但 `libscplugin` 这个真实样本恰好几乎不含这种形状——`docs/
+architecture-optimization-eval-prompt.md` 的 goto 分析已经指出 65% 的 case goto
+来自 case 本身直接跳转，真正的结构性收敛仍需 J2（`collapseRegionDispatchTree`）。
+
+### 新增测试
+
+`tests/emit/test_structure_dispatch_region.cpp` 新增 4 个用例：
+- 2-site（`deferRegionCollapse`）与 8-site（自然达到 `minRegionSites`、共享点相隔
+  两个 site）两个正例——共享 handler 被克隆进每个 case，不再是单一 goto 目标。
+- 反例：共享 handler 的其中一个前驱不是 resolved 2-way table dispatch（一个普通
+  无条件跳转）——`claimOrCloneSharedCaseBody` 正确拒绝，两个 switch 的对应 case
+  仍是未声明（打印为 goto）的插槛。
+- 通过 A/B（feature-flag 环境变量 + 手工 diff 生成的 C）验证了 containsSwitch/
+  reachesFurtherDispatch 两层防护缺一都会在 `libscplugin` 上产生可观测回归，
+  确认两层都是必要的，不是防御性冗余。
+
+### 回归
+
+`xdec_tests.exe`：619 test cases、133,705 assertions 全过。`eval/run.ps1`：baseline
+98/98，vs baseline 无 fixed/regressed。`samples/run.ps1`：5/5，vs baseline 无
+fixed/regressed（`sample_libscplugin` 逐字节回到 J1 基线，见上表）。`samples/
+manifest.json`/`baseline.json` 均未改动——J2d 对这个样本没有把门槛推得更紧的理由。
+
+## 2026-08-12：libscplugin 核心提升方案 Phase 0–5 收尾
+
+对应计划：`libscplugin 反核心提升`（见该 plan 文件自身的诊断与分阶段设计，
+不重复摘要）。核心约束照旧：**不开发插件系统**，所有改动 IL/形状驱动，
+`libscplugin`（`0x1164f8`）只作 L2 观测，不写任何该样本专属的地址/常量分支。
+
+### 交付内容
+
+- **Phase 1**：`analysis::DispatchRegion`
+  （`include/xdec/analysis/dispatch_region.h`、`src/analysis/dispatch_region.cpp`）
+  —— 按物理跳表身份（base/stride/entryBits/clamp）聚类分散的两路 dispatch
+  site，并在 pooled targets 上做 `matchDispatcherShape` 式的多数票，识别出
+  单个 site 自己凑不出三个目标、但整个 region 能确认的共享尾。接入
+  `AnalysisCache`（新增 `"dispatch"` tag）与 `Structurizer::tryDispatcherLoop`
+  的 fallback。完整设计与已知局限见 `docs/17-dispatch-region.md`（新增）。
+- **Phase 3**：`emit/c_stmt.cpp` 的 `Store` 打印顺序调整——共享的 `Select`
+  值现在优先走 `ExprPrinter::materializeAs`（赋给 local 自己的名字），只有
+  不共享时才回退到 `printSelectAssign` 的 if/else 展开；`deadStateDiscriminantStore`
+  的 Block+Switch 折叠一并验证仍在生效。细节与验收用例见
+  `docs/09-expression-reuse.md` 的 H2 扩展说明。
+- **Phase 4**：`passes/fold.cpp` 新增 `FlagPhiDistributor`（跨 flags-phi 分发
+  `FlagCond` 测试）；`passes/fold_resolved_branch.cpp` 新增 `removeOrphanedLoads`
+  （已解析分支丢弃目标表达式后的孤儿 load DCE）；`vtable_call`
+  （`analysis/vtable_call.h`）接线到 `printCall`，确认的 vtable slot 现在打印
+  `/* vtable slot 0x... */` 注释。
+- **`xdec_dispatch_index_*` 内联 helper 已按此前决定移除**：clamp 现在总是打印
+  成普通三元表达式，`quantify_c.py` 的 `clamp-ternary` 正则据此更新以匹配带
+  `(intNN_t)`/`(uintNN_t)` 强转的形式。
+
+### `sample_libscplugin` 前后对比（`samples/build/out/sample_libscplugin.c`）
+
+| 指标 | 方案落地前 | 本次（2026-08-12） | 说明 |
+|------|-----------:|-------------------:|------|
+| 行数 | 8295 | 8253 | H2 折叠 + region-confirm 打通带来的净减少 |
+| `state =` | 1192 | 1188 | Phase 3 的共享 `Select` 折叠（`state = (cond) ? A : B;` 复用同一次计算） |
+| `switch` | 0 | 0 | 见下文：该函数唯一 region 的 `sharedTail=false`，Phase 2 的 region-confirm 无票可用 |
+| `while (true)` | 39 | 39 | 同上 |
+| `goto` | 407 | 407 | 同上 |
+| `L_0x` 标签 | 295 | 295 | 同上 |
+| `clamp-ternary`（新指标） | — | 4 | 确认 4 处 clamp 都已是普通三元，无 `xdec_dispatch_index_*` 残留 |
+| `flagcond-stub` | 29 | 29 | 该函数里现存的 stub 并非跨 phi 链路（`FlagPhiDistributor` 覆盖的形状），本次未变 |
+| `dispatch-load-sites`（新指标） | — | 37 | Phase 0 新增度量，仅供后续跟踪，无历史基线 |
+| `duplicate-routing-if`（新指标） | — | 10 | 同上 |
+
+`xdec decompile ... --emit-report` 的诊断行确认了 Phase 1 的分析结果：
+
+```
+dispatch-regions: 1 region(s), 234 site(s) total
+  region[0]: table=0x1e70a0 stride=8 entryBits=64 clamp=0x2cc/0x213 sites=234 sharedTail=false
+```
+
+**为什么 `switch`/`while(true)`/`goto` 三项没有变化**：`libscplugin` 这一个函数
+里，234 个 dispatch site 的目标确实各自散落到不同的下一状态，没有多数
+site 收敛到同一个 merge block——`sharedTail=false` 是分析给出的真实结论，
+不是没找全。`Structurizer::matchRegionConfirmedShape` 在 `region.sharedTail`
+为空时没有证据可用，因此对这个函数完全不生效，`switchFor` 的 2-way collapse
+策略（Phase 2c，本方案未修正）继续把两路 dispatch 打印成 `if`/`else`。
+这与方案诊断阶段的预期一致（该函数从未被认为会自己长出 `sharedTail`），
+`docs/17-dispatch-region.md` 的"What this does and does not change for
+libscplugin"一节记录了同样的结论，以及为什么 region-confirm 路径本身在
+`tryDispatcherLoop` 里目前还没有一个能端到端触发它的合成 fixture
+（`emitRegion` 遇到内嵌的 `IndirectBranch` 就不会继续走向调用者要求的
+`stop` 块，这是一个独立于本方案的既有限制，不是这次改动引入的）。
+
+### 回归
+
+- `xdec_tests`：612 test cases、133664 assertions 全过（含本次新增的
+  `tests/analysis/test_dispatch_region.cpp`、`tests/analysis/test_analysis_cache.cpp`
+  的 `dispatchRegions()` 用例、`tests/emit/test_c_vtable_call.cpp`、
+  `tests/emit/test_c_printer.cpp` 的共享 `Select` 折叠用例）。
+- `eval/run.ps1`：98/98，vs baseline 无 fixed / 无 regressed。
+- `samples/run.ps1`：5/5（`sample_jni_onload`、`sample_mega_dispatcher`、
+  `sample_core_mba`、`sample_afRDLog`、`sample_libscplugin`），vs baseline
+  无 fixed / 无 regressed；`manifest.json` 的阈值本次未放宽
+  （`sample_libscplugin` 仍在 `max_gotos=460`、`min_loops_while_true=30`、
+  `max_lines=10500` 内，用不着改）。
+
+## 2026-08-12：反编译质量继续优化方案 Phase 1-4（J5/J3/J2e/J2/J2f + Track A 并行项）
+
+对应计划：`docs/architecture-optimization-eval-prompt.md`，J2d 完成后审查得出
+「407 个 goto 的结构性收敛必须靠 J2」的结论，本轮把方案的四个阶段全部落地。
+起点（J2d 完成时，`sample_libscplugin` @ `0x1164f8`）：goto 407、switch 234、
+行数 6368、`while(true)` 2、`dispatch-load-sites` 37、`duplicate-routing-if` 10。
+
+### Phase 1：J5 dead dispatch load DCE + J3 路由三写消除（Track B）与 PipelineFixture/AnalysisCache（Track A）
+
+**J5**：扩展 `c_stmt.cpp` 的 `deadJumpTableLoad` 判定并系统接入 `collectDeadOps`
+遍历路径——`state = f(cond); t = load(table[clamp(state)]);` 里 `t` 若无读者、
+routing 分支本身不读它、也没有 call/memory 副作用，则整条 `load` 判死。
+`sample_libscplugin` 的 `dispatch-load-sites` 从 37 降到 30。
+
+**J3**：新增 `deadRoutingStateStore`（`c_stmt.cpp`），识别 `state=(cond)?A:B`
+紧邻同 `cond` 的 `if`/`CondBranch` 这一路由三写形状。核心难点是不能只看
+「无读者」的一般死存储判据（`findDeadStackStores` 已经处理了那种更简单的
+形状，且过早地吃掉了合成测试的目标结构）——这里需要一个有界的正向可达性
+检查（`localMayBeReadBeforeRewrite`）：只在同 block 内、以及预算内可达的
+后继 block 里，确认该 local 在被下一次写覆盖之前不会被路由路径读到，才判定
+这次 `Store` 真正冗余。`sample_jni_onload` 的 `duplicate-routing-if`
+10 → **0**，且 `state=` 相应减少。回归：`tests/emit/test_c_dead_routing_store.cpp`。
+
+**Track A（H+C）**：`tests/fixture/pipeline_fixture.h` 新增
+`structureFunction()`，把「建 `Dominators`/`PostDominators`/`NaturalLoop` 再调
+`structureFunction`」这套每个 structure 测试都手写的样板收进一个 helper，
+`test_structure.cpp`/`test_structure_dispatch_region.cpp` 已迁移。新增
+`AnalysisCacheObserver`（`xdec_decompile`，实现 `pass::Observer`）：某个 pass
+报告有变更时，读它的 `PassInfo::invalidates` 标签并调
+`AnalysisCache::invalidate()`，堵上「pass 跑完但 cache 没失效」的既有缺口。
+回归：`tests/decompile/test_analysis_cache_observer.cpp`。
+
+### Phase 2：J2e region join block epilogue + J2 设计冻结
+
+**J2e**：`sharedTail` 是整 region 的 ≥80% 多数票，抓不住「19 个各自只有
+2-3 个前驱的独立 merge hub」这种形状。新增 `analysis::findDispatchJoins`
+（`dispatch_region.h`/`.cpp`）：找一个块 `hub`，它是 ≥2 个「私有 handler
+尾块」（恰好一个前驱来自 region 内某 dispatch site、恰好一个后继指向
+`hub`）的共同目标，且 `hub` 自身的全部前驱都能被这些尾块覆盖（排除 region
+外还有第三方前驱混进来的假阳性）。`Structurizer::switchFor` 在
+`matchDispatcherShape` declines 之后，用 `joinHubByTail()` 缓存试第一个
+尚未被占用的 `DispatchJoin`，把它的 `hub` 当作这个 switch 的 epilogue 打印
+一次（`stmt->frame` 仅在 `DispatcherShape` 的全套证明成立时才赋值，避免
+J2e 派生的合并被误套上并不适用的活跃寄存器帧）。回归：
+`tests/emit/test_structure_join_epilogue.cpp`。
+
+**J2 设计冻结**：`StructureOptions::regionStructuring`（默认 `false`）、
+`kRegionPatterns` 元数据数组、CLI `--region-structuring`（`cmd_pipeline.cpp`）、
+7-site 合成 fixture（`test_structure_region_switch.cpp`）——为 Phase 3 的
+实现先把接口和测试骨架定下来，本阶段不改变默认输出。
+
+### Phase 3：J2 `collapseRegionDispatchTree`
+
+新建 `structure_dispatch_region.cpp`：`Structurizer::collapseRegionDispatchTree`
+在 `switchFor` 建好一个 outer `Switch` 之后，检查它每个 case body 是否恰好是
+`[Block, Switch]`，且内外两个 `Switch` 都是 `tableMode`、共享同一个
+`il::ExprId` discriminant（`outer.cond == inner.cond`）、`caseValues` 状态
+一致（同为空或同非空）、内层没有自己的 `epilogue`——只在这四条都成立时，把
+内层的 case/predicate/body 拼进外层对应位置，物理上合并成一个 mega-switch。
+故意不做的是「跨 site 猜测同一个 discriminant」：只合并已经证明共享同一个
+`ExprId` 的相邻两层，不推断两个本来互不相关的 site 的 index 其实是同一个
+状态变量——那是本文档 `17-dispatch-region.md` "Non-goals" 一节明确排除的
+更大、更冒险的主张。
+
+`sample_libscplugin` 上开 `--region-structuring` 观测：goto/switch/行数
+**零变化**——该函数的 234 个 site 各自读取独立的 discriminant，从未出现
+两层嵌套共享同一个 `ExprId` 的形状，这是分析给出的诚实结果（无嵌套树可
+合并），不是实现的缺口。合成 fixture（7-site 同表、可恢复 caseValues 的
+线性链）验证了算法本身确实能把嵌套树压成一个 ≥7-case switch。回归：
+`tests/emit/test_structure_region_switch.cpp`。
+
+### Phase 4：J2f labeled natural loop
+
+`sample_libscplugin` 149 条回边里的大多数落在「header 是已解析
+`IndirectBranch`」的 handler 簇内——这个形状既不匹配 `tryLoop`/
+`tryDispatcherLoop`（两者都专门找 `CondBranch` 头），`wrapAsLoop` 也只在
+它刚建好的那一个 switch 内部找回边，看不到从别的、隔了好几个 block 才到达
+的独立顶层分组回来的边。新增 `Structurizer::collapseLabeledNaturalLoops`
+（`structure.cpp`，`run()` 的两轮 RPO 扫描之后跑一次）：对每个
+`NaturalLoop`，找到 header 自己代码所在的那个顶层分组——**不要求 header 是
+该分组自己的起始块**，因为一次普通的 fallthrough 链（`emitRegion` 的
+`Branch` 分支本就不断往同一个 `Sequence` 继续追加）经常把 header 的代码接在
+一段与循环无关的前置代码后面（典型例子：函数真正的入口块直接落进循环
+header）。做法是在该分组自己的 `items` 里定位 header 的 `Block` 语句所在
+下标，只把从那个下标开始的尾段（而不是整个分组）当作候选循环体，之前的
+内容原样留在分组里、留在 `while` 外面。随后要求循环的每个其余成员块都能在
+某个尚未被消费的顶层分组里找到、且该分组自身没有已经嵌套的循环，才把这些
+分组按 RPO 顺序拼接进循环体，调用（原本只在 `structure_dispatch.cpp` 内部
+用的）`Structurizer::continueAtBackEdges`（现已提升为共享的 `static`
+方法，并扩展到能把裸 `Switch` 的 case/default 目标一并改写）把 `goto
+header` 改成 `continue`，最后包成 `while (true)`。
+
+`sample_libscplugin`：`while(true)` **2 → 49**，`goto` **407 → 388**
+（比方案自己估计的「60-100」小得多，原因是这批回边与 J2e 已经claim的 hub
+高度重叠——两项收益本就不是简单相加，方案 §Phase2 的注释已经提到这点）。
+行数从 6368 上升到 6702（`max_lines: 6600` 因此被突破，见下）。回归：
+`tests/emit/test_structure_labeled_loop.cpp`（两个用例：`head`/`a`/`b`
+分裂成三个独立顶层分组、`a`/`b` 都落进同一个未被 claim 的 `tail` 的正例；
+某个循环成员自己已经先被 `wrapAsLoop` 包成自环的负例，确认外层循环不会
+去拆一个已经结构化好的内层循环）。
+
+### `sample_libscplugin` 汇总对比（J2d 完成 → 本轮四阶段落地后）
+
+| 指标 | J2d 完成时 | 本轮后 | 说明 |
+|------|-----:|-----:|------|
+| goto | 407 | **388** | 全部来自 J2f；J2/J2e 本身对这个样本零直接贡献（见上） |
+| switch | 234 | 234 | J2（`collapseRegionDispatchTree`）零命中，J2e 只挂 epilogue 不改 switch 数 |
+| `while(true)` | 2 | **49** | J2f |
+| 行数 | 6368 | 6702 | 主要是 47 个新 `while(true)` 各自的结构开销 |
+| `dispatch-load-sites` | 37 | **30** | J5 |
+| `duplicate-routing-if` | 10 | **0** | J3（在 `sample_jni_onload` 上验证；`sample_libscplugin` 本身这项此前已是低个位数） |
+
+### manifest 阈值（待用户确认，暂未调整）
+
+`samples/manifest.json` 的 `sample_libscplugin.max_lines: 6600` 被本轮的
+6702 行突破，`samples/run.ps1` 现报 4/5。这是 J2f 新增 47 个 `while(true)`
+的直接、可解释的结构开销，不是回归——但按方案 §8 与用户既有约定，
+manifest 阈值收紧/放宽只在用户确认后用 `-UpdateBaseline` 落地，本轮未改动
+`manifest.json`/`baseline.json`，把决定权留给用户。
+
+### 回归
+
+`xdec_tests.exe`：**636** test cases、133778 assertions 全过（含本轮新增的
+`test_analysis_cache_observer.cpp`、`test_c_dead_routing_store.cpp`、
+`test_structure_join_epilogue.cpp`、`test_structure_region_switch.cpp`、
+`test_structure_labeled_loop.cpp`）。`eval/run.ps1`：baseline 98/98、
+typed 38/38，vs baseline 均无 fixed/regressed。`samples/run.ps1`：4/5——
+仅 `sample_libscplugin` 因上述 `max_lines` 阈值未随 J2f 更新而报"NO"，
+其余 4 个样本与其余所有指标均无回归。

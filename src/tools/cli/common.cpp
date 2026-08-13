@@ -54,6 +54,8 @@ int usage() {
   printLine("               --helpers-header <path|none> (default xdec_helpers.h)");
   printLine("               --arg-naming <indexed|reg> (default indexed: arg1, arg2, ...)");
   printLine("               --security-hints <comment|keep> (default comment)");
+  printLine("               --region-structuring (J2 diagnostic: collapse a nested dispatch");
+  printLine("                 region's tree into fewer switches; default off)");
   printLine("  exec <binary> <workload>         execute blocks against scripted states");
   printLine("  memdump <binary> <out>           dump the relocated memory view for emulators");
   printLine("  decode                           decode hex words from stdin (fuzzer iface)");

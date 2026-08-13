@@ -43,6 +43,14 @@ const StackFrame& AnalysisCache::stackFrame() const {
   return *stackFrame_;
 }
 
+const std::vector<DispatchRegion>& AnalysisCache::dispatchRegions() const {
+  if (!dispatchRegions_) {
+    dispatchRegions_ = findDispatchRegions(*function_);
+    ++stats_.dispatchRegionsComputed;
+  }
+  return *dispatchRegions_;
+}
+
 void AnalysisCache::invalidate(std::span<const std::string_view> tags) {
   const bool all = tags.empty();
   if (all || namesAnyOf(tags, "cfg", "dominators")) {
@@ -52,6 +60,9 @@ void AnalysisCache::invalidate(std::span<const std::string_view> tags) {
   }
   if (all || namesAnyOf(tags, "cfg", "stack")) {
     stackFrame_.reset();
+  }
+  if (all || namesAnyOf(tags, "cfg", "dispatch")) {
+    dispatchRegions_.reset();
   }
 }
 

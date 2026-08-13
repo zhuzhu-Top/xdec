@@ -224,6 +224,20 @@ TEST_CASE("idiom tier: the identities behind the new rules hold", "[passes][alge
       return fn.binary(ExprOp::Sub, fn.constant(t, y + k2), fn.constant(t, x));
     }, width);
 
+    // (v<<1|2) - (v^1) ≡ v+1: the obfuscated increment. `v<<1` always clears
+    // bit 0, and ORing in 2 forces bit 1 on unconditionally, while `v^1`
+    // merely flips `v`'s own bit 0 -- two spellings of "add one" that only
+    // agree once the arithmetic is worked out, which is exactly what makes it
+    // useful as an opaque predicate's building block.
+    checkEquivalent(f, [&](Function& fn, uint64_t x, uint64_t) {
+      const ExprId v = fn.constant(t, x);
+      const ExprId doubled = fn.binary(ExprOp::Shl, v, fn.constant(t, 1));
+      return fn.binary(ExprOp::Sub, fn.binary(ExprOp::Or, doubled, fn.constant(t, 2)),
+                       fn.binary(ExprOp::Xor, v, fn.constant(t, 1)));
+    }, [&](Function& fn, uint64_t x, uint64_t) {
+      return fn.binary(ExprOp::Add, fn.constant(t, x), fn.constant(t, 1));
+    }, width);
+
     // 2·(x|y) - (x^y) ≡ x + y: the third MBA spelling of an addition.
     checkEquivalent(f, [&](Function& fn, uint64_t x, uint64_t y) {
       const ExprId xv = fn.constant(t, x);
@@ -602,6 +616,34 @@ TEST_CASE("structural: the rewrite produces the promised shape", "[passes][algeb
       REQUIRE(f.function.asConstant(out, k));
       CHECK(k == 0);
     }
+  }
+
+  SECTION("opaque fuel: (x*~x) & 1 is always zero, either association") {
+    const Type t32 = Type::integer(32);
+    const ExprId x32 = f.function.cast(ExprOp::Trunc, t32, x);
+    const ExprId notX = f.function.unary(ExprOp::Not, x32);
+    for (const ExprId product : {f.function.binary(ExprOp::Mul, x32, notX),
+                                 f.function.binary(ExprOp::Mul, notX, x32)}) {
+      const ExprId id =
+          f.function.binary(ExprOp::And, product, f.function.constant(t32, 1));
+      const ExprId out = xdec::passes::simplifyAlgebra(f.function, id);
+      uint64_t k = 1;
+      REQUIRE(f.function.asConstant(out, k));
+      CHECK(k == 0);
+    }
+  }
+
+  SECTION("the obfuscated increment collapses to a plain add") {
+    const ExprId doubled = f.function.binary(ExprOp::Shl, x, f.function.constant(t, 1));
+    const ExprId id = f.function.binary(
+        ExprOp::Sub, f.function.binary(ExprOp::Or, doubled, f.function.constant(t, 2)),
+        f.function.binary(ExprOp::Xor, x, f.function.constant(t, 1)));
+    const il::Expr& out = f.function.expr(xdec::passes::simplifyAlgebra(f.function, id));
+    REQUIRE(out.op == ExprOp::Add);
+    CHECK(out.operands[0] == x);
+    uint64_t k = 0;
+    REQUIRE(f.function.asConstant(out.operands[1], k));
+    CHECK(k == 1);
   }
 
   SECTION("the sbfm sign-extension closed form becomes a sext of a trunc") {

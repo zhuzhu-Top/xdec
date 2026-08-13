@@ -2,6 +2,7 @@
 #include "transform.h"
 
 #include <unordered_map>
+#include <vector>
 
 #include "xdec/il/ceval.h"
 
@@ -195,6 +196,165 @@ class FlagConditionRewrite {
   const il::Expr flagDef_;
 };
 
+/// Distributes a FlagCond through a flags-typed phi that `foldFlagConditions`
+/// cannot see through directly: its pattern is `flagcond(flagdef ...)`, and a
+/// bundle that reaches its test by crossing a real CFG merge -- two blocks
+/// each setting flags their own way before a shared test -- arrives as
+/// `flagcond(phi(flagdef ..., flagdef ...))` instead, and stays the
+/// `/*flagcond*/0` stub even though every edge into the merge is individually
+/// foldable.
+///
+/// This distributes the *test* across the merge rather than trying to prove
+/// the bundle itself is one value: one boolean phi, synthesized once per
+/// (flags phi, condition code) pair and cached so every FlagCond that shares
+/// the pair shares the phi, whose inputs are each edge's own flags rewritten
+/// independently (recursing through further phis for a merge of merges). An
+/// edge whose flags still cannot be resolved -- a load, a call result, a flag
+/// bundle from another architecture register -- keeps its own honest FlagCond
+/// there rather than costing every other, resolvable edge the same opacity.
+/// A loop-carried flags phi's back edge, which refers to the phi being built,
+/// is exactly such an edge: nothing upstream can resolve it without
+/// re-executing the loop, so it is left as a FlagCond over that edge's value.
+class FlagPhiDistributor {
+ public:
+  explicit FlagPhiDistributor(il::Function& function) : function_(function) {}
+
+  /// `flags` denotes a flags-typed expression; returns the boolean `code`
+  /// denotes, or an invalid id when it cannot be resolved from here.
+  [[nodiscard]] il::ExprId resolve(il::ExprId flags, il::ConditionCode code) {
+    return resolveRec(flags, code, 0);
+  }
+
+ private:
+  struct Key {
+    uint32_t phiValue;
+    uint8_t code;
+    friend bool operator==(const Key&, const Key&) = default;
+  };
+  struct KeyHash {
+    std::size_t operator()(const Key& key) const noexcept {
+      return (static_cast<std::size_t>(key.phiValue) << 8) | key.code;
+    }
+  };
+
+  // Generous but finite: memoization already bounds the total number of
+  // synthesized phis to (flags phis) x (condition codes), so this only guards
+  // against a pathologically long non-cyclic merge-of-merges chain.
+  static constexpr int kMaxDepth = 64;
+
+  [[nodiscard]] il::ExprId resolveRec(il::ExprId flags, il::ConditionCode code, int depth) {
+    const il::Expr expr = function_.expr(flags);
+    if (expr.op == il::ExprOp::FlagDef) {
+      return FlagConditionRewrite(function_, expr).rewrite(code);
+    }
+    if (expr.op != il::ExprOp::Value || depth >= kMaxDepth) {
+      return il::ExprId{};
+    }
+    const auto value = il::ValueId{static_cast<uint32_t>(expr.immediate)};
+    const il::ValueInfo& info = function_.value(value);
+    if (!info.definition.valid() || function_.op(info.definition).code != il::OpCode::Phi) {
+      return il::ExprId{};
+    }
+    const Key key{value.index(), static_cast<uint8_t>(code)};
+    if (const auto found = cache_.find(key); found != cache_.end()) {
+      return function_.valueRef(found->second);
+    }
+    const il::OpId phiOp = info.definition;
+    const std::vector<il::ExprId> incoming(function_.operands(function_.op(phiOp)).begin(),
+                                           function_.operands(function_.op(phiOp)).end());
+    // Cached before recursing: a loop-carried flags phi's back edge names
+    // this same value, and that edge must find this phi here rather than
+    // recurse into building it again.
+    const il::ValueId newPhi =
+        function_.prependPhi(info.block, function_.op(phiOp).va, il::Type::integer(1));
+    cache_.emplace(key, newPhi);
+
+    std::vector<il::ExprId> rewritten;
+    rewritten.reserve(incoming.size());
+    for (const il::ExprId in : incoming) {
+      il::ExprId arm = (in == flags) ? il::ExprId{} : resolveRec(in, code, depth + 1);
+      if (!arm.valid()) {
+        arm = function_.flagCondition(in, code);
+      }
+      rewritten.push_back(arm);
+    }
+    function_.setOperands(function_.value(newPhi).definition, rewritten);
+    return function_.valueRef(newPhi);
+  }
+
+  il::Function& function_;
+  std::unordered_map<Key, il::ValueId, KeyHash> cache_;
+};
+
+/// Same shape as foldFlagConditionsRec, extended with the phi case above.
+il::ExprId distributeFlagCondRec(il::Function& function, il::ExprId id,
+                                 std::unordered_map<il::ExprId, il::ExprId>& memo,
+                                 FlagPhiDistributor& distributor) {
+  if (const auto found = memo.find(id); found != memo.end()) {
+    return found->second;
+  }
+  const il::Expr expr = function.expr(id);
+  il::Expr rebuilt = expr;
+  bool changed = false;
+  for (unsigned index = 0; index < expr.operandCount; ++index) {
+    const il::ExprId folded =
+        distributeFlagCondRec(function, expr.operands[index], memo, distributor);
+    changed |= folded != expr.operands[index];
+    rebuilt.operands[index] = folded;
+  }
+  il::ExprId result = changed ? function.intern(rebuilt) : id;
+
+  if (expr.op == il::ExprOp::FlagCond) {
+    const il::Expr& cond = function.expr(result);
+    const il::Expr& flags = function.expr(cond.operands[0]);
+    if (flags.op != il::ExprOp::FlagDef) {
+      if (const il::ExprId resolved = distributor.resolve(
+              cond.operands[0], static_cast<il::ConditionCode>(cond.immediate));
+          resolved.valid()) {
+        result = resolved;
+      }
+    }
+  }
+  memo.emplace(id, result);
+  return result;
+}
+
+/// Runs distributeFlagCondRec over every op operand. A separate driver from
+/// foldOperands below (rather than reusing it) because prependPhi mutates the
+/// block whose ops foldOperands' own loop is walking live; this one is used
+/// nowhere else, so it owns its snapshot-first traversal outright instead of
+/// making every foldOperands caller pay for a hazard only this one has.
+bool distributeFlagCondThroughPhi(il::Function& function) {
+  FlagPhiDistributor distributor(function);
+  std::unordered_map<il::ExprId, il::ExprId> memo;
+  bool changed = false;
+  for (const il::BlockId blockId : function.blockHandles()) {
+    // Snapshotted: prependPhi below inserts into a block's op list, which
+    // would otherwise invalidate this loop mid-walk when that block is the
+    // one being visited.
+    const std::vector<il::OpId> ops(function.block(blockId).ops.begin(),
+                                    function.block(blockId).ops.end());
+    for (const il::OpId opId : ops) {
+      const auto operands = function.operands(function.op(opId));
+      if (operands.empty()) {
+        continue;
+      }
+      std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
+      bool opChanged = false;
+      for (il::ExprId& operand : rewritten) {
+        const il::ExprId next = distributeFlagCondRec(function, operand, memo, distributor);
+        opChanged |= next != operand;
+        operand = next;
+      }
+      if (opChanged) {
+        function.setOperands(opId, rewritten);
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
 il::ExprId foldFlagConditionsRec(il::Function& function, il::ExprId id,
                                  std::unordered_map<il::ExprId, il::ExprId>& memo) {
   if (const auto found = memo.find(id); found != memo.end()) {
@@ -275,9 +435,15 @@ bool foldConstants(il::Function& function) {
 }
 
 bool foldFlagConditions(il::Function& function) {
-  return foldOperands(function, [](il::Function& f, il::ExprId id) {
+  const bool direct = foldOperands(function, [](il::Function& f, il::ExprId id) {
     return foldFlagConditions(f, id);
   });
+  // Order does not matter for correctness -- the two patterns are disjoint,
+  // matched on what the flags operand's own expression is -- but running the
+  // cheap direct rewrite first means fewer FlagCond nodes are still standing
+  // when the phi walk below looks for them.
+  const bool distributed = distributeFlagCondThroughPhi(function);
+  return direct || distributed;
 }
 
 }  // namespace xdec::passes

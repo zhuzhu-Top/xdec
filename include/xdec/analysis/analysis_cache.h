@@ -19,6 +19,7 @@
 #include <string_view>
 #include <vector>
 
+#include "xdec/analysis/dispatch_region.h"
 #include "xdec/analysis/dominators.h"
 #include "xdec/analysis/loops.h"
 #include "xdec/analysis/stack_frame.h"
@@ -36,6 +37,7 @@ struct AnalysisCacheStats {
   unsigned postDominatorsComputed = 0;
   unsigned loopsComputed = 0;
   unsigned stackFrameComputed = 0;
+  unsigned dispatchRegionsComputed = 0;
 };
 
 /// Binds to one Function for its whole lifetime -- a different function gets
@@ -62,6 +64,11 @@ class AnalysisCache {
   /// for dominators once, not twice.
   [[nodiscard]] const std::vector<NaturalLoop>& loops() const;
   [[nodiscard]] const StackFrame& stackFrame() const;
+  /// See analysis::findDispatchRegions. Independent of dominators/loops --
+  /// it reads jump-table and clamp shapes off the function's own
+  /// expressions and edges, not off either tree -- so it is invalidated by
+  /// "cfg" alone, not by "dominators".
+  [[nodiscard]] const std::vector<DispatchRegion>& dispatchRegions() const;
 
   /// Drops whichever cached analyses `tags` names, so the next accessor call
   /// recomputes them from the function as it looks right now. Tags share
@@ -75,6 +82,9 @@ class AnalysisCache {
   ///                            builtin pass declares it today, since every
   ///                            stack-affecting pass runs before the point
   ///                            StackFrame is ever computed)
+  ///   "cfg" or "dispatch"   -- dispatchRegions() ("dispatch" is reserved
+  ///                            the same way "stack" is: no builtin pass
+  ///                            declares it today)
   ///
   /// An empty `tags` (the default) invalidates everything, for a caller that
   /// does not know or does not trust which specific tag applies.
@@ -88,6 +98,7 @@ class AnalysisCache {
   mutable std::optional<PostDominators> postDominators_;
   mutable std::optional<std::vector<NaturalLoop>> loops_;
   mutable std::optional<StackFrame> stackFrame_;
+  mutable std::optional<std::vector<DispatchRegion>> dispatchRegions_;
   mutable AnalysisCacheStats stats_;
 };
 

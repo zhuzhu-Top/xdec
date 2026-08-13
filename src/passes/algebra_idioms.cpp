@@ -385,6 +385,51 @@ il::ExprId matchMbaSub(il::Function& function, const il::Expr& subExpr) {
   return {};
 }
 
+il::ExprId matchObfuscatedIncrement(il::Function& function, const il::Expr& subExpr) {
+  const Pair orPair = operandsOf(function, subExpr.operands[0], il::ExprOp::Or);
+  if (!orPair) {
+    return {};
+  }
+  const il::ExprId v = doubledOperand(function, orPair.lhs);
+  const Konst two = constantOf(function, orPair.rhs);
+  if (!v.valid() || !two || two.value != 2) {
+    return {};
+  }
+  const Pair xorPair = operandsOf(function, subExpr.operands[1], il::ExprOp::Xor);
+  if (!xorPair || xorPair.lhs != v) {
+    return {};
+  }
+  const Konst one = constantOf(function, xorPair.rhs);
+  if (!one || one.value != 1) {
+    return {};
+  }
+  return function.binary(il::ExprOp::Add, v, function.constant(subExpr.type, 1));
+}
+
+bool matchEvenProduct(const il::Function& function, il::ExprId mulId) {
+  const il::Expr& expr = function.expr(mulId);
+  if (expr.op != il::ExprOp::Mul) {
+    return false;
+  }
+  for (const int arm : {0, 1}) {
+    const il::ExprId other = expr.operands[arm ^ 1];
+    const il::Expr& factor = function.expr(expr.operands[arm]);
+    // v * (v±1), either association: two consecutive integers.
+    if (factor.op == il::ExprOp::Sub || factor.op == il::ExprOp::Add) {
+      const Konst one = constantOf(function, factor.operands[1]);
+      if (one && one.value == 1 && factor.operands[0] == other) {
+        return true;
+      }
+    }
+    // v * ~v, either association: NOT flips bit 0, so exactly one of the pair
+    // is even no matter what v is.
+    if (factor.op == il::ExprOp::Not && factor.operands[0] == other) {
+      return true;
+    }
+  }
+  return false;
+}
+
 il::ExprId matchShiftedCompare(il::Function& function, const il::Expr& cmpExpr) {
   // The shifted side can be either one: the IL has no `>` or `>=`, so half of
   // the comparisons a program makes arrive with their operands swapped.

@@ -82,6 +82,15 @@ class ValueSubst {
 
 /// Whole-function drivers over the expression rewrites. Return whether any op
 /// operand changed.
+///
+/// foldFlagConditions' whole-function form also distributes a FlagCond
+/// through a flags-typed phi it merges through -- two blocks each setting
+/// flags their own way before a shared test -- by synthesizing one boolean
+/// phi per (flags phi, condition code) and rewriting each incoming edge
+/// independently, so a real cross-block merge folds as far as its
+/// individually-resolvable edges allow instead of degrading the whole test to
+/// one opaque stub. The single-expression form does not: it has no function
+/// to insert the synthesized phi into.
 bool foldConstants(il::Function& function);
 bool foldFlagConditions(il::Function& function);
 

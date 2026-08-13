@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "xdec/analysis/dominators.h"
+#include "xdec/analysis/indexed_transform_loop.h"
 #include "xdec/analysis/live_register_frame.h"
 #include "xdec/analysis/loops.h"
 #include "xdec/il/function.h"
@@ -58,6 +59,28 @@ inline constexpr std::array<PatternAttempt, 4> kCondBranchPatterns{{
     {"guard-cascade", 1},
     {"dispatch-tree", 2},
     {"one-sided", 3},
+}};
+
+/// J2's own reserved slot (docs/architecture-optimization-eval-prompt.md §3
+/// Phase 3): a *region*-level pass -- one that claims an entire
+/// analysis::DispatchRegion's worth of `IndirectBranch` sites into a single
+/// mega-switch (analysis::DispatchRegion's own many small two-way sites,
+/// collapsed rather than left as a nested tree) -- is not one of
+/// `kCondBranchPatterns` above, which is a `CondBranch`-site table only, and
+/// runs at a different point in `Structurizer::run()` (once per qualifying
+/// region, ahead of `emitRegion`'s per-block walk, not once per site inside
+/// it). Named and frozen here as its own table, the same doc-only,
+/// checked-by-a-test discipline `kCondBranchPatterns` already holds to,
+/// purely so the interface exists before the implementation does: nothing
+/// in `Structurizer` reads this yet, and `StructureOptions::regionStructuring`
+/// (default off) is what Phase 3's actual pass gates on once it exists.
+struct RegionPatternAttempt {
+  std::string_view name;
+  int priority;
+};
+
+inline constexpr std::array<RegionPatternAttempt, 1> kRegionPatterns{{
+    {"region-switch", 0},
 }};
 
 enum class StmtKind : uint8_t {
@@ -132,6 +155,10 @@ struct Stmt {
   /// was found but this exact save/restore protocol was not -- emission then
   /// prints every case's edge copies in full, same as any ordinary switch.
   std::optional<analysis::LiveRegisterFrame> frame;  // Switch
+  /// While/DoWhile: the load/transform/store shape found in this loop's own
+  /// body (see analysis::matchIndexedTransformLoop). Null when the loop was
+  /// not this shape at all -- most loops -- printing nothing extra for it.
+  std::optional<analysis::IndexedTransformLoop> transform;  // While, DoWhile
 
   static StmtPtr make(StmtKind kind) {
     auto stmt = std::make_unique<Stmt>();
@@ -156,11 +183,46 @@ struct StructuredFunction {
   std::vector<std::string_view> matchedPatterns;
 };
 
+/// Track B / J1 (docs/18-architecture-optimization-plan.md §5.2): `switchFor`'s
+/// two-live-target table dispatch normally collapses straight to `if (cond)
+/// A else B` (see analysis::matchDispatchValues) -- the right call for an
+/// isolated site, but wrong for one of hundreds of sites all reading through
+/// the same physical table (see analysis::DispatchRegion): collapsing every
+/// one loses the table identity that ties them together, with nothing
+/// (yet) rebuilding it. `minRegionSites` defers that collapse -- keeping the
+/// table-mode `Switch` instead -- for a site that is a member of a region
+/// with at least this many sites; below it, a two-way table dispatch really
+/// is just an isolated `if` and collapses exactly as before.
+struct StructureOptions {
+  /// A region this large is `analysis::ObfuscationProfile::likelyFlattened`'s
+  /// own `dispatcherFanIn >= 8` floor, restated for region membership rather
+  /// than one block's unresolved fan-in -- the same "this is not an ordinary
+  /// switch table" line, drawn from IL shape alone.
+  std::size_t minRegionSites = 8;
+  /// Test/diagnostic override, independent of `minRegionSites`: when true,
+  /// every resolved two-way table dispatch defers its collapse, regardless
+  /// of whether it belongs to any region at all -- lets a small synthetic
+  /// fixture exercise "what a deferred site prints like" without first
+  /// building a region large enough to cross `minRegionSites` on its own.
+  /// Never set by decompileToC()'s own default path.
+  bool deferRegionCollapse = false;
+  /// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): gates the
+  /// not-yet-implemented region pass named at `kRegionPatterns` -- collapsing
+  /// a whole analysis::DispatchRegion's nested tree of two-way sites into one
+  /// mega-switch rather than leaving `switchFor` to structure each site on
+  /// its own. Frozen here, ahead of that pass's own landing, so
+  /// `StructureOptions`'s shape does not have to change again once it does;
+  /// `Structurizer` does not read this field yet, so setting it true today
+  /// changes nothing.
+  bool regionStructuring = false;
+};
+
 /// Structures the whole function. The analyses must be computed from the
 /// same function and outlive the call.
 [[nodiscard]] StructuredFunction structureFunction(
     const il::Function& function, const analysis::Dominators& dominators,
     const analysis::PostDominators& postDominators,
-    std::span<const analysis::NaturalLoop> loops);
+    std::span<const analysis::NaturalLoop> loops,
+    const StructureOptions& options = {});
 
 }  // namespace xdec::emit

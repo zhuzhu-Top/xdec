@@ -21,6 +21,8 @@ add_executable(xdec_tests
   support/test_result.cpp
   analysis/test_analysis.cpp
   analysis/test_analysis_cache.cpp
+  analysis/test_dispatch_region.cpp
+  analysis/test_dispatch_values.cpp
   analysis/test_dispatcher_shape.cpp
   analysis/test_emit_redundancy.cpp
   analysis/test_expr_reuse.cpp
@@ -29,6 +31,7 @@ add_executable(xdec_tests
   analysis/test_image_literals.cpp
   analysis/test_import_callee.cpp
   analysis/test_index_bound.cpp
+  analysis/test_indexed_transform_loop.cpp
   analysis/test_jump_table.cpp
   analysis/test_live_register_frame.cpp
   analysis/test_load_inline.cpp
@@ -40,19 +43,27 @@ add_executable(xdec_tests
   analysis/test_stack_store_fold.cpp
   analysis/test_typed_variables.cpp
   analysis/test_variables.cpp
+  analysis/test_vtable_call.cpp
   decompile/test_driver.cpp
   decompile/test_decompile_to_c.cpp
   decompile/test_api.cpp
+  decompile/test_analysis_cache_observer.cpp
   emit/test_structure.cpp
+  emit/test_structure_dispatch_region.cpp
+  emit/test_structure_join_epilogue.cpp
+  emit/test_structure_labeled_loop.cpp
+  emit/test_structure_region_switch.cpp
   emit/test_c_printer.cpp
   emit/test_c_atomic.cpp
   emit/test_c_expr.cpp
   emit/test_c_expr_reuse.cpp
+  emit/test_c_dead_routing_store.cpp
   emit/test_c_helpers_header.cpp
   emit/test_c_load_inline.cpp
   emit/test_c_stack_load_inline.cpp
     emit/test_c_address_form.cpp
     emit/test_c_import_call.cpp
+    emit/test_c_vtable_call.cpp
     emit/test_c_syscall.cpp
     emit/test_c_types.cpp
   emit/test_c_phi_edges.cpp

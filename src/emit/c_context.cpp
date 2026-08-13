@@ -30,8 +30,10 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
       structured(theStructured),
       options(theOptions),
       literals(theOptions.imageReader, theOptions.memory),
-      deadOps(theStructured.root ? collectDeadOps(theFunction, *theStructured.root, theOptions)
-                                 : std::unordered_set<uint32_t>{}) {
+      deadOps(theStructured.root
+                  ? collectDeadOps(theFunction, theFrame, theVariables, *theStructured.root,
+                                   theOptions)
+                  : std::unordered_set<uint32_t>{}) {
   if (options.types != nullptr) {
     binder_.emplace(*options.types, [this](uint64_t va) {
       const SymbolRef symbol = symbolAt(va);
@@ -87,6 +89,9 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
                                InlinedMemoryLoad{load.address, load.width});
   }
   deadLocalStackDeltas = prep.deadLocalStackDeltas;
+  for (const analysis::VtableCallSite& site : analysis::findConfirmedVtableCalls(function)) {
+    vtableCalls.emplace(site.call.index(), site);
+  }
 }
 
 const std::string* CContext::tempFor(il::ValueId value) const {

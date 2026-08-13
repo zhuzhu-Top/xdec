@@ -15,6 +15,7 @@
 #include "common.h"
 #include "options.h"
 #include "session.h"
+#include "xdec/analysis/dispatch_region.h"
 #include "xdec/analysis/emit_redundancy.h"
 #include "xdec/analysis/expr_reuse.h"
 #include "xdec/analysis/profile.h"
@@ -198,6 +199,11 @@ int commandDecompile(std::string_view path, uint64_t address,
   // of what a header happened to name.
   bool indexedArgumentNames = true;
   bool securityHintsAsComments = true;
+  // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): off by
+  // default, same as StructureOptions::regionStructuring's own default --
+  // this flag exists only so an `eval`/`samples` run can opt in for L2
+  // observation without a unit test standing in for the CLI.
+  bool regionStructuring = false;
   for (std::size_t i = 0; i < options.size(); ++i) {
     const std::string_view option = options[i];
     const auto value = [&]() -> std::string_view {
@@ -223,6 +229,8 @@ int commandDecompile(std::string_view path, uint64_t address,
       emitReport = true;
     } else if (option == "--dump-il") {
       dumpIl = true;
+    } else if (option == "--region-structuring") {
+      regionStructuring = true;
     } else if (option == "--types") {
       typeSources.emplace_back(value());
     } else if (option == "--syscall-table") {
@@ -305,10 +313,12 @@ int commandDecompile(std::string_view path, uint64_t address,
   toCOptions.emit.helpersHeader = helpersHeader;
   toCOptions.emit.indexedArgumentNames = indexedArgumentNames;
   toCOptions.emit.securityHintsAsComments = securityHintsAsComments;
+  toCOptions.structure.regionStructuring = regionStructuring;
   // `--emit-report` now asks decompileToC() itself for the scan (see
   // DecompileToCOptions::computeEmitRedundancy) instead of the CLI repeating
   // it over the result -- the same report, the same one function-sized scan.
   toCOptions.computeEmitRedundancy = emitReport;
+  toCOptions.computeObfuscationProfile = emitReport;
   auto result = xdec::decompile::decompileToC(engine, reader, address, registry, toCOptions);
   if (!result) {
     return reportError(result.error());
@@ -332,6 +342,25 @@ int commandDecompile(std::string_view path, uint64_t address,
   }
   if (emitReport && result->report.emitRedundancy) {
     print("emit-report: {}", result->report.emitRedundancy->format());
+  }
+  if (emitReport && result->report.obfuscationProfile) {
+    print("profile: {}", result->report.obfuscationProfile->format());
+  }
+  if (emitReport) {
+    const auto regions = xdec::analysis::findDispatchRegions(function);
+    std::size_t totalSites = 0;
+    for (const auto& region : regions) {
+      totalSites += region.sites.size();
+    }
+    print("dispatch-regions: {} region(s), {} site(s) total", regions.size(), totalSites);
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+      const auto& region = regions[i];
+      print("  region[{}]: table=0x{:x} stride={} entryBits={} clamp={} sites={} sharedTail={}", i,
+            region.tableBase, region.tableStride, region.tableEntryBits,
+            region.clampBound ? std::format("0x{:x}/0x{:x}", *region.clampBound, *region.clampReplacement)
+                              : std::string("none"),
+            region.sites.size(), region.sharedTail.has_value());
+    }
   }
 
   print("emit: {} argument(s), {} local(s), {} temp(s), {} labeled block(s)",

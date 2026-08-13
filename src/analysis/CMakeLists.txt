@@ -3,6 +3,8 @@ xdec_add_library(xdec_analysis
     analysis_cache.cpp
     atomic_exclusive.cpp
     call_target.cpp
+    dispatch_region.cpp
+    dispatch_values.cpp
     dispatcher_shape.cpp
     dominators.cpp
     expr_reuse.cpp
@@ -11,6 +13,7 @@ xdec_add_library(xdec_analysis
     image_literals.cpp
     index_bound.cpp
     import_callee.cpp
+    indexed_transform_loop.cpp
     jump_table.cpp
     live_register_frame.cpp
     load_inline.cpp
@@ -28,6 +31,7 @@ xdec_add_library(xdec_analysis
     typed_variables.cpp
     value_uses.cpp
     variables.cpp
+    vtable_call.cpp
   DEPS
     xdec_il
     xdec_support

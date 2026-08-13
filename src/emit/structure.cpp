@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <limits>
 
+#include "xdec/analysis/dispatch_values.h"
 #include "xdec/analysis/dispatcher_shape.h"
 #include "xdec/analysis/guard_cascade.h"
 #include "xdec/analysis/jump_table.h"
@@ -83,6 +84,41 @@ StmtPtr cloneStmt(const Stmt* node) {
   copy->mergeBlock = node->mergeBlock;
   copy->frame = node->frame;
   return copy;
+}
+
+/// Whether `node`'s tree holds a nested `Switch` anywhere -- claimOrCloneSharedCaseBody's
+/// own honesty check on top of its op-count size cap (see its own comment): a
+/// scatter-dispatcher's handler routinely does its own tiny bit of work and
+/// then dispatches again through the very same table, so a body that reads as
+/// "small" by trail_ growth alone -- an unclaimed nested switch's own cases
+/// cost this walk nothing, since they are goto placeholders for the driver's
+/// ordinary top-level walk to pick up later, not blocks this speculative
+/// region claims -- can still print as another whole switch statement, and
+/// if that nested switch's own cases are shared handlers too, the same cheap
+/// check fires again one level down. Bounding by *this* instead means a
+/// clone that would otherwise nest a further dispatch is left as a goto,
+/// where the driver's own top-level walk still gets to fold it (into the
+/// dispatch region's own table-mode switch, per J1) exactly once rather than
+/// once per predecessor.
+bool containsSwitch(const Stmt* node) {
+  if (node == nullptr) {
+    return false;
+  }
+  if (node->kind == StmtKind::Switch) {
+    return true;
+  }
+  for (const StmtPtr& item : node->items) {
+    if (containsSwitch(item.get())) return true;
+  }
+  if (containsSwitch(node->thenArm.get())) return true;
+  if (containsSwitch(node->elseArm.get())) return true;
+  if (containsSwitch(node->body.get())) return true;
+  for (const StmtPtr& body : node->caseBodies) {
+    if (containsSwitch(body.get())) return true;
+  }
+  if (containsSwitch(node->defaultBody.get())) return true;
+  if (containsSwitch(node->epilogue.get())) return true;
+  return false;
 }
 
 /// The block `stmt` runs first when control falls into it with no jump of
@@ -295,15 +331,72 @@ void collectReferences(const Stmt* node, std::set<il::BlockId>& out) {
   collectReferences(node->body.get(), out);
 }
 
+/// Whether `node` holds a `While`/`DoWhile` anywhere in its own tree.
+/// `collapseLabeledNaturalLoops` (J2f) uses this to stay out of the
+/// nested-loop case entirely: folding an inner loop's already-`continue`d
+/// back edge into an outer merge would need to tell that `continue` apart
+/// from one meant for the loop being built here, which nothing here does
+/// (see `Structurizer::continueAtBackEdges`'s own nested-loop stop).
+bool containsLoopStmt(const Stmt* node) {
+  if (node == nullptr) {
+    return false;
+  }
+  if (node->kind == StmtKind::While || node->kind == StmtKind::DoWhile) {
+    return true;
+  }
+  for (const StmtPtr& item : node->items) {
+    if (containsLoopStmt(item.get())) {
+      return true;
+    }
+  }
+  if (containsLoopStmt(node->thenArm.get()) || containsLoopStmt(node->elseArm.get())) {
+    return true;
+  }
+  for (const StmtPtr& body : node->caseBodies) {
+    if (containsLoopStmt(body.get())) {
+      return true;
+    }
+  }
+  return containsLoopStmt(node->defaultBody.get()) || containsLoopStmt(node->epilogue.get());
+}
+
+/// Every `Stmt::Block` this tree actually prints code for, mapped to
+/// `groupIndex` -- `collapseLabeledNaturalLoops`'s own view of "which
+/// top-level entry is this block's code really under", since a plain
+/// fallthrough (see emitRegion's Branch case) routinely folds a second block
+/// into the first one's own entry without either needing its own.
+void collectReferencedBlocks(const Stmt* node, std::size_t groupIndex,
+                             std::map<il::BlockId, std::size_t>& out) {
+  if (node == nullptr) {
+    return;
+  }
+  if (node->kind == StmtKind::Block && node->block.valid()) {
+    out.emplace(node->block, groupIndex);
+  }
+  for (const StmtPtr& item : node->items) {
+    collectReferencedBlocks(item.get(), groupIndex, out);
+  }
+  collectReferencedBlocks(node->thenArm.get(), groupIndex, out);
+  collectReferencedBlocks(node->elseArm.get(), groupIndex, out);
+  collectReferencedBlocks(node->body.get(), groupIndex, out);
+  for (const StmtPtr& body : node->caseBodies) {
+    collectReferencedBlocks(body.get(), groupIndex, out);
+  }
+  collectReferencedBlocks(node->defaultBody.get(), groupIndex, out);
+  collectReferencedBlocks(node->epilogue.get(), groupIndex, out);
+}
+
 }  // namespace
 
 Structurizer::Structurizer(const il::Function& function,
                            const analysis::Dominators& dominators,
                            const analysis::PostDominators& postDominators,
-                           std::span<const analysis::NaturalLoop> loops)
+                           std::span<const analysis::NaturalLoop> loops,
+                           const StructureOptions& options)
     : function_(function),
       dominators_(dominators),
       postDominators_(postDominators),
+      options_(options),
       budget_(static_cast<std::size_t>(function.blockCount()) * kBudgetPerBlock) {
   for (const analysis::NaturalLoop& loop : loops) {
     loopByHeader_[loop.header] = &loop;
@@ -352,6 +445,12 @@ StructuredFunction Structurizer::run() {
     }
     groups.emplace_back(blockId, emitRegion(blockId, il::BlockId{}, 0));
   }
+
+  // J2f (docs/architecture-optimization-eval-prompt.md §6.5): both sweeps
+  // above are done leaving behind whatever labelled remnants no pattern
+  // wanted, so this is the last chance to notice a natural loop hiding among
+  // them before the sort below fixes their final order.
+  collapseLabeledNaturalLoops(groups);
 
   std::map<il::BlockId, std::size_t> rank;
   for (const il::BlockId blockId : dominators_.rpo()) {
@@ -922,6 +1021,9 @@ StmtPtr Structurizer::tryLoop(const analysis::NaturalLoop& loop, unsigned depth)
   if (result == nullptr) {
     result = tryDispatcherLoop(loop, depth);
   }
+  if (result != nullptr) {
+    result->transform = analysis::matchIndexedTransformLoop(function_, loop);
+  }
 
   inProgressHeaders_.erase(header);
   return result;
@@ -947,8 +1049,11 @@ StmtPtr Structurizer::tryDispatcherLoop(const analysis::NaturalLoop& loop, unsig
       continue;
     }
     const auto dispatchTargets = function_.targets(*dispatchTerm);
-    const std::optional<analysis::DispatcherShape> shape =
+    std::optional<analysis::DispatcherShape> shape =
         analysis::matchDispatcherShape(function_, dispatch, dispatchTargets);
+    if (!shape.has_value()) {
+      shape = matchRegionConfirmedShape(dispatch, dispatchTargets);
+    }
     if (!shape.has_value() || shape->hub != header ||
         std::find(loop.latches.begin(), loop.latches.end(), shape->merge) ==
             loop.latches.end()) {
@@ -1044,6 +1149,190 @@ StmtPtr Structurizer::tryDispatcherLoop(const analysis::NaturalLoop& loop, unsig
   return nullptr;
 }
 
+void Structurizer::collapseLabeledNaturalLoops(
+    std::vector<std::pair<il::BlockId, StmtPtr>>& groups) {
+  // Which top-level entry a block's own code actually lives under -- not
+  // just the entry's own starting block (`groups[i].first`), but every block
+  // a sibling's plain fallthrough happened to absorb along the way (see
+  // emitRegion's Branch case): the RPO sweep's own claim order routinely
+  // hands one member of a loop's block set the block right after it for free
+  // this way, and requiring every member to be its own separate entry would
+  // reject that shape outright instead of still finding the loop hiding
+  // across the (fewer) entries it actually landed in.
+  std::map<il::BlockId, std::size_t> ownerOf;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    collectReferencedBlocks(groups[index].second.get(), index, ownerOf);
+  }
+  std::map<il::BlockId, std::size_t> rank;
+  for (const il::BlockId blockId : dominators_.rpo()) {
+    rank.emplace(blockId, rank.size());
+  }
+  // Indices folded into some other loop's merge already, kept separate from
+  // `groups` itself (rather than erasing as each loop is decided) so a
+  // header's own map lookup above stays valid across every loop this visits.
+  std::set<std::size_t> consumed;
+  for (const auto& [header, loopPtr] : loopByHeader_) {
+    const auto headerOwner = ownerOf.find(header);
+    if (headerOwner == ownerOf.end() || consumed.contains(headerOwner->second)) {
+      continue;  // not its own top-level entry: already inside some other pattern
+    }
+    const std::size_t headerIndex = headerOwner->second;
+    StmtPtr& headerStmt = groups[headerIndex].second;
+    // `header` need not be this group's own starting block: a plain
+    // fallthrough chain (emitRegion's Branch case keeps appending to the
+    // *same* Sequence as it walks) routinely lands an earlier, unrelated
+    // block's own code ahead of `header` in this exact `items` vector --
+    // e.g. the function's real entry block falling straight into a
+    // dispatch loop's header. That earlier code plainly must not end up
+    // inside `while (true)`, re-running every iteration, so the split point
+    // is `header`'s own `Block` item, not the group's front.
+    std::size_t splitPos = headerStmt->items.size();
+    for (std::size_t index = 0; index < headerStmt->items.size(); ++index) {
+      const Stmt* item = headerStmt->items[index].get();
+      if (item->kind == StmtKind::Block && item->block == header) {
+        splitPos = index;
+        break;
+      }
+    }
+    if (splitPos == headerStmt->items.size()) {
+      continue;  // header's own block never printed as a plain top-level item here
+    }
+    bool tailAlreadyLoops = false;
+    for (std::size_t index = splitPos; index < headerStmt->items.size(); ++index) {
+      if (containsLoopStmt(headerStmt->items[index].get())) {
+        tailAlreadyLoops = true;
+        break;
+      }
+    }
+    if (tailAlreadyLoops) {
+      continue;  // tryLoop/wrapAsLoop (or a nested nat. loop) already claimed this header
+    }
+    // Every other top-level entry this loop's own blocks turn out to live
+    // under, deduplicated (several members can share one absorbing entry) and
+    // each still required to *start* at one of this same loop's own blocks --
+    // an entry that starts outside the loop and merely flows into it on its
+    // own way to something else is not this loop's body to claim, whatever
+    // it happened to pick up along the way.
+    std::set<std::size_t> contributing;
+    bool everyMemberIsAccountedFor = true;
+    for (const il::BlockId member : loopPtr->blocks) {
+      if (member == header) {
+        continue;
+      }
+      const auto owner = ownerOf.find(member);
+      if (owner == ownerOf.end() || consumed.contains(owner->second)) {
+        everyMemberIsAccountedFor = false;
+        break;
+      }
+      if (owner->second != headerIndex) {
+        contributing.insert(owner->second);
+      }
+    }
+    if (!everyMemberIsAccountedFor) {
+      continue;
+    }
+    bool everyContributorQualifies = true;
+    for (const std::size_t index : contributing) {
+      if (!loopPtr->blocks.contains(groups[index].first) ||
+          containsLoopStmt(groups[index].second.get())) {
+        everyContributorQualifies = false;
+        break;
+      }
+    }
+    if (!everyContributorQualifies) {
+      continue;  // some contributing entry starts outside the loop, or holds a loop of its own
+    }
+    // Reading order for the merged body: the same reverse-post-order `run`
+    // sorts the whole function by, so a member reached from several sibling
+    // handlers still lands somewhere a reader's eye would expect it.
+    std::vector<std::size_t> ordered(contributing.begin(), contributing.end());
+    std::sort(ordered.begin(), ordered.end(),
+              [&groups, &rank](std::size_t lhs, std::size_t rhs) {
+                return rank[groups[lhs].first] < rank[groups[rhs].first];
+              });
+    auto body = Stmt::make(StmtKind::Sequence);
+    for (std::size_t index = splitPos; index < headerStmt->items.size(); ++index) {
+      body->items.push_back(std::move(headerStmt->items[index]));
+    }
+    headerStmt->items.resize(splitPos);
+    for (const std::size_t index : ordered) {
+      for (StmtPtr& item : groups[index].second->items) {
+        body->items.push_back(std::move(item));
+      }
+      consumed.insert(index);
+    }
+    continueAtBackEdges(body.get(), header);
+    auto loop = Stmt::make(StmtKind::While);
+    loop->block = header;
+    loop->body = std::move(body);
+    headerStmt->items.push_back(std::move(loop));
+  }
+  if (consumed.empty()) {
+    return;
+  }
+  std::vector<std::pair<il::BlockId, StmtPtr>> kept;
+  kept.reserve(groups.size() - consumed.size());
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    if (!consumed.contains(index)) {
+      kept.push_back(std::move(groups[index]));
+    }
+  }
+  groups = std::move(kept);
+}
+
+const std::vector<analysis::DispatchRegion>& Structurizer::dispatchRegions() {
+  if (!dispatchRegions_) {
+    dispatchRegions_ = analysis::findDispatchRegions(function_);
+  }
+  return *dispatchRegions_;
+}
+
+const std::map<il::BlockId, il::BlockId>& Structurizer::joinHubByTail() {
+  if (!joinHubByTail_) {
+    std::map<il::BlockId, il::BlockId> byTail;
+    for (const analysis::DispatchRegion& region : dispatchRegions()) {
+      for (const analysis::DispatchJoin& join : analysis::findDispatchJoins(function_, region)) {
+        for (const il::BlockId tail : join.tails) {
+          byTail.emplace(tail, join.hub);
+        }
+      }
+    }
+    joinHubByTail_ = std::move(byTail);
+  }
+  return *joinHubByTail_;
+}
+
+bool Structurizer::isMemberOfLargeDispatchRegion(il::BlockId block) {
+  for (const analysis::DispatchRegion& region : dispatchRegions()) {
+    if (region.sites.size() < options_.minRegionSites) {
+      continue;
+    }
+    const bool memberOfRegion =
+        std::any_of(region.sites.begin(), region.sites.end(),
+                    [&](const analysis::DispatchSite& site) { return site.dispatchBlock == block; });
+    if (memberOfRegion) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<analysis::DispatcherShape> Structurizer::matchRegionConfirmedShape(
+    il::BlockId dispatch, std::span<const il::BlockId> targets) {
+  for (const analysis::DispatchRegion& region : dispatchRegions()) {
+    const bool memberOfRegion =
+        std::any_of(region.sites.begin(), region.sites.end(),
+                    [&](const analysis::DispatchSite& site) { return site.dispatchBlock == dispatch; });
+    if (!memberOfRegion) {
+      continue;
+    }
+    if (auto shape = analysis::confirmDispatcherShapeFromRegion(function_, dispatch, targets, region)) {
+      return shape;
+    }
+  }
+  return std::nullopt;
+}
+
 // ---------------------------------------------------------------------------
 // Raw emission
 // ---------------------------------------------------------------------------
@@ -1067,9 +1356,70 @@ StmtPtr Structurizer::gotoStmt(il::BlockId target) {
 }
 
 StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned depth) {
-  auto stmt = Stmt::make(StmtKind::Switch);
   const auto operands = function_.operands(op);
   const auto targets = function_.targets(op);
+
+  // Two live targets is exactly the shape a flattened function's *original*
+  // `if` takes once the state it computes and the table it dispatches
+  // through are both resolved: `state = cond ? A : B` next to a switch that
+  // only ever enumerates A and B. When the index's own constant/select
+  // structure recovers that boolean (see analysis::matchDispatchValues),
+  // printing `if (cond) A else B` says what actually happened instead of a
+  // two-case `switch` a reader has to reverse-engineer back into one -- and,
+  // since it is an ordinary `If`, a chain of these (one handler leading
+  // straight into the next dispatch) now nests through the same recursion
+  // an ordinary `if`/`else` chain would, rather than each link adding
+  // another "switch inside a case inside a switch". Decided before any case
+  // below gets claimed (and, on failure, marked as a goto target): a
+  // collapse that succeeds here must never leave a stray label behind on a
+  // block every path to it turned out to inline instead.
+  // J1 (docs/18-architecture-optimization-plan.md §5.2): the collapse above
+  // is right for an isolated site, but a site that is a member of a large
+  // dispatch region (analysis::DispatchRegion) is one of many small
+  // decisions that all read through the same physical table -- collapsing
+  // it away loses the table identity tying it to the rest of the region,
+  // with nothing (yet) rebuilding it from the collapsed form. Deferred here
+  // rather than collapsed: falls straight through to the table-mode switch
+  // below, so the region's own site count stays visible in the emitted
+  // shape instead of vanishing into 2-way ifs one at a time.
+  // `options_.deferRegionCollapse` is a second, independent way to reach the
+  // same deferral -- a blanket diagnostic/test switch that defers every
+  // resolved two-way table dispatch's collapse regardless of how large (or
+  // small, or absent) any region around it is, so a fixture can exercise
+  // "what a deferred site prints like" without first building one big
+  // enough to cross `minRegionSites` on its own.
+  const bool deferCollapse = options_.deferRegionCollapse || isMemberOfLargeDispatchRegion(block);
+  if (targets.size() == 2 && !operands.empty() && !deferCollapse) {
+    if (const auto table = analysis::matchJumpTable(function_, operands[0]);
+        table.has_value() && table->index.valid()) {
+      if (const std::optional<analysis::DispatchValues> values =
+              analysis::matchDispatchValues(function_, table->index, 2);
+          values.has_value() && values->condition.valid()) {
+        const std::size_t firstIndex = values->conditionTrueIsFirst ? 0 : 1;
+        const std::size_t secondIndex = 1 - firstIndex;
+        auto ifStmt = Stmt::make(StmtKind::If);
+        ifStmt->block = block;
+        ifStmt->cond = values->condition;
+        ifStmt->thenArm = claimCaseBody(block, targets[firstIndex], depth);
+        if (!ifStmt->thenArm) {
+          ifStmt->thenArm = claimOrCloneSharedCaseBody(block, targets[firstIndex], depth);
+        }
+        ifStmt->elseArm = claimCaseBody(block, targets[secondIndex], depth);
+        if (!ifStmt->elseArm) {
+          ifStmt->elseArm = claimOrCloneSharedCaseBody(block, targets[secondIndex], depth);
+        }
+        if (!ifStmt->thenArm) {
+          ifStmt->thenArm = gotoStmt(targets[firstIndex]);
+        }
+        if (!ifStmt->elseArm) {
+          ifStmt->elseArm = gotoStmt(targets[secondIndex]);
+        }
+        return ifStmt;
+      }
+    }
+  }
+
+  auto stmt = Stmt::make(StmtKind::Switch);
   stmt->block = block;
   stmt->cases.assign(targets.begin(), targets.end());
   // Every case leaves from the branch's own block, which is where the phi
@@ -1088,17 +1438,58 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
   const std::optional<analysis::DispatcherShape> shape =
       analysis::matchDispatcherShape(function_, block, targets);
   StmtPtr epilogue;
+  il::BlockId mergeBlock;
   if (shape.has_value() && !emitted_.contains(shape->merge) &&
       !inProgressHeaders_.contains(shape->merge)) {
     epilogue = emitRegion(shape->merge, il::BlockId{}, depth + 1);
+    mergeBlock = shape->merge;
+  } else if (!shape.has_value()) {
+    // J2e (docs/architecture-optimization-eval-prompt.md §6.3): `shape`
+    // above only ever votes on `block`'s own targets, so it never fires for
+    // a scatter-dispatcher's typical two-way site -- two targets is below
+    // matchDispatcherShape's own three-target floor. `joinHubByTail` instead
+    // pools evidence across every site in the region: a target here counts
+    // as a private tail the moment *some* site's own target list names it,
+    // not just this one's. The first target of this switch that turns out
+    // to be one of those tails claims the hub as this switch's own epilogue
+    // (same emitRegion-once discipline as the shape above); a second target
+    // mapping to a different hub is left for whichever switch reaches that
+    // hub's own tails first.
+    for (const il::BlockId target : targets) {
+      const auto found = joinHubByTail().find(target);
+      if (found == joinHubByTail().end() || emitted_.contains(found->second) ||
+          inProgressHeaders_.contains(found->second)) {
+        continue;
+      }
+      epilogue = emitRegion(found->second, il::BlockId{}, depth + 1);
+      if (epilogue) {
+        mergeBlock = found->second;
+        break;
+      }
+    }
   }
   for (std::size_t index = 0; index < targets.size(); ++index) {
     if (epilogue) {
       stmt->caseBodies[index] =
-          claimDispatcherCaseBody(block, targets[index], shape->merge, depth);
+          claimDispatcherCaseBody(block, targets[index], mergeBlock, depth);
     }
     if (!stmt->caseBodies[index]) {
       stmt->caseBodies[index] = claimCaseBody(block, targets[index], depth);
+    }
+    // J2d (docs/18-architecture-optimization-plan.md §5.3's handler-clone
+    // extension): a handler two or more of *this table's own* resolved
+    // two-way sites both fall into is exactly claimOrCloneSharedCaseBody's
+    // shape (see its own comment, including its containsSwitch guard -- the
+    // one this call site needed that the if/else collapse above never did,
+    // since a scatter-dispatcher's handler routinely just re-dispatches
+    // through this same table again) -- J1 only reaches this table-mode
+    // switch instead of the if/else collapse above for a deferred region
+    // member, so without this fallback a shared handler here always lost to
+    // addGotoTarget below, no matter how small it was. Safe to try
+    // unconditionally: the callee's own predecessor/shape checks are what
+    // decide, not anything about this call site.
+    if (!stmt->caseBodies[index]) {
+      stmt->caseBodies[index] = claimOrCloneSharedCaseBody(block, targets[index], depth);
     }
     if (!stmt->caseBodies[index]) {
       addGotoTarget(targets[index]);
@@ -1106,12 +1497,18 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
   }
   if (epilogue) {
     stmt->epilogue = std::move(epilogue);
-    stmt->mergeBlock = shape->merge;
+    stmt->mergeBlock = mergeBlock;
     // Whether the handlers this switch just claimed carry their live
     // registers to `epilogue` through the shadow-register protocol (see
     // analysis::LiveRegisterFrame): when they do, emission can skip printing
-    // a case's save into a slot it never actually changes.
-    stmt->frame = analysis::matchLiveRegisterFrame(function_, *shape);
+    // a case's save into a slot it never actually changes. Only `shape`'s
+    // own merge (voted from `block`'s own targets) has a `hub` to check
+    // that protocol against -- a J2e join hub is pooled from other sites
+    // entirely and carries no such further successor to test, so it always
+    // prints its case saves in full instead.
+    if (shape.has_value() && shape->merge == mergeBlock) {
+      stmt->frame = analysis::matchLiveRegisterFrame(function_, *shape);
+    }
   }
   // A table match at two targets is still a real index dispatch -- an
   // opaque-predicate pass upstream routinely leaves a flattened function's
@@ -1125,6 +1522,35 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
         table.has_value() && table->index.valid()) {
       stmt->tableMode = true;
       stmt->cond = table->index;
+      // The real dispatch value behind each case, when the index's
+      // constant/select structure recovers one -- `case 0x20f:` instead of
+      // `case 0:`, which is not a state value at all, just this target's
+      // position in the (arbitrary, discovery-order) list resolve_indirect
+      // returned. Left empty (falling back to the ordinal, as before) when
+      // the index is not fully reconstructable this way, e.g. it still
+      // depends on a load.
+      if (const std::optional<analysis::DispatchValues> values =
+              analysis::matchDispatchValues(function_, table->index, targets.size());
+          values.has_value()) {
+        stmt->caseValues = values->values;
+      }
+      // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): not
+      // yet the default -- see StructureOptions::regionStructuring's own
+      // comment. Only tried once `stmt` is fully built (every case already
+      // claimed, tableMode/cond/caseValues already set), since that is
+      // exactly the shape collapseRegionDispatchTree pattern-matches against
+      // in each candidate case body.
+      if (options_.regionStructuring) {
+        for (const analysis::DispatchRegion& region : dispatchRegions()) {
+          const bool memberOfRegion =
+              std::any_of(region.sites.begin(), region.sites.end(),
+                          [&](const analysis::DispatchSite& site) { return site.dispatchBlock == block; });
+          if (memberOfRegion) {
+            collapseRegionDispatchTree(*stmt, region);
+            break;
+          }
+        }
+      }
       return stmt;
     }
   }
@@ -1159,6 +1585,88 @@ StmtPtr Structurizer::claimCaseBody(il::BlockId dispatcher, il::BlockId handler,
     return nullptr;
   }
   return body;
+}
+
+bool Structurizer::reachesFurtherDispatch(il::BlockId start, unsigned budget) const {
+  std::set<il::BlockId> visited;
+  std::vector<il::BlockId> queue{start};
+  visited.insert(start);
+  while (!queue.empty() && visited.size() <= budget) {
+    const il::BlockId current = queue.back();
+    queue.pop_back();
+    const il::Op* term = terminatorOf(current);
+    if (term != nullptr && term->code == il::OpCode::IndirectBranch) {
+      return true;
+    }
+    for (const il::BlockId successor : function_.block(current).successors) {
+      if (visited.insert(successor).second) {
+        queue.push_back(successor);
+      }
+    }
+  }
+  return false;
+}
+
+StmtPtr Structurizer::claimOrCloneSharedCaseBody(il::BlockId dispatcher, il::BlockId handler,
+                                                 unsigned depth) {
+  if (const auto cached = sharedCaseBodyCache_.find(handler); cached != sharedCaseBodyCache_.end()) {
+    return cloneStmt(cached->second.get());
+  }
+  if (depth >= kMaxDepth || budget_ == 0 || handler == dispatcher ||
+      emitted_.contains(handler) || inProgressHeaders_.contains(handler)) {
+    return nullptr;
+  }
+  const auto& predecessors = function_.block(handler).predecessors;
+  // claimCaseBody already owns 0 or 1 predecessor; this exists only for the
+  // shared case, and only the shape it was built for -- every predecessor a
+  // resolved two-target dispatch through a table this same collapse would
+  // recognise, never merely "more than one block happens to jump here".
+  if (predecessors.size() < 2) {
+    return nullptr;
+  }
+  for (const il::BlockId pred : predecessors) {
+    const il::Op* term = terminatorOf(pred);
+    if (term == nullptr || term->code != il::OpCode::IndirectBranch) {
+      return nullptr;
+    }
+    const auto predOperands = function_.operands(*term);
+    if (function_.targets(*term).size() != 2 || predOperands.empty()) {
+      return nullptr;
+    }
+    const auto table = analysis::matchJumpTable(function_, predOperands[0]);
+    if (!table.has_value() || !table->index.valid() ||
+        !analysis::matchDispatchValues(function_, table->index, 2).has_value()) {
+      return nullptr;
+    }
+  }
+  constexpr std::size_t kMaxSharedBodySize = 24;
+  // Bails before the walk below even starts, and so before it can cost
+  // anything -- see reachesFurtherDispatch's own comment. containsSwitch
+  // (below) still catches the same shape after the fact, for the rarer case
+  // this cheap successor-only scan cannot see (a diamond whose *merge*,
+  // past this budget, is where the further dispatch actually sits); this is
+  // the common case, cheaply, up front.
+  if (reachesFurtherDispatch(handler, kMaxSharedBodySize)) {
+    return nullptr;
+  }
+  const ScopedHeader inProgress(inProgressHeaders_, dispatcher);
+  const std::size_t snapshot = trail_.size();
+  const std::size_t gotoSnapshot = gotoTrail_.size();
+  StmtPtr body = emitRegion(handler, il::BlockId{}, depth + 1);
+  // A body worth duplicating across every remaining predecessor stays small:
+  // this is for a flattened branch's arm, a handful of ops, not a body that
+  // duplication would multiply into real code growth.
+  if (trail_.size() == snapshot || !regionClosed(snapshot, handler) ||
+      !alwaysLeaves(body.get()) || trail_.size() - snapshot > kMaxSharedBodySize ||
+      containsSwitch(body.get())) {
+    budget_ -= std::min(budget_, trail_.size() - snapshot);
+    rollback(snapshot, gotoSnapshot);
+    return nullptr;
+  }
+  StmtPtr firstCopy = cloneStmt(body.get());
+  sharedCaseBodyCache_.emplace(handler, std::move(body));
+  sharedCaseBodyInsertions_.push_back({snapshot, handler});
+  return firstCopy;
 }
 
 StmtPtr Structurizer::claimDispatcherCaseBody(il::BlockId dispatcher, il::BlockId handler,
@@ -1300,6 +1808,19 @@ void Structurizer::rollback(std::size_t trailSnapshot, std::size_t gotoSnapshot)
     gotoTargets_.erase(gotoTrail_[index]);
   }
   gotoTrail_.resize(gotoSnapshot);
+  // Undoes claimOrCloneSharedCaseBody's own caching too (see
+  // sharedCaseBodyInsertions_'s comment): any cache entry whose claim
+  // started at or after `trailSnapshot` began -- and so ran entirely
+  // inside -- the speculative window this rollback is discarding.
+  std::size_t keep = 0;
+  for (const auto& [insertedAt, handler] : sharedCaseBodyInsertions_) {
+    if (insertedAt >= trailSnapshot) {
+      sharedCaseBodyCache_.erase(handler);
+    } else {
+      sharedCaseBodyInsertions_[keep++] = {insertedAt, handler};
+    }
+  }
+  sharedCaseBodyInsertions_.resize(keep);
 }
 
 bool Structurizer::regionClosed(std::size_t snapshot, il::BlockId head) const {
@@ -1328,8 +1849,8 @@ bool StructuredFunction::isLabeled(il::BlockId block) const {
 StructuredFunction structureFunction(
     const il::Function& function, const analysis::Dominators& dominators,
     const analysis::PostDominators& postDominators,
-    std::span<const analysis::NaturalLoop> loops) {
-  return Structurizer(function, dominators, postDominators, loops).run();
+    std::span<const analysis::NaturalLoop> loops, const StructureOptions& options) {
+  return Structurizer(function, dominators, postDominators, loops, options).run();
 }
 
 }  // namespace xdec::emit

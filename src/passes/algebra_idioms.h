@@ -48,6 +48,29 @@ namespace xdec::passes {
 /// `subExpr` is the Sub node.
 [[nodiscard]] il::ExprId matchMbaSub(il::Function& function, const il::Expr& subExpr);
 
+/// `(v<<1 | 2) - (v^1)` is `v + 1`. `v<<1` always clears bit 0, and ORing in 2
+/// forces bit 1 on unconditionally; `v^1` flips `v`'s own bit 0. Split on
+/// whether that bit started set: if it was, `v<<1` already had bit 1 set (the
+/// shifted-up bit 0) and the OR is a no-op, while `v^1` is `v-1`, so the
+/// difference is `2v-(v-1) = v+1`; if it was clear, the OR adds 2 and `v^1` is
+/// `v+1`, so the difference is `(2v+2)-(v+1) = v+1` again -- the same answer
+/// either way, which is what makes this a sound identity rather than a
+/// coincidence at one input. `subExpr` is the Sub node; the doubling may be
+/// spelled as a shift or a multiply by 2, matching every other MBA rule's
+/// tolerance for both.
+[[nodiscard]] il::ExprId matchObfuscatedIncrement(il::Function& function,
+                                                  const il::Expr& subExpr);
+
+/// Whether `mulId` is a product of two operands provably even together,
+/// regardless of what their free variable is: two consecutive integers
+/// (`v * (v±1)`, one of any two neighbours is even) or a value times its own
+/// bitwise complement (`v * ~v` -- NOT flips bit 0, so exactly one of the pair
+/// is even no matter what `v` is). Flattened dispatchers hide their state
+/// constants behind whichever of the two identities their obfuscator prefers.
+/// `mulId` must be the Mul node; the caller's own `& 1` rule is what actually
+/// turns this into the constant zero (see algebra.cpp's rewriteAnd).
+[[nodiscard]] bool matchEvenProduct(const il::Function& function, il::ExprId mulId);
+
 /// `(x & y) | (x ^ y)` is `x | y`. `orExpr` is the Or node.
 [[nodiscard]] il::ExprId matchMbaOr(il::Function& function, const il::Expr& orExpr);
 

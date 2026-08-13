@@ -10,6 +10,7 @@
 
 #include "address_render.h"
 #include "xdec/analysis/import_callee.h"
+#include "xdec/analysis/indexed_transform_loop.h"
 #include "xdec/analysis/noreturn.h"
 #include "xdec/il/expr_roots.h"
 #include "xdec/passes/recover_syscall.h"
@@ -18,6 +19,33 @@
 namespace xdec::emit {
 
 namespace {
+
+/// A human-readable summary of an `analysis::IndexedTransformLoop`, printed
+/// as a comment ahead of the loop it was found in (see the header for why
+/// this stays a comment rather than rewriting the loop's own statements: the
+/// match says the shape is there, not that every reader's `src`/`dst`/`key`
+/// naming would agree with whatever the real base expressions turn out to
+/// mean once someone reads them).
+[[nodiscard]] std::string describeIndexedTransformLoop(const analysis::IndexedTransformLoop& t) {
+  std::string expr;
+  switch (t.op) {
+    case analysis::TransformOp::RotateLeft:
+      expr = "rotl(src[i], key)";
+      break;
+    case analysis::TransformOp::RotateRight:
+      expr = "rotr(src[i], key)";
+      break;
+    default:
+      expr = t.loadIsFirstOperand
+                 ? std::format("src[i] {} key", analysis::toString(t.op))
+                 : std::format("key {} src[i]", analysis::toString(t.op));
+      break;
+  }
+  std::string start = t.indexStart ? std::format("0x{:x}", *t.indexStart) : "?";
+  return std::format(
+      "indexed transform loop: dst[i] = {}; i = {}, step {}{}, element size {}", expr, start,
+      t.indexStride >= 0 ? "+" : "", t.indexStride, t.elementScale);
+}
 
 /// The low `width` bits as a C constant, in a form that works past 64 bits.
 [[nodiscard]] std::string lowMask(uint32_t width, const std::string& type) {
@@ -46,6 +74,15 @@ using il::collectValueLeaves;
     return 0;
   }
   return static_cast<uint32_t>(database.sizeOf(param->element).value_or(1) * 8);
+}
+
+/// Whether `arm` is exactly a `goto`/`continue` leaf and nothing else -- the
+/// shape `gotoChain`'s own arms always have (see structure.cpp), and the
+/// only shape `deadRoutingStateStore`'s paired `if` is allowed to take:
+/// anything else might carry its own edge copies, which dropping the store
+/// alone never touches.
+[[nodiscard]] bool isGotoLeaf(const Stmt* arm) {
+  return arm != nullptr && (arm->kind == StmtKind::Goto || arm->kind == StmtKind::Continue);
 }
 
 }  // namespace
@@ -122,8 +159,26 @@ void StmtPrinter::printStmt(const StmtPtr& stmt, std::string& out) {
           const StmtPtr& next = stmt->items[index + 1];
           if (next->kind == StmtKind::Switch && next->block == item->block &&
               next->cond.valid()) {
+            // Phase 3.2: if the block's own store into a plain local is
+            // exactly this switch's discriminant (see
+            // `deadStateDiscriminantStore`, already marked dead by
+            // `collectDeadOps` so `printBlock` below skips it), fold that
+            // store's assignment into the switch's own condition instead of
+            // losing it -- `printSwitch` needs the local's name to do that.
+            std::string assignDiscriminantTo;
+            const bool enumerated = next->tableMode || !next->caseValues.empty();
+            if (const il::OpId stateStore = deadStateDiscriminantStore(
+                    ctx_.function, ctx_.frame, ctx_.variables, enumerated, item->block,
+                    next->cond);
+                stateStore.valid()) {
+              const auto operands = ctx_.function.operands(ctx_.function.op(stateStore));
+              const analysis::AddressInfo address = ctx_.frame.classify(operands[0]);
+              if (const analysis::Variable* local = ctx_.variables.localAt(address.delta)) {
+                assignDiscriminantTo = local->name;
+              }
+            }
             printBlock(*item, out, {next->cond});
-            printSwitch(*next, out, /*openScope=*/false);
+            printSwitch(*next, out, /*openScope=*/false, assignDiscriminantTo);
             ++index;
             continue;
           }
@@ -244,6 +299,9 @@ void StmtPrinter::printIf(const Stmt& stmt, std::string& out) {
 void StmtPrinter::printWhile(const Stmt& stmt, std::string& out) {
   const il::BlockId header = stmt.block;
   consumePending(header, out);
+  if (stmt.transform) {
+    line(out, std::format("/* {} */", describeIndexedTransformLoop(*stmt.transform)));
+  }
   // No condition: a loop whose only exits are the returns and jumps inside it,
   // which is the shape of a dispatch loop. The header's own code is in the body.
   if (!stmt.cond.valid()) {
@@ -296,6 +354,9 @@ std::string StmtPrinter::doWhileCondition(il::ExprId cond, bool invertCond, std:
 void StmtPrinter::printDoWhile(const Stmt& stmt, std::string& out) {
   const il::BlockId header = stmt.block;
   consumePending(header, out);
+  if (stmt.transform) {
+    line(out, std::format("/* {} */", describeIndexedTransformLoop(*stmt.transform)));
+  }
   line(out, "do {");
   ++indent_;
   printStmt(stmt.body, out);
@@ -315,7 +376,8 @@ void StmtPrinter::printDoWhile(const Stmt& stmt, std::string& out) {
   last_ = latch;
 }
 
-void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out, bool openScope) {
+void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out, bool openScope,
+                              const std::string& assignDiscriminantTo) {
   if (stmt.block.valid()) {
     consumePending(stmt.block, out);
     // A compare-chain switch replaces its dispatcher block outright (no
@@ -392,17 +454,30 @@ void StmtPrinter::printSwitch(const Stmt& stmt, std::string& out, bool openScope
     expressions_.beginScope({stmt.cond});
   }
   const std::string discriminant = assignedText(stmt.cond, out);
-  line(out, std::format("switch ({}) {{", discriminant));
+  // Phase 3.2 (docs/09 shape A, beyond H2): the paired block's own store into
+  // `assignDiscriminantTo` never printed (see `deadStateDiscriminantStore`),
+  // so its assignment happens here instead -- once, as the switch's own
+  // condition, rather than on a line of its own immediately above.
+  line(out, std::format("switch ({}) {{",
+                        assignDiscriminantTo.empty()
+                            ? discriminant
+                            : std::format("{} = {}", assignDiscriminantTo, discriminant)));
   ++indent_;
   for (std::size_t index = 0; index < stmt.cases.size(); ++index) {
     if (stmt.tableMode) {
-      // The case label is the table's ordinal, not anything a disassembler
-      // would show at this address; whether or not `claimCaseBody` inlined
-      // the handler below (in which case no `goto` prints its address at
-      // all), naming the target here is what lets a reader match this case
-      // up against the jump table or the graph view in another tool.
-      line(out, std::format("case {}: /* handler @0x{:x} */", index,
-                            ctx_.function.block(stmt.cases[index]).va));
+      // `caseValues[index]`, when analysis::matchDispatchValues recovered
+      // one, is the actual index value that reaches this case -- the real
+      // dispatcher state, not just this target's position in the (arbitrary,
+      // discovery-order) list resolve_indirect returned. Falls back to the
+      // ordinal only when the index still depends on something this cannot
+      // see through (a load), so there is no value to show instead.
+      if (index < stmt.caseValues.size()) {
+        line(out, std::format("case 0x{:x}: /* handler @0x{:x} */", stmt.caseValues[index],
+                              ctx_.function.block(stmt.cases[index]).va));
+      } else {
+        line(out, std::format("case {}: /* handler @0x{:x} */", index,
+                              ctx_.function.block(stmt.cases[index]).va));
+      }
     } else {
       line(out, std::format("case 0x{:x}:", stmt.caseValues[index]));
     }
@@ -527,6 +602,142 @@ il::OpId deadJumpTableLoad(const il::Function& function, il::BlockId block, bool
   return candidate;
 }
 
+il::OpId deadStateDiscriminantStore(const il::Function& function, const analysis::StackFrame& frame,
+                                    const analysis::VariableTable& variables, bool enumerated,
+                                    il::BlockId block, il::ExprId cond) {
+  if (!enumerated || !block.valid() || !cond.valid()) {
+    return {};
+  }
+  for (const il::OpId opId : function.block(block).ops) {
+    const il::Op& op = function.op(opId);
+    if (op.code != il::OpCode::Store) {
+      continue;
+    }
+    const auto operands = function.operands(op);
+    if (operands[1] != cond) {
+      continue;
+    }
+    const analysis::AddressInfo address = frame.classify(operands[0]);
+    if (address.kind != analysis::AddressKind::StackSlot) {
+      continue;
+    }
+    const analysis::Variable* local = variables.localAt(address.delta);
+    // The same plain-local gate H2 (see printOp's Store case) requires
+    // before it will fold a store's value under the local's own name: no
+    // pointer cast, no aliased field, and the whole slot at exactly this
+    // store's width -- anything else is a shape `memoryLvalue` prints
+    // differently than the bare name this fold assumes.
+    if (local == nullptr || local->type.pointerDepth > 0 || local->aliasBase.has_value() ||
+        local->type.width != op.type.bits()) {
+      continue;
+    }
+    return opId;
+  }
+  return {};
+}
+
+/// Whether a `Load` of the stack slot at `delta` is reachable from `start`
+/// before any `Store` to that same slot rewrites it first -- a bounded
+/// forward walk (at most `budget` blocks visited), the same shape
+/// `Structurizer::reachesFurtherDispatch` (structure.cpp) already uses for
+/// an identical "cannot see far enough, so decline" gate. Running out of
+/// budget without settling either way also answers true: an unresolved read
+/// is exactly the case `deadRoutingStateStore` must not risk.
+[[nodiscard]] bool localMayBeReadBeforeRewrite(const il::Function& function,
+                                               const analysis::StackFrame& frame,
+                                               il::BlockId start, int64_t delta, unsigned budget) {
+  std::set<il::BlockId> visited{start};
+  std::vector<il::BlockId> queue{start};
+  std::size_t explored = 0;
+  while (!queue.empty()) {
+    if (++explored > budget) {
+      return true;
+    }
+    const il::BlockId current = queue.back();
+    queue.pop_back();
+    bool rewritten = false;
+    for (const il::OpId opId : function.block(current).ops) {
+      const il::Op& op = function.op(opId);
+      const auto operands = function.operands(op);
+      if (op.code == il::OpCode::Load &&
+          frame.classify(operands[0]).delta == delta) {
+        return true;
+      }
+      if (op.code == il::OpCode::Store &&
+          frame.classify(operands[0]).delta == delta) {
+        rewritten = true;
+        break;  // this path is clean from here on; a later read sees the rewrite, not ours
+      }
+    }
+    if (rewritten) {
+      continue;
+    }
+    for (const il::BlockId successor : function.block(current).successors) {
+      if (visited.insert(successor).second) {
+        queue.push_back(successor);
+      }
+    }
+  }
+  return false;
+}
+
+il::OpId deadRoutingStateStore(const il::Function& function, const analysis::StackFrame& frame,
+                               const analysis::VariableTable& variables, il::BlockId block,
+                               il::ExprId ifCond, bool ifArmsLeaveDirectly) {
+  if (!ifArmsLeaveDirectly || !block.valid() || !ifCond.valid()) {
+    return {};
+  }
+  constexpr unsigned kReachBudget = 32;
+  const auto& ops = function.block(block).ops;
+  for (std::size_t index = 0; index < ops.size(); ++index) {
+    const il::Op& op = function.op(ops[index]);
+    if (op.code != il::OpCode::Store) {
+      continue;
+    }
+    const auto operands = function.operands(op);
+    const il::Expr& value = function.expr(operands[1]);
+    if (value.op != il::ExprOp::Select || value.operand(0) != ifCond ||
+        function.expr(value.operand(1)).op != il::ExprOp::Const ||
+        function.expr(value.operand(2)).op != il::ExprOp::Const) {
+      continue;
+    }
+    const analysis::AddressInfo address = frame.classify(operands[0]);
+    if (address.kind != analysis::AddressKind::StackSlot) {
+      continue;
+    }
+    const analysis::Variable* local = variables.localAt(address.delta);
+    if (local == nullptr || local->type.pointerDepth > 0 || local->aliasBase.has_value() ||
+        local->type.width != op.type.bits()) {
+      continue;
+    }
+    // Nothing later in this same block may still read the local before its
+    // terminator leaves through the `if` this store's decision duplicates,
+    // and nothing reachable beyond it (up to the budget) may either --
+    // otherwise the goto this fold trusts to carry the same decision would
+    // silently leave a stale value for that read to see.
+    bool readLater = false;
+    for (std::size_t later = index + 1; later < ops.size() && !readLater; ++later) {
+      const il::Op& laterOp = function.op(ops[later]);
+      readLater = laterOp.code == il::OpCode::Load &&
+                  frame.classify(function.operands(laterOp)[0]).delta == address.delta;
+    }
+    if (readLater) {
+      continue;
+    }
+    bool readDownstream = false;
+    for (const il::BlockId successor : function.block(block).successors) {
+      if (localMayBeReadBeforeRewrite(function, frame, successor, address.delta, kReachBudget)) {
+        readDownstream = true;
+        break;
+      }
+    }
+    if (!readDownstream) {
+      return ops[index];
+    }
+  }
+  return {};
+}
+
 namespace {
 
 /// Whether `va` names the syscall-error accessor a header declared under --
@@ -645,8 +856,9 @@ namespace {
   return {};
 }
 
-void collectDeadOpsInto(const il::Function& function, const Stmt& stmt, const COptions& options,
-                        std::unordered_set<uint32_t>& dead) {
+void collectDeadOpsInto(const il::Function& function, const analysis::StackFrame& frame,
+                        const analysis::VariableTable& variables, const Stmt& stmt,
+                        const COptions& options, std::unordered_set<uint32_t>& dead) {
   switch (stmt.kind) {
     case StmtKind::Sequence:
       for (std::size_t index = 0; index < stmt.items.size(); ++index) {
@@ -659,9 +871,40 @@ void collectDeadOpsInto(const il::Function& function, const Stmt& stmt, const CO
                 dead_load.valid()) {
               dead.insert(dead_load.index());
             }
+            const bool enumerated = next.tableMode || !next.caseValues.empty();
+            if (const il::OpId dead_store = deadStateDiscriminantStore(
+                    function, frame, variables, enumerated, item.block, next.cond);
+                dead_store.valid()) {
+              dead.insert(dead_store.index());
+            }
+          } else if (next.kind == StmtKind::If && next.block == item.block && next.cond.valid()) {
+            // The resolved binary-dispatch collapse (see switchFor): a
+            // table-mode switch printed as a plain if/else asks the same
+            // "is the table load's own result still read" question the
+            // switch's own dead-load check already answers, just with the
+            // recovered boolean standing in for the index.
+            if (const il::OpId dead_load =
+                    deadJumpTableLoad(function, item.block, /*tableMode=*/true, next.cond);
+                dead_load.valid()) {
+              dead.insert(dead_load.index());
+            }
+            // J3 (docs/architecture-optimization-eval-prompt.md §6.6): the
+            // same runtime decision compiled twice -- once into a
+            // `state=select(cond,...)` store this block makes, again into
+            // the terminator `next` lowers to. Only tried when `next`'s own
+            // arms just leave (see structure.cpp's `gotoChain`); anything
+            // else might still need the store's value along a path this
+            // cannot see.
+            const bool nextArmsLeaveDirectly =
+                isGotoLeaf(next.thenArm.get()) && isGotoLeaf(next.elseArm.get());
+            if (const il::OpId dead_store = deadRoutingStateStore(
+                    function, frame, variables, item.block, next.cond, nextArmsLeaveDirectly);
+                dead_store.valid()) {
+              dead.insert(dead_store.index());
+            }
           }
         }
-        collectDeadOpsInto(function, item, options, dead);
+        collectDeadOpsInto(function, frame, variables, item, options, dead);
       }
       break;
     case StmtKind::Block:
@@ -672,29 +915,29 @@ void collectDeadOpsInto(const il::Function& function, const Stmt& stmt, const CO
       break;
     case StmtKind::If:
       if (stmt.thenArm) {
-        collectDeadOpsInto(function, *stmt.thenArm, options, dead);
+        collectDeadOpsInto(function, frame, variables, *stmt.thenArm, options, dead);
       }
       if (stmt.elseArm) {
-        collectDeadOpsInto(function, *stmt.elseArm, options, dead);
+        collectDeadOpsInto(function, frame, variables, *stmt.elseArm, options, dead);
       }
       break;
     case StmtKind::While:
     case StmtKind::DoWhile:
       if (stmt.body) {
-        collectDeadOpsInto(function, *stmt.body, options, dead);
+        collectDeadOpsInto(function, frame, variables, *stmt.body, options, dead);
       }
       break;
     case StmtKind::Switch:
       for (const StmtPtr& body : stmt.caseBodies) {
         if (body) {
-          collectDeadOpsInto(function, *body, options, dead);
+          collectDeadOpsInto(function, frame, variables, *body, options, dead);
         }
       }
       if (stmt.defaultBody) {
-        collectDeadOpsInto(function, *stmt.defaultBody, options, dead);
+        collectDeadOpsInto(function, frame, variables, *stmt.defaultBody, options, dead);
       }
       if (stmt.epilogue) {
-        collectDeadOpsInto(function, *stmt.epilogue, options, dead);
+        collectDeadOpsInto(function, frame, variables, *stmt.epilogue, options, dead);
       }
       break;
     default:
@@ -704,10 +947,12 @@ void collectDeadOpsInto(const il::Function& function, const Stmt& stmt, const CO
 
 }  // namespace
 
-std::unordered_set<uint32_t> collectDeadOps(const il::Function& function, const Stmt& root,
-                                            const COptions& options) {
+std::unordered_set<uint32_t> collectDeadOps(const il::Function& function,
+                                            const analysis::StackFrame& frame,
+                                            const analysis::VariableTable& variables,
+                                            const Stmt& root, const COptions& options) {
   std::unordered_set<uint32_t> dead;
-  collectDeadOpsInto(function, root, options, dead);
+  collectDeadOpsInto(function, frame, variables, root, options, dead);
   return dead;
 }
 
@@ -848,21 +1093,34 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       const auto assign = [&lvalue, &castPrefix](const std::string& arm) {
         return std::format("{} = {}{};", lvalue, castPrefix, arm);
       };
-      if (!printSelectAssign(operands[1], out, assign)) {
-        // H2 (docs/09, docs/14 Phase 4): a plain store into a named local
-        // (no pointer cast, `lvalue` exactly the local's own bare name --
-        // ruling out a field access, an aliased local, or a width mismatch,
-        // any of which give `memoryLvalue` different text) whose value is
-        // about to be materialized as a CSE temp for the first time in this
-        // scope folds `_cseN = <expr>; var_X = _cseN;` into one `var_X =
-        // <expr>;` -- the local already carries the name a fresh `_cseN`
-        // would have needed.
-        if (castPrefix.empty() && storeLocal != nullptr && lvalue == storeLocal->name) {
-          if (const auto initializer = expressions_.materializeAs(operands[1], lvalue)) {
-            line(out, assign(*initializer));
-            break;
-          }
+      // H2 (docs/09, docs/14 Phase 4) tried ahead of the general select-to-
+      // if/else expansion below, not only after it fails: a plain store into
+      // a named local (no pointer cast, `lvalue` exactly the local's own
+      // bare name -- ruling out a field access, an aliased local, or a
+      // width mismatch) whose value is about to be materialized as a shared
+      // CSE temp for the first time in this scope folds `_cseN = <expr>;
+      // var_X = _cseN;` into one `var_X = <expr>;`, the same way it always
+      // has for any other shared expression -- and a Select is not
+      // special-cased out of that fold just because printSelectAssign can
+      // also render it. Skipping this when the value is *not* shared costs
+      // nothing (`materializeAs` returns nullopt below and the if/else
+      // fallback runs exactly as it always did), but taking it when the
+      // value *is* shared matters: this is the general shape a flattening
+      // dispatcher's own state slot and the same-valued table index it
+      // feeds both take, once hash-consing has already made the two one
+      // node (docs/17-dispatch-region.md's routing-duplication case). Left
+      // as two if/else pairs testing the identical condition, a reader sees
+      // no connection between `state = 0x2a2` and the table lookup a few
+      // lines down; named once and reused, `state` itself becomes the index
+      // and the connection is the code.
+      bool folded = false;
+      if (castPrefix.empty() && storeLocal != nullptr && lvalue == storeLocal->name) {
+        if (const auto initializer = expressions_.materializeAs(operands[1], lvalue)) {
+          line(out, assign(*initializer));
+          folded = true;
         }
+      }
+      if (!folded && !printSelectAssign(operands[1], out, assign)) {
         line(out, assign(assignedText(operands[1], out)));
       }
       break;
@@ -885,7 +1143,7 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       break;
     }
     case il::OpCode::Call:
-      printCall(op, out);
+      printCall(opId, op, out);
       break;
     case il::OpCode::Intrinsic:
       printIntrinsic(opId, op, out);
@@ -1023,7 +1281,7 @@ std::string StmtPrinter::callArgumentText(const types::TypeEntry* callee, std::s
   return exprText(operand, out);
 }
 
-void StmtPrinter::printCall(const il::Op& op, std::string& out) {
+void StmtPrinter::printCall(il::OpId opId, const il::Op& op, std::string& out) {
   const auto operands = ctx_.function.operands(op);
   // At Vars and beyond the operand list *is* the recovered argument list (see
   // passes/vars.h), so it prints verbatim: trimming it again here would be the
@@ -1080,7 +1338,18 @@ void StmtPrinter::printCall(const il::Op& op, std::string& out) {
   // it is not.
   const std::optional<std::string> imported =
       analysis::importNameThroughSlot(ctx_.function, ctx_.options.memory, operands[0]);
-  const std::string note = imported.has_value() ? std::format(" /* import: {} */", *imported) : "";
+  std::string note = imported.has_value() ? std::format(" /* import: {} */", *imported) : "";
+  // A vtable dispatch has no import to name, but analysis::
+  // findConfirmedVtableCalls already proved something an import note would
+  // otherwise leave unsaid: the target is one slot of an object read at more
+  // than one, not an arbitrary function pointer. Naming the slot offset is
+  // as far as this goes -- no struct, no class name, neither of which the
+  // analysis has evidence for (see vtable_call.h).
+  if (note.empty()) {
+    if (const auto found = ctx_.vtableCalls.find(opId.index()); found != ctx_.vtableCalls.end()) {
+      note = std::format(" /* vtable slot {:#x} */", found->second.slotOffset);
+    }
+  }
   line(out, std::format("{}(({}){})({}){};{}", assignee, prototype, target, args, suffix, note));
 }
 

@@ -9,6 +9,7 @@
 
 #include "il/il_test_support.h"
 #include "xdec/il/function.h"
+#include "xdec/il/printer.h"
 #include "xdec/il/verify.h"
 #include "xdec/pass/manager.h"
 #include "xdec/pass/registry.h"
@@ -302,6 +303,80 @@ TEST_CASE("a wide phi of one repeated constant still folds", "[passes][ssaopt]")
   uint64_t value = 0;
   REQUIRE(b.function.asConstant(b.function.operands(store)[1], value));
   CHECK(value == 0x2a);
+}
+
+//   entry: brc (x0 == 0), left, right             (x0 unknown: both arms live)
+//   left:  nzcv = flagdef.sub(x1, x2); br join
+//   right: nzcv = flagdef.sub(x3, x4); br join    (a different comparison)
+//   join:  cond = flagcond(nzcv, eq); brc cond, whenTrue, whenFalse
+//
+// The two arms set flags from unrelated operands, so the phi at join cannot
+// collapse to one shared FlagDef the way a single-definition cross-block flag
+// already does (see SsaOptimize's own comment on why folding flags again
+// here matters) -- this is the merge that comment does not cover: distinct
+// FlagDefs reaching the same test. distributeFlagCondThroughPhi (fold.cpp)
+// exists to resolve it anyway, by rewriting each arm's own comparison and
+// merging the two answers behind one synthesized boolean phi instead of
+// leaving the whole test as a shared opaque stub.
+TEST_CASE("a flags merge from two different comparisons distributes the test across the phi",
+          "[passes][ssaopt][flags]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId left = b.block(0x2000);
+  const BlockId right = b.block(0x3000);
+  const BlockId join = b.block(0x4000);
+  const BlockId whenTrue = b.block(0x5000);
+  const BlockId whenFalse = b.block(0x6000);
+
+  const ExprId entryCond =
+      b.function.binary(ExprOp::CmpEq, b.read(entry, b.reg("x0"), 0x1000), b.i64(0));
+  b.function.appendCondBranch(entry, 0x1004, entryCond, left, right);
+
+  const il::ExprId leftOperands[2] = {b.read(left, b.reg("x1"), 0x2000),
+                                      b.read(left, b.reg("x2"), 0x2004)};
+  b.function.appendWriteReg(left, 0x2008, b.reg("nzcv"),
+                            b.function.flagDef(il::FlagOp::Sub, 64, leftOperands));
+  b.function.appendBranch(left, 0x200c, join);
+
+  const il::ExprId rightOperands[2] = {b.read(right, b.reg("x3"), 0x3000),
+                                       b.read(right, b.reg("x4"), 0x3004)};
+  b.function.appendWriteReg(right, 0x3008, b.reg("nzcv"),
+                            b.function.flagDef(il::FlagOp::Sub, 64, rightOperands));
+  b.function.appendBranch(right, 0x300c, join);
+
+  const ExprId joinCond = b.function.flagCondition(b.read(join, b.reg("nzcv"), 0x4000),
+                                                    il::ConditionCode::Equal);
+  b.function.appendCondBranch(join, 0x4004, joinCond, whenTrue, whenFalse);
+  b.function.appendStore(whenTrue, 0x5000, Type::integer(64), b.i64(0x9000), b.i64(1));
+  b.function.appendReturn(whenTrue, 0x5004);
+  b.function.appendStore(whenFalse, 0x6000, Type::integer(64), b.i64(0x9000), b.i64(2));
+  b.function.appendReturn(whenFalse, 0x6004);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  // No flagcond survives: both arms resolved to plain compares behind one
+  // synthesized boolean phi, not one shared stub.
+  const std::string printed = il::print(b.function);
+  CHECK(printed.find("flagcond") == std::string::npos);
+
+  // The original flags phi is dead (its only use was the flagcond just
+  // resolved away) and DCE removed it; the boolean phi that replaced its use
+  // is the only one left.
+  CHECK(phiCount(b.function, join) == 1);
+
+  const il::Op& terminator = b.function.op(b.function.block(join).terminator());
+  REQUIRE(terminator.code == OpCode::CondBranch);
+  const ExprId cond = b.function.operands(terminator)[0];
+  REQUIRE(b.function.expr(cond).op == ExprOp::Value);
+  const il::ValueId condValue{static_cast<uint32_t>(b.function.expr(cond).immediate)};
+  const il::OpId condDef = b.function.value(condValue).definition;
+  REQUIRE(b.function.op(condDef).code == OpCode::Phi);
+  const auto arms = b.function.operands(b.function.op(condDef));
+  REQUIRE(arms.size() == 2);
+  CHECK(b.function.expr(arms[0]).op == ExprOp::CmpEq);
+  CHECK(b.function.expr(arms[1]).op == ExprOp::CmpEq);
 }
 
 }  // namespace

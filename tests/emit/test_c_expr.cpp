@@ -299,6 +299,57 @@ TEST_CASE("a bit rotate calls a real, defined helper", "[emit][expr]") {
   CHECK(!contains(text, "rotl?"));
 }
 
+TEST_CASE("a jump-table index clamp prints as a plain ternary",
+          "[emit][expr]") {
+  Fixture f;
+  // `bound < index ? replacement : index` -- an OLLVM jump table's
+  // out-of-range guard once its compare survives folding. Wrapped in a
+  // harmless `+ 0` so it prints through `inner()`'s ordinary operand path
+  // rather than `printOp`'s Store case, which flattens a bare top-level
+  // select into if/else on its own (see `flattenSelect`) before the ternary
+  // ever gets a look at it.
+  const ExprId index = f.entryReg("x0");
+  const ExprId clamp = f.function.binary(ExprOp::CmpLtS, f.i64(0x9), index);
+  const ExprId select = f.function.select(clamp, f.i64(0x4), index);
+  f.observe(f.function.binary(ExprOp::Add, select, f.i64(0)));
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "? 0x4 : arg1"));
+  CHECK(!contains(text, "xdec_dispatch_index"));
+}
+
+TEST_CASE("an unsigned jump-table index clamp also prints as a plain ternary",
+          "[emit][expr]") {
+  Fixture f;
+  const ExprId index = f.entryReg("x0");
+  const ExprId clamp = f.function.binary(ExprOp::CmpLtU, f.i64(0x9), index);
+  const ExprId select = f.function.select(clamp, f.i64(0x4), index);
+  f.observe(f.function.binary(ExprOp::Add, select, f.i64(0)));
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "? 0x4 : arg1"));
+  CHECK(!contains(text, "xdec_dispatch_index"));
+}
+
+TEST_CASE("a select that is not an index clamp still prints as a plain "
+          "ternary",
+          "[emit][expr]") {
+  Fixture f;
+  // Same compare, but the *true* arm reads the index too (not a
+  // replacement) -- an ordinary min/max idiom.
+  const ExprId index = f.entryReg("x0");
+  const ExprId clamp = f.function.binary(ExprOp::CmpLtS, f.i64(0x9), index);
+  const ExprId select = f.function.select(clamp, index, f.i64(0x4));
+  f.observe(f.function.binary(ExprOp::Add, select, f.i64(0)));
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(!contains(text, "xdec_dispatch_index"));
+  CHECK(contains(text, "? arg1 : 0x4"));
+}
+
 TEST_CASE("count-trailing-zeros is a labelled embedder stub, not a silent zero",
           "[emit][expr]") {
   Fixture f;

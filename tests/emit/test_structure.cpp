@@ -3,20 +3,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "il/il_test_support.h"
-#include "xdec/analysis/dominators.h"
-#include "xdec/analysis/loops.h"
 #include "xdec/emit/structure.h"
 #include "xdec/il/function.h"
 
+#include "../fixture/pipeline_fixture.h"
+
 namespace il = xdec::il;
 using xdec::Arch;
-using xdec::analysis::Dominators;
-using xdec::analysis::NaturalLoop;
-using xdec::analysis::PostDominators;
 using xdec::emit::Stmt;
 using xdec::emit::StmtKind;
 using xdec::emit::StructuredFunction;
-using xdec::emit::structureFunction;
 using xdec::il::BlockId;
 using xdec::il::ExprId;
 using xdec::il::ExprOp;
@@ -42,12 +38,7 @@ struct Fixture {
   BlockId entry;
 };
 
-StructuredFunction run(Function& function) {
-  const Dominators dominators = Dominators::compute(function);
-  const PostDominators postDominators = PostDominators::compute(function);
-  const std::vector<NaturalLoop> loops = naturalLoops(function, dominators);
-  return structureFunction(function, dominators, postDominators, loops);
-}
+StructuredFunction run(Function& function) { return xdec::testing::structureFunction(function); }
 
 /// Counts Block statements and collects the structured kinds, flattening the
 /// tree for assertions.
@@ -142,6 +133,61 @@ TEST_CASE("a bare conditional header becomes a while loop", "[emit][structure]")
   CHECK(walk.blocks.size() == 3);
   REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::While) == 1);
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+}
+
+TEST_CASE("a self-loop latch that xors a scaled load into a scaled store "
+          "carries the recovered indexed-transform shape",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId loop = f.block(0x2000);
+  const BlockId exit = f.block(0x4000);
+  f.function.appendBranch(f.entry, 0x1000, loop);
+  // do { *(dst+i) = *(src+i) ^ key; i = i+1; } while (i < 0x10): the header
+  // is its own latch, exactly like "a self-loop latch becomes a do-while"
+  // above, with a real induction phi and a load/transform/store added.
+  const il::ValueId index = f.function.prependPhi(loop, 0x2000, Type::integer(64));
+  const ExprId srcBase = f.function.entryReg(f.function.registers().find("x1"));
+  const ExprId dstBase = f.function.entryReg(f.function.registers().find("x2"));
+  const ExprId key = f.function.entryReg(f.function.registers().find("x3"));
+  const ExprId srcAddress = f.function.binary(ExprOp::Add, srcBase, f.function.valueRef(index));
+  const il::ValueId loaded = f.function.appendLoad(loop, 0x2004, Type::integer(64), srcAddress);
+  const ExprId transformed = f.function.binary(ExprOp::Xor, f.function.valueRef(loaded), key);
+  const ExprId dstAddress = f.function.binary(ExprOp::Add, dstBase, f.function.valueRef(index));
+  f.function.appendStore(loop, 0x2008, Type::integer(64), dstAddress, transformed);
+  const ExprId loopCond =
+      f.function.binary(ExprOp::CmpLtU, f.function.valueRef(index), f.i64(0x10));
+  f.function.appendCondBranch(loop, 0x200c, loopCond, loop, exit);
+  f.function.appendReturn(exit, 0x4000);
+  const ExprId next = f.function.binary(ExprOp::Add, f.function.valueRef(index), f.i64(1));
+  const std::vector<ExprId> incoming{f.i64(0), next};
+  f.function.setOperands(f.function.value(index).definition, incoming);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  // Walk (above) only records kinds, not the Stmt pointers themselves --
+  // find the DoWhile directly with its own small stack instead.
+  const Stmt* loopStmt = nullptr;
+  std::vector<const Stmt*> stack{result.root.get()};
+  while (!stack.empty()) {
+    const Stmt* current = stack.back();
+    stack.pop_back();
+    if (current->kind == StmtKind::DoWhile) {
+      loopStmt = current;
+      break;
+    }
+    for (const auto& item : current->items) {
+      stack.push_back(item.get());
+    }
+    if (current->body) stack.push_back(current->body.get());
+  }
+  REQUIRE(loopStmt != nullptr);
+  REQUIRE(loopStmt->transform.has_value());
+  CHECK(loopStmt->transform->op == xdec::analysis::TransformOp::Xor);
+  CHECK(loopStmt->transform->elementScale == 1);
+  CHECK(loopStmt->transform->indexStride == 1);
+  CHECK(loopStmt->transform->srcBase == srcBase);
+  CHECK(loopStmt->transform->dstBase == dstBase);
+  CHECK(loopStmt->transform->key == key);
 }
 
 TEST_CASE("a self-loop latch becomes a do-while", "[emit][structure]") {
@@ -319,6 +365,215 @@ TEST_CASE("a resolved computed branch over a table becomes a switch",
   // Table mode selects on the raw index: entry(x0).
   const il::Expr& selector = f.function.expr(switchStmt->cond);
   CHECK(selector.op == ExprOp::EntryReg);
+}
+
+TEST_CASE("a resolved two-target table dispatch collapses to if/else over the "
+          "recovered condition",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId target0 = f.block(0x2000);
+  const BlockId target1 = f.block(0x3000);
+  const ExprId branchCond = f.cond();
+  // state = cond ? 0x10 : 0x20 -- the shape an obfuscated `if` takes once
+  // flattened; the table's two live entries are exactly those two values.
+  const ExprId state = f.function.select(branchCond, f.i64(0x10), f.i64(0x20));
+  const il::ValueId loaded = f.function.appendLoad(
+      f.entry, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, state, f.i64(3))));
+  const il::OpId brind =
+      f.function.appendIndirectBranch(f.entry, 0x1004, f.function.valueRef(loaded));
+  f.function.setTargets(brind, std::vector<BlockId>{target0, target1});
+  f.function.appendReturn(target0, 0x2000);
+  f.function.appendReturn(target1, 0x3000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), target0) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), target1) == 1);
+
+  const Stmt* ifStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::If) {
+      ifStmt = item.get();
+    }
+  }
+  REQUIRE(ifStmt != nullptr);
+  // 0x10 < 0x20, so the smaller (true) value is target0.
+  CHECK(ifStmt->cond == branchCond);
+  CHECK(!ifStmt->invertCond);
+  REQUIRE(ifStmt->thenArm != nullptr);
+  REQUIRE(ifStmt->elseArm != nullptr);
+}
+
+TEST_CASE("chained resolved two-target dispatches nest as if/else instead of "
+          "switch-in-a-case",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId mid = f.block(0x2000);
+  const BlockId exitA = f.block(0x3000);
+  const BlockId leafA = f.block(0x4000);
+  const BlockId leafB = f.block(0x5000);
+  const ExprId cond1 = f.cond();
+  const ExprId cond2 = f.function.binary(
+      ExprOp::CmpEq, f.function.entryReg(f.function.registers().find("x1")), f.i64(0));
+
+  const ExprId state1 = f.function.select(cond1, f.i64(0x10), f.i64(0x20));
+  const il::ValueId loaded1 = f.function.appendLoad(
+      f.entry, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, state1, f.i64(3))));
+  const il::OpId brind1 =
+      f.function.appendIndirectBranch(f.entry, 0x1004, f.function.valueRef(loaded1));
+  // 0x10 (smaller) -> mid, 0x20 -> exitA.
+  f.function.setTargets(brind1, std::vector<BlockId>{mid, exitA});
+  f.function.appendReturn(exitA, 0x3000);
+
+  const ExprId state2 = f.function.select(cond2, f.i64(0x30), f.i64(0x40));
+  const il::ValueId loaded2 = f.function.appendLoad(
+      mid, 0x2000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b800),
+                        f.function.binary(ExprOp::Shl, state2, f.i64(3))));
+  const il::OpId brind2 = f.function.appendIndirectBranch(mid, 0x2004, f.function.valueRef(loaded2));
+  f.function.setTargets(brind2, std::vector<BlockId>{leafA, leafB});
+  f.function.appendReturn(leafA, 0x4000);
+  f.function.appendReturn(leafB, 0x5000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 2);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), mid) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), exitA) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), leafA) == 1);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), leafB) == 1);
+}
+
+TEST_CASE("a handler shared by two resolved two-target dispatches is cloned "
+          "into each instead of left as a shared label",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId shared = f.block(0x2000);
+  const BlockId onlyFromFirst = f.block(0x3000);
+  const BlockId second = f.block(0x4000);
+  const BlockId onlyFromSecond = f.block(0x5000);
+  const ExprId cond1 = f.cond();
+  const ExprId cond2 = f.function.binary(
+      ExprOp::CmpEq, f.function.entryReg(f.function.registers().find("x1")), f.i64(0));
+
+  const ExprId state1 = f.function.select(cond1, f.i64(0x10), f.i64(0x20));
+  const il::ValueId loaded1 = f.function.appendLoad(
+      f.entry, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, state1, f.i64(3))));
+  const il::OpId brind1 =
+      f.function.appendIndirectBranch(f.entry, 0x1004, f.function.valueRef(loaded1));
+  // 0x10 (smaller) -> shared, 0x20 -> onlyFromFirst.
+  f.function.setTargets(brind1, std::vector<BlockId>{shared, onlyFromFirst});
+  f.function.appendBranch(onlyFromFirst, 0x3000, second);
+
+  const ExprId state2 = f.function.select(cond2, f.i64(0x30), f.i64(0x40));
+  const il::ValueId loaded2 = f.function.appendLoad(
+      second, 0x4000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b800),
+                        f.function.binary(ExprOp::Shl, state2, f.i64(3))));
+  const il::OpId brind2 =
+      f.function.appendIndirectBranch(second, 0x4004, f.function.valueRef(loaded2));
+  // shared is reached from both dispatches: 0x30 (smaller) -> shared, 0x40 -> onlyFromSecond.
+  f.function.setTargets(brind2, std::vector<BlockId>{shared, onlyFromSecond});
+  f.function.appendReturn(shared, 0x2000);
+  f.function.appendReturn(onlyFromSecond, 0x5000);
+  f.function.rebuildEdges();
+  REQUIRE(f.function.block(shared).predecessors.size() == 2);
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  // Both dispatches collapse, and `shared` is inlined (cloned) into each
+  // rather than printed once behind a `goto`.
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 2);
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), shared) == 2);
+}
+
+TEST_CASE("a resolved two-target dispatch at a loop header still wraps in "
+          "while(true)",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId header = f.entry;
+  const BlockId bumpAndLoop = f.block(0x2000);
+  const BlockId exit = f.block(0x3000);
+  const ExprId cond1 = f.cond();
+
+  const ExprId state = f.function.select(cond1, f.i64(0x10), f.i64(0x20));
+  const il::ValueId loaded = f.function.appendLoad(
+      header, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, state, f.i64(3))));
+  const il::OpId brind =
+      f.function.appendIndirectBranch(header, 0x1004, f.function.valueRef(loaded));
+  f.function.setTargets(brind, std::vector<BlockId>{bumpAndLoop, exit});
+  f.function.appendBranch(bumpAndLoop, 0x2000, header);
+  f.function.appendReturn(exit, 0x3000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  Walk walk;
+  walk.visit(result.root);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::While) == 1);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 1);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Continue) == 1);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
+}
+
+TEST_CASE("a resolved dispatch with three targets keeps the switch but shows "
+          "the real values instead of ordinals",
+          "[emit][structure]") {
+  Fixture f;
+  const BlockId target0 = f.block(0x2000);
+  const BlockId target1 = f.block(0x3000);
+  const BlockId target2 = f.block(0x4000);
+  const ExprId cond1 = f.cond();
+  const ExprId cond2 = f.function.binary(
+      ExprOp::CmpEq, f.function.entryReg(f.function.registers().find("x1")), f.i64(0));
+  // Nested select over three constants -- still fully enumerable, still no
+  // load anywhere in the index itself.
+  const ExprId state = f.function.select(
+      cond1, f.i64(0x10), f.function.select(cond2, f.i64(0x20), f.i64(0x30)));
+  const il::ValueId loaded = f.function.appendLoad(
+      f.entry, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, f.i64(0x30b7f0),
+                        f.function.binary(ExprOp::Shl, state, f.i64(3))));
+  const il::OpId brind =
+      f.function.appendIndirectBranch(f.entry, 0x1004, f.function.valueRef(loaded));
+  f.function.setTargets(brind, std::vector<BlockId>{target0, target1, target2});
+  f.function.appendReturn(target0, 0x2000);
+  f.function.appendReturn(target1, 0x3000);
+  f.function.appendReturn(target2, 0x4000);
+  f.function.rebuildEdges();
+
+  const StructuredFunction result = run(f.function);
+  const Stmt* switchStmt = nullptr;
+  for (const auto& item : result.root->items) {
+    if (item->kind == StmtKind::Switch) {
+      switchStmt = item.get();
+    }
+  }
+  REQUIRE(switchStmt != nullptr);
+  CHECK(switchStmt->tableMode);
+  REQUIRE(switchStmt->caseValues.size() == 3);
+  CHECK(switchStmt->caseValues[0] == 0x10);
+  CHECK(switchStmt->caseValues[1] == 0x20);
+  CHECK(switchStmt->caseValues[2] == 0x30);
 }
 
 TEST_CASE("a flattened dispatcher chain becomes a switch over the state",
@@ -1145,6 +1400,19 @@ TEST_CASE("kCondBranchPatterns states emitRegion's own priority order",
   for (std::size_t i = 1; i < kCondBranchPatterns.size(); ++i) {
     CHECK(kCondBranchPatterns[i - 1].priority < kCondBranchPatterns[i].priority);
   }
+}
+
+TEST_CASE("kRegionPatterns reserves J2's region-switch slot ahead of its own "
+          "implementation",
+          "[emit][structure]") {
+  // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): frozen
+  // now, so a later reorder/rename cannot silently drift from what this
+  // table (and StructureOptions::regionStructuring's own comment) claim --
+  // same discipline as kCondBranchPatterns above, for a table with exactly
+  // one entry so far because there is exactly one region-level pass planned.
+  using xdec::emit::kRegionPatterns;
+  REQUIRE(kRegionPatterns.size() == 1);
+  CHECK(kRegionPatterns[0].name == "region-switch");
 }
 
 TEST_CASE("matchedPatterns records which pattern claimed a diamond and a goto-chain site",

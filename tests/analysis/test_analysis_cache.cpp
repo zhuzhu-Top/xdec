@@ -89,12 +89,15 @@ TEST_CASE("AnalysisCache computes each analysis at most once across repeated rea
   (void)cache.stackFrame();
   (void)cache.stackFrame();
   (void)cache.stackFrame();
+  (void)cache.dispatchRegions();
+  (void)cache.dispatchRegions();
 
   const auto& stats = cache.stats();
   CHECK(stats.dominatorsComputed == 1);
   CHECK(stats.postDominatorsComputed == 1);
   CHECK(stats.loopsComputed == 1);
   CHECK(stats.stackFrameComputed == 1);
+  CHECK(stats.dispatchRegionsComputed == 1);
 }
 
 TEST_CASE("AnalysisCache answers match computing the analyses directly", "[analysis][cache]") {
@@ -119,19 +122,23 @@ TEST_CASE("invalidate() with no tags drops every cached analysis", "[analysis][c
   (void)cache.postDominators();
   (void)cache.loops();
   (void)cache.stackFrame();
+  (void)cache.dispatchRegions();
   REQUIRE(cache.stats().dominatorsComputed == 1);
   REQUIRE(cache.stats().stackFrameComputed == 1);
+  REQUIRE(cache.stats().dispatchRegionsComputed == 1);
 
   cache.invalidate();
   (void)cache.dominators();
   (void)cache.postDominators();
   (void)cache.loops();
   (void)cache.stackFrame();
+  (void)cache.dispatchRegions();
 
   CHECK(cache.stats().dominatorsComputed == 2);
   CHECK(cache.stats().postDominatorsComputed == 2);
   CHECK(cache.stats().loopsComputed == 2);
   CHECK(cache.stats().stackFrameComputed == 2);
+  CHECK(cache.stats().dispatchRegionsComputed == 2);
 }
 
 TEST_CASE("invalidate() only drops the analyses its tags name", "[analysis][cache]") {
@@ -161,6 +168,26 @@ TEST_CASE("invalidate() only drops the analyses its tags name", "[analysis][cach
   // Untagged: still the one original computation.
   (void)cache.stackFrame();
   CHECK(cache.stats().stackFrameComputed == 1);
+}
+
+TEST_CASE("invalidate() with the \"dispatch\" tag only drops dispatchRegions",
+          "[analysis][cache]") {
+  Cfg cfg;
+  const Function& function = diamond(cfg);
+  AnalysisCache cache(function);
+
+  (void)cache.dominators();
+  (void)cache.dispatchRegions();
+
+  const std::array<std::string_view, 1> tags{"dispatch"};
+  cache.invalidate(tags);
+
+  (void)cache.dispatchRegions();
+  CHECK(cache.stats().dispatchRegionsComputed == 2);
+
+  // Untagged: still the one original computation.
+  (void)cache.dominators();
+  CHECK(cache.stats().dominatorsComputed == 1);
 }
 
 }  // namespace

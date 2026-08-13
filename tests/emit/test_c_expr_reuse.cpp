@@ -116,14 +116,16 @@ TEST_CASE(
   INFO(text);
   // `flag` is shared across the whole function (the store, the switch's own
   // discriminant, and the reread in target0), so it still materializes
-  // exactly once regardless of scope -- but as of the H2 store/CSE merge
-  // (docs/09, docs/14 Phase 4) that one materialization IS the store into
-  // `var_10` itself, not a separate `_cse0` the store then copies from: one
-  // assignment, computed once, and every other reference (the switch, the
-  // reread) just reads `var_10` back rather than introducing a `_cseN`.
+  // exactly once regardless of scope, computed exactly once -- but as of
+  // Phase 3.2 (docs/09 shape A, past the H2 store/CSE merge of docs/14 Phase
+  // 4) that one materialization is not even a statement of its own: the
+  // store into `var_10` never prints (see deadStateDiscriminantStore), and
+  // its assignment moves into the switch's own condition instead, so the
+  // pair collapses from two statements to one and the reread in target0
+  // just reads `var_10` back.
   CHECK(occurrences(text, "(arg1 + 0x1000)") == 1);
-  CHECK(occurrences(text, "var_10 = (arg1 + 0x1000);") == 1);
-  CHECK(occurrences(text, "switch (var_10)") == 1);
+  CHECK(occurrences(text, "var_10 = (arg1 + 0x1000);") == 0);
+  CHECK(occurrences(text, "switch (var_10 = (arg1 + 0x1000)) {") == 1);
   CHECK(occurrences(text, "_cse") == 0);
 }
 
@@ -167,6 +169,43 @@ TEST_CASE(
   // comparison a second time.
   CHECK(occurrences(text, "== 0x0") == 1);
   CHECK(occurrences(text, "_cse0 = ") == 1);
+}
+
+TEST_CASE(
+    "Phase 3.3: a resolved switch's own discriminant root never mints a "
+    "temporary just for being the switch's condition",
+    "[emit][expr-reuse]") {
+  Fixture f;
+  // flag is reached twice (the clamp compare and the select's else-arm) so
+  // it earns its own _cse0; `index` -- the select, and the switch's own
+  // resolved discriminant -- is read by nothing but the switch itself, so
+  // `assignedText`/`rootText`'s ordinary isShared check already leaves it
+  // inline rather than minting a second, wrapping temporary for it. This is
+  // the plan's "single-use CSE inline" ask (3.3): confirming the existing
+  // root-context machinery already does this, with nothing left to change.
+  const ExprId flag = f.function.binary(ExprOp::And, f.entryReg("x0"), f.i64(0x3));
+  const ExprId clamp = f.function.binary(ExprOp::CmpLtS, f.i64(0x3), flag);
+  const ExprId index = f.function.select(clamp, f.i64(0x2), flag);
+  const ExprId address = f.function.binary(
+      ExprOp::Add, f.i64(0x30b7f0), f.function.binary(ExprOp::Shl, index, f.i64(3)));
+  const il::ValueId loaded = f.function.appendLoad(f.entry, 0x1004, Type::integer(64), address);
+  const BlockId target0 = f.block(0x2000);
+  const BlockId target1 = f.block(0x3000);
+  const BlockId target2 = f.block(0x4000);
+  const il::OpId brind =
+      f.function.appendIndirectBranch(f.entry, 0x1008, f.function.valueRef(loaded));
+  f.function.setTargets(brind, std::vector<BlockId>{target0, target1, target2});
+  f.function.appendReturn(target0, 0x2000);
+  f.function.appendReturn(target1, 0x3000);
+  f.function.appendReturn(target2, 0x4000);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(occurrences(text, "_cse0 = (arg1 & 0x3);") == 1);
+  // The clamp select is the switch's inline discriminant, not a second _cseN.
+  CHECK(occurrences(text, "switch (") == 1);
+  CHECK(occurrences(text, "? 0x2 : _cse0") >= 1);
+  CHECK(occurrences(text, "_cse1") == 0);
 }
 
 TEST_CASE(

@@ -21,6 +21,7 @@
 #include "xdec/analysis/image_literals.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/variables.h"
+#include "xdec/analysis/vtable_call.h"
 #include "xdec/emit/c_printer.h"
 #include "xdec/emit/structure.h"
 #include "xdec/il/function.h"
@@ -180,6 +181,15 @@ class CContext {
   /// declarations() so a local in this state gets no declaration either --
   /// one nothing writes and nothing reads has no fact left worth naming.
   std::unordered_set<int64_t> deadLocalStackDeltas;
+
+  /// Call op index -> the vtable slot it was confirmed to dispatch through
+  /// (see analysis::findConfirmedVtableCalls). A computed call the analysis
+  /// did not confirm as a vtable dispatch -- an ordinary function-pointer
+  /// call, or an object seen at only one slot -- has no entry here, and
+  /// prints exactly as it always did; this only ever adds a comment
+  /// (StmtPrinter::printCall), never changes what the call itself casts to,
+  /// since neither the object's struct layout nor its class name is known.
+  std::map<uint32_t, analysis::VtableCallSite> vtableCalls;
 
   /// The temporary standing for a value, or nullptr when the value has none.
   [[nodiscard]] const std::string* tempFor(il::ValueId value) const;

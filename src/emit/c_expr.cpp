@@ -411,8 +411,8 @@ std::string ExprPrinter::inner(il::ExprId id) {
     case il::ExprOp::SExt:
       return signExtend(id);
     case il::ExprOp::Select:
-      return std::format("({} ? {} : {})", text(e.operand(0)),
-                         text(e.operand(1)), text(e.operand(2)));
+      return std::format("({} ? {} : {})", text(e.operand(0)), text(e.operand(1)),
+                         text(e.operand(2)));
     case il::ExprOp::Extract: {
       const uint32_t width = e.type.bits();
       if (e.immediate == 0) {

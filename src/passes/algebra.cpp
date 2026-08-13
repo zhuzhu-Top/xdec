@@ -228,6 +228,10 @@ class Algebra {
     if (const il::ExprId mba = matchMbaSub(function_, expr); mba.valid()) {
       return mba;
     }
+    if (const il::ExprId increment = matchObfuscatedIncrement(function_, expr);
+        increment.valid()) {
+      return increment;
+    }
     if (pred_.isZero(y)) {
       return x;
     }
@@ -324,10 +328,11 @@ class Algebra {
                                 function_.constant(expr.type, k1 & k2));
       }
     }
-    // Opaque-predicate fuel: (v*(v±1)) & 1 is always zero — a product of
-    // consecutive integers is even. Flattened dispatchers hide their state
-    // constants behind this identity.
-    if (pred_.constant(y, k2) && k2 == 1 && consecutiveProduct(x)) {
+    // Opaque-predicate fuel: a product provably even, masked down to its own
+    // parity bit, is always zero. Flattened dispatchers hide their state
+    // constants behind this identity (see matchEvenProduct for which product
+    // shapes it covers).
+    if (pred_.constant(y, k2) && k2 == 1 && matchEvenProduct(function_, x)) {
       return function_.constant(expr.type, 0);
     }
     // A mask over a rotate or a shift: the rotate loses the half the mask
@@ -346,27 +351,6 @@ class Algebra {
       return carry;
     }
     return unchanged(expr);
-  }
-
-  /// v*(v±1) with hash-consed operand equality: the classic even-product
-  /// opaque identity, in either association the obfuscators emit.
-  [[nodiscard]] bool consecutiveProduct(il::ExprId id) const {
-    const il::Expr& expr = function_.expr(id);
-    if (expr.op != il::ExprOp::Mul) {
-      return false;
-    }
-    for (const int arm : {0, 1}) {
-      const il::Expr& factor = function_.expr(expr.operands[arm]);
-      if (factor.op != il::ExprOp::Sub && factor.op != il::ExprOp::Add) {
-        continue;
-      }
-      uint64_t k = 0;
-      if (pred_.constant(factor.operands[1], k) && k == 1 &&
-          factor.operands[0] == expr.operands[arm ^ 1]) {
-        return true;
-      }
-    }
-    return false;
   }
 
   [[nodiscard]] il::ExprId rewriteOr(il::Expr expr) {

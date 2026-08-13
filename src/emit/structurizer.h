@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include "xdec/analysis/dispatch_region.h"
 #include "xdec/emit/structure.h"
 
 namespace xdec::emit {
@@ -24,7 +25,8 @@ class Structurizer {
  public:
   Structurizer(const il::Function& function, const analysis::Dominators& dominators,
                const analysis::PostDominators& postDominators,
-               std::span<const analysis::NaturalLoop> loops);
+               std::span<const analysis::NaturalLoop> loops,
+               const StructureOptions& options = {});
 
   StructuredFunction run();
 
@@ -80,6 +82,73 @@ class Structurizer {
   /// be accounted for either way.
   StmtPtr tryDispatcherLoop(const analysis::NaturalLoop& loop, unsigned depth);
 
+  /// J2f (docs/architecture-optimization-eval-prompt.md §6.5): folds a
+  /// natural loop's own remaining top-level `groups` entries -- the header's
+  /// and every other member's, each left as its own untouched, labelled
+  /// remnant because the header's terminator (almost always a resolved
+  /// dispatch, not a `CondBranch`) never matched tryLoop's or
+  /// tryDispatcherLoop's shapes and wrapAsLoop only ever looks inside the one
+  /// switch it just built, not at a member reached through several other
+  /// handlers first -- into one `while (true)` whose jumps back to the
+  /// header print as `continue`. Only fires when every one of the loop's
+  /// blocks is still exactly that: its own untouched top-level entry, none
+  /// of them holding a loop of their own (a `goto header` inside one would
+  /// belong to *that* loop's own `continue`, not this one's). Mutates
+  /// `groups` in place, erasing every entry this absorbs; the caller's own
+  /// rank-based sort still places the surviving, now-merged entry correctly
+  /// since it keeps the header's original `BlockId`.
+  void collapseLabeledNaturalLoops(std::vector<std::pair<il::BlockId, StmtPtr>>& groups);
+
+  /// The function's dispatch regions (see analysis::findDispatchRegions),
+  /// computed at most once per Structurizer instance regardless of how many
+  /// of the two callers below end up asking for it: `tryDispatcherLoop`
+  /// reaches for it only once its own single-block vote
+  /// (analysis::matchDispatcherShape) has already failed, but `switchFor`'s
+  /// `isMemberOfLargeDispatchRegion` asks on every resolved two-target table
+  /// dispatch site -- still one scan of the function, not one per site.
+  const std::vector<analysis::DispatchRegion>& dispatchRegions();
+
+  /// J1's own collapse gate (see StructureOptions, structure.cpp's switchFor):
+  /// whether `block` -- a resolved two-target table dispatch's own site --
+  /// is a member of a dispatch region large enough that collapsing it to
+  /// `if`/`else` would lose the table identity `dispatchRegions()` already
+  /// recovered. `options_.deferRegionCollapse` widens "large enough" to any
+  /// region at all, for a fixture too small to reach `minRegionSites`
+  /// organically.
+  [[nodiscard]] bool isMemberOfLargeDispatchRegion(il::BlockId block);
+
+  /// tryDispatcherLoop's fallback for a `dispatch` whose own target count
+  /// never clears matchDispatcherShape's floor: looks for a region `dispatch`
+  /// belongs to and asks analysis::confirmDispatcherShapeFromRegion to
+  /// verify `dispatch`'s own targets against that region's shared tail.
+  std::optional<analysis::DispatcherShape> matchRegionConfirmedShape(
+      il::BlockId dispatch, std::span<const il::BlockId> targets);
+
+  /// J2e (docs/architecture-optimization-eval-prompt.md §6.3): every join
+  /// hub across every one of `dispatchRegions()`'s own regions, computed at
+  /// most once per Structurizer instance and indexed by tail block for
+  /// `switchFor`'s per-target lookup -- the same one-scan-not-one-per-site
+  /// discipline `dispatchRegions()` itself already holds to.
+  const std::map<il::BlockId, il::BlockId>& joinHubByTail();
+
+  /// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3,
+  /// StructureOptions::regionStructuring): flattens `stmt` -- a table-mode
+  /// Switch `switchFor` just finished building for `dispatch` -- against any
+  /// of its own case bodies that turn out to be exactly one more resolved
+  /// dispatch site of the same `region`, reached privately and reading the
+  /// identical already-evaluated discriminant (`Stmt::cond`, not merely a
+  /// structurally similar one). See structure_dispatch_region.cpp's own
+  /// comment for why that exact-`ExprId` requirement is load-bearing: two
+  /// different reads of "the same logical state variable" can (and in a
+  /// flattening dispatcher's own state-transition handlers routinely do)
+  /// hold different values by the second read, and folding those into one
+  /// `switch (cond)` evaluated exactly once would misdescribe control flow
+  /// that really re-reads and re-branches. Mutates `stmt` in place;
+  /// recurses into whatever it just spliced in, so a chain three or more
+  /// sites deep flattens in one call. Returns how many case slots were
+  /// absorbed this way (0 when nothing in `stmt` qualified).
+  std::size_t collapseRegionDispatchTree(Stmt& stmt, const analysis::DispatchRegion& region);
+
   StmtPtr gotoChain(il::ExprId cond, il::BlockId taken, il::BlockId untaken);
   StmtPtr gotoStmt(il::BlockId target);
 
@@ -104,6 +173,34 @@ class Structurizer {
   StmtPtr claimDispatcherCaseBody(il::BlockId dispatcher, il::BlockId handler,
                                   il::BlockId merge, unsigned depth,
                                   bool appendBreak = true);
+
+  /// `claimCaseBody`'s same-target-duplication counterpart, for a resolved
+  /// binary dispatch's handler that more than one such dispatch reaches
+  /// (see switchFor's collapse to `If`). Every predecessor of `handler` must
+  /// itself be a resolved two-target dispatch this collapse would
+  /// recognise -- not merely more than one predecessor -- so this only ever
+  /// fires inside the shape it was designed for. Claimed once (walked and
+  /// size-capped exactly like `claimCaseBody`), then handed out as
+  /// independent `cloneStmt` copies to every caller, first included, so no
+  /// caller's tree shares nodes with another's.
+  StmtPtr claimOrCloneSharedCaseBody(il::BlockId dispatcher, il::BlockId handler,
+                                     unsigned depth);
+
+  /// claimOrCloneSharedCaseBody's cheap, read-only guard: whether a resolved
+  /// table dispatch is reachable from `start` within `budget` successor
+  /// edges, checked by walking `il::Function::block(...).successors`
+  /// directly rather than through `emitRegion` -- no `mark`/`trail_`/
+  /// `gotoTargets_` touched, so there is nothing to `rollback` even when
+  /// this returns true. Exists because that cost matters here specifically:
+  /// a scatter-dispatcher's own handler routinely does a couple of ops and
+  /// dispatches again through the very same table, so `emitRegion` would
+  /// have to walk (and speculatively claim, and print-check via
+  /// containsSwitch, and only then roll back) that whole further switch
+  /// before finding out this handler was never going to qualify -- and,
+  /// worse, that walk's own nested pattern attempts leave `budget_` spent
+  /// with nothing to show for it even after the rollback, unlike this
+  /// check's cost, which is the same on every call.
+  [[nodiscard]] bool reachesFurtherDispatch(il::BlockId start, unsigned budget) const;
 
   /// Whether control cannot reach the bottom of a statement and carry on past it.
   /// Conservative: unsure counts as "it can".
@@ -157,6 +254,13 @@ class Structurizer {
   /// `continue`. Returns `stmt` unchanged when it is not that shape.
   StmtPtr wrapAsLoop(StmtPtr stmt, il::BlockId head);
 
+  /// Turns every jump back to `header` inside `node` into a `continue`, and
+  /// says whether it found any; stops at a nested loop rather than stealing
+  /// its own back edge's `continue`. Defined in structure_dispatch.cpp
+  /// (wrapAsLoop's original use); shared here so structure.cpp's
+  /// collapseLabeledNaturalLoops (J2f) does not need its own copy.
+  static bool continueAtBackEdges(Stmt* node, il::BlockId header);
+
   // -- helpers ----------------------------------------------------------------
 
   StmtPtr emitBlock(il::BlockId blockId);
@@ -198,6 +302,35 @@ class Structurizer {
   std::vector<il::BlockId> trail_;
   std::vector<il::BlockId> gotoTrail_;
   il::BlockId regionEnd_{};
+
+  /// Canonical bodies claimed by `claimOrCloneSharedCaseBody`, keyed by
+  /// handler: populated once per handler, on the first dispatch site that
+  /// reaches it, and cloned for every call after (including that first one).
+  std::map<il::BlockId, StmtPtr> sharedCaseBodyCache_;
+
+  /// One entry per `sharedCaseBodyCache_` insertion, in insertion order:
+  /// the claim's own pre-walk `trail_.size()` (its local `snapshot`) paired
+  /// with the handler it cached. `rollback` needs this because a cache
+  /// insertion can happen nested inside another pattern's speculative
+  /// `emitRegion` walk (any of tryDiamond/tryOneSided/tryLoop/claimCaseBody/
+  /// etc. can recurse through emitBlock/switchFor into this cache) -- if
+  /// that *enclosing* attempt fails and rolls its own trail back, the
+  /// nested claim's blocks stop being `emitted_` again, but without this,
+  /// the cache entry itself would survive and keep handing out a clone of a
+  /// body whose blocks the rest of the function no longer considers
+  /// claimed, printing it both inline (stale, from the clone) and again at
+  /// its own natural position (since nothing marked it emitted after the
+  /// rollback) -- see rollback's own comment for the actual purge.
+  std::vector<std::pair<std::size_t, il::BlockId>> sharedCaseBodyInsertions_;
+
+  /// See dispatchRegions(). Absent until the first call.
+  std::optional<std::vector<analysis::DispatchRegion>> dispatchRegions_;
+
+  /// See joinHubByTail(). Absent until the first call.
+  std::optional<std::map<il::BlockId, il::BlockId>> joinHubByTail_;
+
+  /// See StructureOptions. Copied in at construction; never mutated after.
+  StructureOptions options_;
 
   /// See `StructuredFunction::matchedPatterns`: one entry per `CondBranch`
   /// site actually claimed, appended right where `emitRegion` commits to

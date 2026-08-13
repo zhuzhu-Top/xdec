@@ -115,7 +115,7 @@ struct DriverOptions {
   bool extendWhileProving = true;
   /// The wall behind the budget: pathological input gets bounded work whatever
   /// it keeps claiming to prove.
-  static constexpr unsigned kRoundCeiling = 64;
+  static constexpr unsigned kRoundCeiling = 128;
   /// Emit a function whose remaining computed branches could not be resolved,
   /// with each one marked, rather than failing the run (see
   /// pass::Context::setSealUnresolvedBranches).
@@ -150,7 +150,7 @@ struct DriverOptions {
   /// this makes consequential instead of merely loud — a wall well above any
   /// legitimate count on purpose, the same role kRoundCeiling plays for
   /// rounds, for entries instead.
-  std::size_t maxTotalEntries = 512;
+  std::size_t maxTotalEntries = 2048;
 };
 
 /// What the loop did, for CLI reporting and tests.

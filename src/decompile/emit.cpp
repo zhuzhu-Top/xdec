@@ -91,7 +91,7 @@ RenderToCResult renderToC(const il::Function& function, const DecompileToCOption
       timed("post-dominators", [&] { return cache.postDominators(); });
   const std::vector<analysis::NaturalLoop> loops = timed("loops", [&] { return cache.loops(); });
   emit::StructuredFunction structured = timed("structure", [&] {
-    return emit::structureFunction(function, dominators, postDominators, loops);
+    return emit::structureFunction(function, dominators, postDominators, loops, options.structure);
   });
   report.labeledBlockCount = structured.labeled.size();
 
@@ -109,6 +109,9 @@ RenderToCResult renderToC(const il::Function& function, const DecompileToCOption
     report.emitRedundancy = timed("emit-redundancy", [&] {
       return analysis::analyzeEmitRedundancy(function, frame, variables);
     });
+  }
+  if (options.computeObfuscationProfile) {
+    report.obfuscationProfile = timed("profile", [&] { return analysis::profile(function); });
   }
 
   return RenderToCResult{std::move(variables), frame, std::move(structured), std::move(text),

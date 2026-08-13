@@ -279,6 +279,31 @@ materializing straight into `var_a0c = (...)`, which a *later* formula in
 the same scope then reads back as `rotr32(var_a1c, ...)` rather than through
 a second temp. See `docs/14-emit-redundancy.md`'s Phase 4 measurements.
 
+**Extension: a `Select`-valued store no longer bypasses this fold.**
+`printOp`'s `Store` case also has its own way to spell a conditional value —
+`printSelectAssign` flattens a `Select` chain into `if (cond) { lvalue = A; }
+else { lvalue = B; }`, which used to run unconditionally ahead of the H2
+check above, so a `Select` never got a chance at the one-line fold no matter
+how shared it was. That is the right call when the `Select` is not shared —
+an `if`/`else` reads better than a raw ternary for most such values, which
+is why `printSelectAssign` exists at all — but wrong the moment the exact
+same `Select` node is *also* read somewhere else in the scope: a flattening
+dispatcher's own state slot and the table index it drives are, after
+hash-consing, frequently the literal same node (`state = (idx < 0x4000) ?
+0x2a2 : 0xb6;` right next to a table lookup through that same
+compare-and-select), and printing the store as `if (cond) { state = 0x2a2;
+} else { state = 0xb6; }` throws away the connection a reader needs between
+the two sites — a second, unconnected-looking `_cseN = (cond) ? 0x2a2 :
+0xb6;` a few lines down has to rediscover it. `printOp`'s `Store` case now
+tries `materializeAs` *first*: when the value is not shared (the common
+case), `materializeAs` returns `nullopt` and `printSelectAssign` runs
+exactly as before; when it is shared, the store is named once, under its
+own lvalue, and the later use reads that name back instead of a fresh
+`_cseN` — see `docs/17-dispatch-region.md`'s own note on where this shows
+up in a real flattened dispatcher, and
+`tests/emit/test_c_printer.cpp`'s "assigned select shared with another use"
+case.
+
 ## I. CSE reference counts inflated by what H removes
 
 `ExprPrinter::beginScope`'s roots include every op's operands, an H1 dead

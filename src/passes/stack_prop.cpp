@@ -3,6 +3,7 @@
 #include "xdec/passes/stack_prop.h"
 
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -35,14 +36,14 @@ class StackProp {
   }
 
   bool run() {
-    if (!spLeaf_.valid()) {
-      return false;  // no stack pointer in the register file: nothing to say
+    if (spLeaf_.valid()) {
+      for (const il::BlockId blockId : function_.blockHandles()) {
+        walkBlock(blockId);
+      }
     }
-    for (const il::BlockId blockId : function_.blockHandles()) {
-      walkBlock(blockId);
-    }
+    const bool globalsForwarded = forwardStoreFreeGlobals();
     const bool forwarded = applyForwarding();
-    return canonicalized_ || forwarded;
+    return canonicalized_ || forwarded || globalsForwarded;
   }
 
  private:
@@ -158,6 +159,116 @@ class StackProp {
           break;
       }
     }
+  }
+
+  /// Whole-function reuse of a global load, for the case `walkBlock`'s
+  /// per-block reset cannot reach: the same address reloaded from a
+  /// different block. Sound whenever nothing anywhere in the function could
+  /// have written it -- any store to the address, any store the analysis
+  /// cannot classify (which may alias anything), or any opaque call
+  /// disqualifies every global at once, the same clobber rule `walkBlock`
+  /// already applies per block, just checked across the whole function
+  /// instead of forgotten at each one. When it holds, the address denotes
+  /// the same value for the life of the function: a caller-established
+  /// constant the decompiler cannot name, but can still stop reloading,
+  /// which is what lets an MBA idiom see two occurrences of the same operand
+  /// instead of two different loads of it.
+  bool forwardStoreFreeGlobals() {
+    bool clobbered = false;
+    std::unordered_set<il::ExprId> storedAddresses;
+    std::unordered_set<il::OpId> alreadyForwarded;
+    for (const auto& [blockId, opId] : forwarded_) {
+      alreadyForwarded.insert(opId);
+    }
+    for (const il::BlockId blockId : function_.blockHandles()) {
+      for (const il::OpId opId : function_.block(blockId).ops) {
+        const il::Op& op = function_.op(opId);
+        if (op.code == il::OpCode::Call || op.code == il::OpCode::Intrinsic ||
+            op.code == il::OpCode::Unimplemented) {
+          clobbered = true;
+        } else if (op.code == il::OpCode::Store) {
+          const il::ExprId address = function_.operands(op)[0];
+          const analysis::AddressInfo info = frame_.classify(address);
+          if (info.kind == analysis::AddressKind::Global) {
+            storedAddresses.insert(address);
+          } else if (info.kind == analysis::AddressKind::Other) {
+            clobbered = true;
+          }
+        }
+      }
+    }
+    if (clobbered) {
+      return false;
+    }
+
+    struct Source {
+      il::ExprId address;
+      il::ExprId data;
+    };
+    std::vector<Source> sources;
+    // A substitution of its own, not the shared `subst_`: that one's `apply`
+    // memoizes per ExprId, and `walkBlock` above already asked it about some
+    // of these operands (to pre-substitute store data) before this loop
+    // could have known they were forwardable. Reusing it would return those
+    // stale, unsubstituted answers forever. A fresh map has no such history.
+    ValueSubst globalSubst;
+    std::vector<std::pair<il::BlockId, il::OpId>> globallyForwarded;
+    for (const il::BlockId blockId : function_.blockHandles()) {
+      for (const il::OpId opId : function_.block(blockId).ops) {
+        const il::Op& op = function_.op(opId);
+        if (op.code != il::OpCode::Load || alreadyForwarded.contains(opId)) {
+          continue;
+        }
+        const il::ExprId address = function_.operands(op)[0];
+        if (frame_.classify(address).kind != analysis::AddressKind::Global ||
+            storedAddresses.contains(address)) {
+          continue;
+        }
+        const auto found = std::find_if(sources.begin(), sources.end(),
+                                        [&](const Source& source) {
+                                          return source.address == address;
+                                        });
+        if (found == sources.end()) {
+          sources.push_back({address, function_.valueRef(op.result)});
+          continue;
+        }
+        const il::Type loadType = op.type;
+        const il::Type sourceType = function_.expr(found->data).type;
+        if (sourceType == loadType) {
+          globalSubst.set(op.result, found->data);
+        } else if (sourceType.isScalarInteger() && loadType.isScalarInteger() &&
+                   sourceType.bits() > loadType.bits()) {
+          globalSubst.set(op.result, function_.cast(il::ExprOp::Trunc, loadType, found->data));
+        } else {
+          sources.push_back({address, function_.valueRef(op.result)});
+          continue;
+        }
+        globallyForwarded.push_back({blockId, opId});
+      }
+    }
+    if (globallyForwarded.empty()) {
+      return false;
+    }
+    for (const il::BlockId blockId : function_.blockHandles()) {
+      for (const il::OpId opId : function_.block(blockId).ops) {
+        const auto operands = function_.operands(function_.op(opId));
+        if (operands.empty()) {
+          continue;
+        }
+        std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
+        bool touched = false;
+        for (il::ExprId& operand : rewritten) {
+          const il::ExprId next = globalSubst.apply(function_, operand);
+          touched |= next != operand;
+          operand = next;
+        }
+        if (touched) {
+          function_.setOperands(opId, rewritten);
+        }
+      }
+    }
+    forwarded_.insert(forwarded_.end(), globallyForwarded.begin(), globallyForwarded.end());
+    return true;
   }
 
   /// Rewrites every use of a forwarded load's value with the stored

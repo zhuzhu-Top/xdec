@@ -295,6 +295,50 @@ TEST_CASE("an assigned select prints as an if/else over the same lvalue",
   CHECK(contains(text, "var_10 = arg3;"));
 }
 
+TEST_CASE("an assigned select shared with another use in the block folds to one line",
+          "[emit][print]") {
+  Fixture f;
+  // var_10 = cond ? 0x2a2 : 0xb6, with the exact same Select node (hash-
+  // consed, so this is one ExprId, not two coincidentally equal ones) also
+  // feeding a second use in the same block -- the shape a flattening
+  // dispatcher's own state slot and the table index it drives take once
+  // resolve-indirect and this store's own value turn out to be the same
+  // node (docs/17-dispatch-region.md's routing-duplication case). Printed
+  // as two if/else pairs each testing the identical condition, a reader
+  // sees no connection between the store and the later table lookup; named
+  // once under the store's own lvalue and read back by that name, the
+  // connection is the code.
+  const ExprId cond = f.function.binary(ExprOp::CmpEq, f.entryReg("x0"), f.i64(0));
+  const ExprId chosen = f.function.select(cond, f.i64(0x2a2), f.i64(0xb6));
+  f.function.appendStore(f.entry, 0x1000, Type::integer(64), f.slot(-0x10), chosen);
+  const ExprId address = f.function.binary(
+      ExprOp::Add, f.function.binary(ExprOp::Shl, chosen, f.i64(3)), f.i64(0x1e70a0));
+  const il::ValueId tableLoad = f.function.appendLoad(f.entry, 0x1004, Type::integer(64), address);
+  // The table load itself needs two readers of its own -- one alone would
+  // make it eligible for load-inline (shape G) and fold it straight into
+  // its reader before this scope's own root scan ever reaches `address`,
+  // which would hide the very reuse this test exists to exercise.
+  f.function.appendStore(f.entry, 0x1008, Type::integer(64), f.slot(-0x20),
+                         f.function.valueRef(tableLoad));
+  const il::ValueId reloaded =
+      f.function.appendLoad(f.entry, 0x100c, Type::integer(64), f.slot(-0x10));
+  const ExprId combined = f.function.binary(ExprOp::Xor, f.function.valueRef(tableLoad),
+                                            f.function.valueRef(reloaded));
+  const il::OpId ret = f.function.appendReturn(f.entry, 0x1010);
+  f.function.setOperands(ret, std::vector<ExprId>{combined});
+
+  const std::string text = f.emit();
+  INFO(text);
+  // One ternary assignment under the store's own name -- no if/else pair,
+  // and no fresh `_cseN` invented for a node that already has a better name.
+  CHECK(contains(text, "var_10 = ((arg1 == 0x0) ? 0x2a2 : 0xb6);"));
+  CHECK_FALSE(contains(text, "} else {"));
+  CHECK_FALSE(contains(text, "_cse"));
+  // The table-load address reads the same name back rather than repeating
+  // the condition.
+  CHECK(contains(text, "var_10 <<"));
+}
+
 TEST_CASE("a select nested in a larger value stays a ternary", "[emit][print]") {
   Fixture f;
   // var_10 = x1 ^ (cond ? x2 : 0). Only the xor is being assigned, and there is
