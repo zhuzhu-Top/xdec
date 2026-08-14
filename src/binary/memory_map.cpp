@@ -33,7 +33,6 @@ Result<void> MemoryMap::finalize() {
   std::sort(regions_.begin(), regions_.end(),
             [](const MemoryRegion& a, const MemoryRegion& b) { return a.va < b.va; });
 
-  const uint64_t backingSize = backing_.size();
   for (const MemoryRegion& region : regions_) {
     if (region.va > std::numeric_limits<uint64_t>::max() - region.size) {
       return err(DiagCode::BadFormat,
@@ -45,13 +44,22 @@ Result<void> MemoryMap::finalize() {
                  std::format("region '{}' at 0x{:x} declares file size 0x{:x} > memory size 0x{:x}",
                              region.name, region.va, region.fileSize, region.size));
     }
-    if (region.fileSize != 0 &&
-        (region.fileOffset > backingSize || backingSize - region.fileOffset < region.fileSize)) {
+    if (region.fileSize == 0) {
+      continue;
+    }
+    if (region.backingIndex >= backingParts_.size()) {
       return err(DiagCode::BadFormat,
-                 std::format("region '{}' at 0x{:x} reads file range [0x{:x}, 0x{:x}) "
-                             "beyond the {} byte file",
+                 std::format("region '{}' at 0x{:x} refers to backing part {} but only {} "
+                             "are known",
+                             region.name, region.va, region.backingIndex, backingParts_.size()));
+    }
+    const uint64_t backingSize = backingParts_[region.backingIndex].size();
+    if (region.fileOffset > backingSize || backingSize - region.fileOffset < region.fileSize) {
+      return err(DiagCode::BadFormat,
+                 std::format("region '{}' at 0x{:x} reads file range [0x{:x}, 0x{:x}) of part {} "
+                             "beyond its {} bytes",
                              region.name, region.va, region.fileOffset,
-                             region.fileOffset + region.fileSize, backingSize));
+                             region.fileOffset + region.fileSize, region.backingIndex, backingSize));
     }
   }
 
@@ -119,8 +127,8 @@ Result<void> MemoryMap::read(uint64_t va, std::span<std::byte> out) const {
     const uint64_t fromFile = std::min(fileAvailable, wanted);
 
     if (fromFile != 0) {
-      std::memcpy(out.data() + written,
-                  backing_.data() + region->fileOffset + offsetInRegion,
+      const std::span<const std::byte> part = backingParts_[region->backingIndex];
+      std::memcpy(out.data() + written, part.data() + region->fileOffset + offsetInRegion,
                   static_cast<std::size_t>(fromFile));
     }
     if (wanted > fromFile) {
@@ -149,8 +157,11 @@ std::span<const std::byte> MemoryMap::directView(uint64_t va, uint64_t size) con
     // next region; the caller must go through read().
     return {};
   }
-  return backing_.subspan(static_cast<std::size_t>(region->fileOffset + offsetInRegion),
-                          static_cast<std::size_t>(size));
+  if (region->backingIndex >= backingParts_.size()) {
+    return {};
+  }
+  return backingParts_[region->backingIndex].subspan(
+      static_cast<std::size_t>(region->fileOffset + offsetInRegion), static_cast<std::size_t>(size));
 }
 
 }  // namespace xdec::binary

@@ -116,6 +116,9 @@ ValueSet ImageEval::eval(il::ExprId id) {
     case il::ExprOp::Extract:
       result = evalCast(expr);
       break;
+    case il::ExprOp::EntryReg:
+      result = evalEntryReg(expr);
+      break;
     default: {
       const il::ExprOpInfo& info = il::info(expr.op);
       if (info.category == il::ExprCategory::IntArithmetic ||
@@ -151,10 +154,7 @@ ValueSet ImageEval::evalValue(il::ValueId id) {
   const il::Op& definition = function_.op(info.definition);
   ValueSet result = ValueSet::top();
   if (definition.code == il::OpCode::Phi) {
-    result = ValueSet::empty();
-    for (const il::ExprId input : function_.operands(definition)) {
-      result.unite(eval(input));
-    }
+    result = unionEntryRegAware(function_.operands(definition));
   } else if (definition.code == il::OpCode::Load) {
     const auto operands = function_.operands(definition);
     result = loadFrom(eval(operands[0]), function_.value(id).type);
@@ -171,6 +171,17 @@ ValueSet ImageEval::loadFrom(const ValueSet& addresses, il::Type type) {
   const std::size_t width = type.bits() / 8;
   ValueSet out = ValueSet::empty();
   for (const uint64_t address : addresses.values()) {
+    if (entryRegs_ != nullptr) {
+      // A captured fact about memory the image itself does not contain (an
+      // argument pointer's pointee, say -- see MemorySeed) always wins over
+      // the image's own bytes at that address, the same priority an
+      // EntryReg literal has over a platform formula.
+      if (const std::optional<uint64_t> seeded =
+              entryRegs_->memoryValueAt(address, static_cast<unsigned>(width))) {
+        out.insert(maskTo(type.bits(), *seeded));
+        continue;
+      }
+    }
     std::array<std::byte, 8> bytes{};
     if (!reader_(address, std::span<std::byte>(bytes).subspan(0, width))) {
       return ValueSet::top();  // unmapped memory is not zero
@@ -182,6 +193,44 @@ ValueSet ImageEval::loadFrom(const ValueSet& addresses, il::Type type) {
     out.insert(maskTo(type.bits(), value));
   }
   return out;
+}
+
+bool ImageEval::isRawEntryReg(il::ExprId id) const {
+  return function_.expr(id).op == il::ExprOp::EntryReg;
+}
+
+ValueSet ImageEval::unionEntryRegAware(std::span<const il::ExprId> arms) {
+  bool anyComputed = false;
+  for (const il::ExprId arm : arms) {
+    if (!isRawEntryReg(arm)) {
+      anyComputed = true;
+      break;
+    }
+  }
+  ValueSet result = ValueSet::empty();
+  for (const il::ExprId arm : arms) {
+    if (anyComputed && isRawEntryReg(arm)) {
+      continue;
+    }
+    result.unite(eval(arm));
+  }
+  return result;
+}
+
+ValueSet ImageEval::evalEntryReg(const il::Expr& expr) {
+  if (entryRegs_ == nullptr) {
+    return ValueSet::top();
+  }
+  const il::RegId reg{static_cast<uint32_t>(expr.immediate)};
+  if (!function_.registers().contains(reg)) {
+    return ValueSet::top();
+  }
+  const std::optional<uint64_t> resolved =
+      entryRegs_->resolve(function_.registers().nameOf(reg));
+  if (!resolved.has_value()) {
+    return ValueSet::top();
+  }
+  return ValueSet::one(maskTo(expr.type.bits(), *resolved));
 }
 
 ValueSet ImageEval::evalUnary(const il::Expr& expr) {
@@ -268,10 +317,9 @@ ValueSet ImageEval::evalSelect(const il::Expr& expr) {
   if (!condition.isTop() && condition.values().size() == 1) {
     return eval(expr.operands[condition.values()[0] != 0 ? 1 : 2]);
   }
-  // The case this evaluator exists for: both arms, unioned.
-  ValueSet out = eval(expr.operands[1]);
-  out.unite(eval(expr.operands[2]));
-  return out;
+  // The case this evaluator exists for: both arms, unioned -- except a bare
+  // EntryReg arm next to a computed one (see unionEntryRegAware).
+  return unionEntryRegAware(std::span<const il::ExprId>(&expr.operands[1], 2));
 }
 
 ValueSet ImageEval::evalCast(const il::Expr& expr) {

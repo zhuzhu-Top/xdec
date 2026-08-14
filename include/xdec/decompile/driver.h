@@ -143,6 +143,12 @@ struct DriverOptions {
   /// null, and both must outlive the call.
   const types::TypeDatabase* types = nullptr;
   const types::SyscallTable* syscalls = nullptr;
+  /// What the platform says a leaked entry register holds (see
+  /// analysis/entry_reg.h, binary::TargetProfile::entryRegOffsets). Absent
+  /// runs exactly as before this existed: every EntryReg leaf stays
+  /// unresolved. Populated by SessionContext::open, never by a CLI flag --
+  /// see docs/21-entry-reg-platform.md for why.
+  const analysis::EntryRegFacts* entryRegs = nullptr;
   /// The image's symbol table, which is what connects an imported declaration
   /// to an address (see pass::Context::setNames). Unset binds nothing.
   pass::NameAt names;

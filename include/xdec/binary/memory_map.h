@@ -58,6 +58,10 @@ struct MemoryRegion {
   uint64_t fileOffset = 0;
   /// Number of bytes actually backed by the file; never greater than `size`.
   uint64_t fileSize = 0;
+  /// Which backing part `fileOffset`/`fileSize` are relative to (see
+  /// MemoryMap::setBackingParts). Zero -- the only part a single-file image
+  /// ever has -- for every loader before the dyld shared cache.
+  uint32_t backingIndex = 0;
   MemoryPermissions permissions = MemoryPermissions::None;
   /// Originating segment or section name; diagnostics only.
   std::string name;
@@ -72,9 +76,20 @@ class MemoryMap {
  public:
   MemoryMap() = default;
 
-  /// The buffer that `fileOffset`/`fileSize` refer to. Must outlive the map and
-  /// keep a stable address.
-  void setBackingBytes(std::span<const std::byte> bytes) noexcept { backing_ = bytes; }
+  /// The buffer that `fileOffset`/`fileSize` refer to when every region has
+  /// `backingIndex == 0`. Must outlive the map and keep a stable address.
+  /// Equivalent to `setBackingParts({bytes})`.
+  void setBackingBytes(std::span<const std::byte> bytes) noexcept {
+    backingParts_.assign(1, bytes);
+  }
+
+  /// The buffers `fileOffset`/`fileSize` refer to, indexed by
+  /// `MemoryRegion::backingIndex`. Every span must outlive the map and keep a
+  /// stable address -- see BackingStore, whose whole purpose is providing
+  /// exactly that.
+  void setBackingParts(std::vector<std::span<const std::byte>> parts) noexcept {
+    backingParts_ = std::move(parts);
+  }
 
   void addRegion(MemoryRegion region);
 
@@ -104,7 +119,7 @@ class MemoryMap {
   [[nodiscard]] std::span<const std::byte> directView(uint64_t va, uint64_t size) const noexcept;
 
  private:
-  std::span<const std::byte> backing_;
+  std::vector<std::span<const std::byte>> backingParts_;
   std::vector<MemoryRegion> regions_;
   bool finalized_ = false;
 };

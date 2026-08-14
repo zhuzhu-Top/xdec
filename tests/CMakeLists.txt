@@ -17,6 +17,7 @@ include(Catch)
 add_executable(xdec_tests
   support/test_bits.cpp
   support/test_arena.cpp
+  support/test_composite_reader.cpp
   support/test_handle.cpp
   support/test_result.cpp
   analysis/test_analysis.cpp
@@ -25,6 +26,7 @@ add_executable(xdec_tests
   analysis/test_dispatch_values.cpp
   analysis/test_dispatcher_shape.cpp
   analysis/test_emit_redundancy.cpp
+  analysis/test_entry_reg.cpp
   analysis/test_expr_reuse.cpp
   analysis/test_guard_cascade.cpp
   analysis/test_image_eval.cpp
@@ -72,6 +74,8 @@ add_executable(xdec_tests
   emit/test_c_typed_return.cpp
   binary/test_memory_map.cpp
   binary/test_elf.cpp
+  binary/test_macho.cpp
+  binary/test_dyld_cache.cpp
   il/test_type.cpp
   il/test_expr.cpp
   il/test_function.cpp

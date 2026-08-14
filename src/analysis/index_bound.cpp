@@ -648,6 +648,113 @@ struct BitFactor {
   return zeroExtend(combined, width);
 }
 
+std::optional<std::vector<uint64_t>> exactValues(const il::Function& function, il::ExprId id,
+                                                 unsigned depth);
+
+/// Every leaf of a chain of the same binary op, found by unfolding nesting on
+/// either side: `a op (b op c)` flattens the same as `(a op b) op c` would.
+/// The obfuscator's own tree only ever associates one way, and absd's OR
+/// dispatchers chain three or more complementary-flag terms this way (see
+/// exactOrChainValues) -- matchBitFactor's direct-sibling check below cannot
+/// see a pair split across that nesting, since a nested `Or` node is not
+/// itself a bit factor.
+void flattenChain(const il::Function& function, il::ExprOp op, il::ExprId id,
+                  std::vector<il::ExprId>& leaves) {
+  const il::Expr& expr = function.expr(id);
+  if (expr.op == op && expr.operandCount == 2) {
+    flattenChain(function, op, expr.operands[0], leaves);
+    flattenChain(function, op, expr.operands[1], leaves);
+    return;
+  }
+  leaves.push_back(id);
+}
+
+/// An OR chain of three or more terms, at least one complementary pair among
+/// them (see BitFactor and its direct-sibling use just below in `exactValues`
+/// for the two-term case this generalises). Each complementary pair
+/// contributes its combined outcomes as one group -- for a true complement
+/// that is the singleton `{1}`, not the `{0, 1}` treating the two flags as
+/// independent would produce -- and every unpaired leaf contributes its own
+/// value set; the groups are then folded together with the same cap the rest
+/// of this file uses. Absd's own shape is `t26 | t27 | ... | !(t_n != t_m)`:
+/// none of those terms sit as direct siblings of every other one, so without
+/// flattening the chain first, the two-term check a few lines down never
+/// gets the chance to fire at all.
+[[nodiscard]] std::optional<std::vector<uint64_t>> exactOrChainValues(const il::Function& function,
+                                                                      il::ExprId id,
+                                                                      unsigned width,
+                                                                      unsigned depth) {
+  std::vector<il::ExprId> leaves;
+  flattenChain(function, il::ExprOp::Or, id, leaves);
+  if (leaves.size() <= 2) {
+    // Nothing this walk can do that the direct two-term check below cannot;
+    // let that path run instead of duplicating it.
+    return std::nullopt;
+  }
+  std::vector<bool> claimed(leaves.size(), false);
+  std::vector<std::vector<uint64_t>> groups;
+  bool anyPair = false;
+  for (std::size_t i = 0; i < leaves.size(); ++i) {
+    if (claimed[i]) {
+      continue;
+    }
+    const std::optional<BitFactor> left = matchBitFactor(function, leaves[i]);
+    bool paired = false;
+    if (left.has_value()) {
+      for (std::size_t j = i + 1; j < leaves.size(); ++j) {
+        if (claimed[j]) {
+          continue;
+        }
+        const std::optional<BitFactor> right = matchBitFactor(function, leaves[j]);
+        if (right.has_value() && left->sameQuestionAs(*right) &&
+            left->complemented != right->complemented) {
+          std::vector<uint64_t> combo;
+          for (uint64_t bit = 0; bit <= 1; ++bit) {
+            const uint64_t leftBit = left->complemented ? 1 - bit : bit;
+            const uint64_t rightBit = right->complemented ? 1 - bit : bit;
+            insertUnique(combo, combineBinary(il::ExprOp::Or, leftBit * left->multiplier,
+                                              rightBit * right->multiplier, width));
+          }
+          groups.push_back(std::move(combo));
+          claimed[i] = claimed[j] = true;
+          paired = true;
+          anyPair = true;
+          break;
+        }
+      }
+    }
+    if (!paired) {
+      const std::optional<std::vector<uint64_t>> values =
+          exactValues(function, leaves[i], depth + 1);
+      if (!values.has_value()) {
+        return std::nullopt;
+      }
+      groups.push_back(*values);
+      claimed[i] = true;
+    }
+  }
+  if (!anyPair) {
+    // Every leaf resolved independently: the same answer the generic
+    // two-at-a-time recursion below already reaches, just computed once
+    // more. Defer to it rather than duplicate the work.
+    return std::nullopt;
+  }
+  std::vector<uint64_t> out{0};  // OR's identity
+  for (const std::vector<uint64_t>& group : groups) {
+    if (out.size() * group.size() > kSetCap) {
+      return std::nullopt;
+    }
+    std::vector<uint64_t> next;
+    for (const uint64_t a : out) {
+      for (const uint64_t b : group) {
+        insertUnique(next, combineBinary(il::ExprOp::Or, a, b, width));
+      }
+    }
+    out = std::move(next);
+  }
+  return out.size() > kSetCap ? std::nullopt : std::optional<std::vector<uint64_t>>{out};
+}
+
 /// See `preciseIndexSet` in the header for the contract; this is the walk.
 [[nodiscard]] std::optional<std::vector<uint64_t>> exactValues(const il::Function& function,
                                                                il::ExprId id, unsigned depth) {
@@ -682,6 +789,55 @@ struct BitFactor {
       }
       return out;
     }
+    case il::ExprOp::Value: {
+      // A value backed by a phi is the same merge ImageEval's evalValue reads
+      // (analysis/image_eval.cpp) -- unioning its arms here, not just leaving
+      // it opaque, is what lets a loop-carried dispatcher state (absd's
+      // reg:x9/x11 phis) answer through a `val:iN(%k)` the same way it would
+      // if the tree had been built with the arms spliced in directly. A raw
+      // EntryReg arm next to a real one is dropped rather than unioned, same
+      // policy and same reason as ImageEval::unionEntryRegAware: it is a
+      // platform fact this walk cannot look up (no EntryRegFacts reaches
+      // here), and folding it in would widen an otherwise small merge with a
+      // value that only ever flows in on the one edge that does not matter.
+      const il::ValueId valueId{static_cast<uint32_t>(expr.immediate)};
+      if (!function.hasValue(valueId)) {
+        return std::nullopt;
+      }
+      const il::ValueInfo& info = function.value(valueId);
+      if (!function.hasOp(info.definition) ||
+          function.op(info.definition).code != il::OpCode::Phi) {
+        // Loads, calls, register reads: no shape to read past, same fallback
+        // as any other op this walk cannot see through.
+        return valuesOfWidth(width);
+      }
+      const std::span<const il::ExprId> arms = function.operands(function.op(info.definition));
+      bool anyComputed = false;
+      for (const il::ExprId arm : arms) {
+        if (function.expr(arm).op != il::ExprOp::EntryReg) {
+          anyComputed = true;
+          break;
+        }
+      }
+      std::vector<uint64_t> out;
+      for (const il::ExprId arm : arms) {
+        if (anyComputed && function.expr(arm).op == il::ExprOp::EntryReg) {
+          continue;
+        }
+        const std::optional<std::vector<uint64_t>> armValues =
+            exactValues(function, arm, depth + 1);
+        if (!armValues.has_value()) {
+          return std::nullopt;
+        }
+        for (const uint64_t value : *armValues) {
+          insertUnique(out, value);
+        }
+        if (out.size() > kSetCap) {
+          return std::nullopt;
+        }
+      }
+      return out;
+    }
     case il::ExprOp::ShrU: {
       uint64_t shift = 0;
       if (!function.asConstant(expr.operands[1], shift)) {
@@ -711,6 +867,15 @@ struct BitFactor {
     case il::ExprOp::Sub:
     case il::ExprOp::Mul:
     case il::ExprOp::Shl: {
+      // A chain of three or more OR terms, a complementary pair among them
+      // separated by nesting rather than sitting as direct siblings: see
+      // exactOrChainValues. Tried first because the direct two-term check
+      // just below never sees past that nesting on its own.
+      if (expr.op == il::ExprOp::Or) {
+        if (auto chained = exactOrChainValues(function, id, width, depth)) {
+          return chained;
+        }
+      }
       // A single shared bit read on both sides (see BitFactor above) is
       // resolved on its own two values before anything else is tried: the
       // generic path below would treat the two sides as independent and
@@ -758,20 +923,50 @@ struct BitFactor {
       return out.size() > kSetCap ? std::nullopt : std::optional<std::vector<uint64_t>>{out};
     }
     case il::ExprOp::Select: {
-      // Whichever arm runs is the whole value, so both must answer -- the
-      // same requirement localBound's Select case has, for the same reason.
+      // Whichever arm runs is the whole value, so ordinarily both must
+      // answer -- the same requirement localBound's Select case has, for the
+      // same reason.
+      const il::ExprId trueArm = expr.operands[1];
+      const il::ExprId falseArm = expr.operands[2];
       const std::optional<std::vector<uint64_t>> onTrue =
-          exactValues(function, expr.operands[1], depth + 1);
+          exactValues(function, trueArm, depth + 1);
       const std::optional<std::vector<uint64_t>> onFalse =
-          exactValues(function, expr.operands[2], depth + 1);
-      if (!onTrue.has_value() || !onFalse.has_value()) {
-        return std::nullopt;
+          exactValues(function, falseArm, depth + 1);
+      if (onTrue.has_value() && onFalse.has_value()) {
+        std::vector<uint64_t> out = *onTrue;
+        for (const uint64_t value : *onFalse) {
+          insertUnique(out, value);
+        }
+        return out.size() > kSetCap ? std::nullopt : std::optional<std::vector<uint64_t>>{out};
       }
-      std::vector<uint64_t> out = *onTrue;
-      for (const uint64_t value : *onFalse) {
-        insertUnique(out, value);
+      // cinc/csinc: `select(cond, state + 1, state)` is one instruction, so
+      // when exactly one arm fails to answer on its own but is structurally
+      // the *other* arm plus (or minus) a literal -- the same relationship
+      // armBound reads to shift a guard's bound by the offset -- the known
+      // arm's values, shifted by that same literal, are the unknown arm's
+      // values too. This is what lets a table index built on an
+      // EntryReg-anchored `state` (a value set, not a structural bound) still
+      // enumerate exactly: armBound already covers the guard-bound case,
+      // this covers the value-set one.
+      if (onTrue.has_value() != onFalse.has_value()) {
+        const il::ExprId knownArm = onTrue.has_value() ? trueArm : falseArm;
+        const std::vector<uint64_t>& knownValues = onTrue.has_value() ? *onTrue : *onFalse;
+        const il::ExprId unknownArm = onTrue.has_value() ? falseArm : trueArm;
+        const il::Expr& shifted = function.expr(unknownArm);
+        uint64_t literal = 0;
+        if ((shifted.op == il::ExprOp::Add || shifted.op == il::ExprOp::Sub) &&
+            sameValue(function, shifted.operands[0], knownArm) &&
+            function.asConstant(shifted.operands[1], literal)) {
+          std::vector<uint64_t> out = knownValues;
+          for (const uint64_t value : knownValues) {
+            const uint64_t shiftedValue =
+                shifted.op == il::ExprOp::Add ? value + literal : value - literal;
+            insertUnique(out, zeroExtend(shiftedValue, width));
+          }
+          return out.size() > kSetCap ? std::nullopt : std::optional<std::vector<uint64_t>>{out};
+        }
       }
-      return out.size() > kSetCap ? std::nullopt : std::optional<std::vector<uint64_t>>{out};
+      return std::nullopt;
     }
     default:
       // Every op this switch does not otherwise know how to read still

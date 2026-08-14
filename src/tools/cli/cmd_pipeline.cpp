@@ -358,6 +358,8 @@ int commandDecompile(std::string_view path, uint64_t address,
   toCOptions.emit.symbols = session->symbols();
   toCOptions.emit.addresses = session->addresses();
   toCOptions.emit.imageReader = session->reader();
+  toCOptions.emit.entryRegs =
+      session->entryRegFacts().empty() ? nullptr : &session->entryRegFacts();
   toCOptions.emit.helpersHeader = helpersHeader;
   toCOptions.emit.indexedArgumentNames = indexedArgumentNames;
   toCOptions.emit.securityHintsAsComments = securityHintsAsComments;

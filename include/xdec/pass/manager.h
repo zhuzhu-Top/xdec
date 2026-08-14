@@ -84,6 +84,12 @@ class Manager {
   }
   void setSyscallTable(const types::SyscallTable* table) noexcept { syscalls_ = table; }
 
+  /// See Context::setEntryRegFacts. Must outlive the pipeline, same as
+  /// types/syscalls above.
+  void setEntryRegFacts(const analysis::EntryRegFacts* facts) noexcept {
+    entryRegs_ = facts;
+  }
+
   /// The image's symbol table, as passes ask about it (see Context::setNames).
   void setNames(NameAt names) { names_ = std::move(names); }
 
@@ -122,6 +128,7 @@ class Manager {
   NameAt names_;
   bool seal_ = false;
   std::function<void(const Discovery&)> discoverySink_;
+  const analysis::EntryRegFacts* entryRegs_ = nullptr;
 };
 
 }  // namespace xdec::pass

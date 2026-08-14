@@ -181,6 +181,59 @@ TEST_CASE("directView is zero-copy only when fully file-backed", "[memory]") {
   CHECK(map.directView(0x8000, 0).empty());
 }
 
+TEST_CASE("memory map reads across backing parts", "[memory]") {
+  // A split dyld shared cache is why setBackingParts exists: two regions at
+  // adjacent virtual addresses can be backed by two entirely different
+  // physical files. Each part uses a distinct fill byte so a read that
+  // silently used the wrong part's bytes would be caught immediately.
+  const std::vector<std::byte> partA(0x100, std::byte{0xAA});
+  const std::vector<std::byte> partB(0x100, std::byte{0xBB});
+  MemoryMap map;
+  map.setBackingParts({partA, partB});
+
+  MemoryRegion regionA = region(0xC000, 0x40, 0x00, 0x40, MemoryPermissions::Read, "part-a");
+  regionA.backingIndex = 0;
+  MemoryRegion regionB = region(0xC040, 0x40, 0x00, 0x40, MemoryPermissions::Read, "part-b");
+  regionB.backingIndex = 1;
+  map.addRegion(regionA);
+  map.addRegion(regionB);
+  REQUIRE(map.finalize());
+
+  std::byte out[8] = {};
+  REQUIRE(map.read(0xC000, out));
+  for (const std::byte value : out) {
+    CHECK(std::to_integer<uint8_t>(value) == 0xAA);
+  }
+
+  // Reading across the boundary must switch which part's bytes it copies.
+  REQUIRE(map.read(0xC03C, out));
+  CHECK(std::to_integer<uint8_t>(out[0]) == 0xAA);
+  CHECK(std::to_integer<uint8_t>(out[3]) == 0xAA);
+  CHECK(std::to_integer<uint8_t>(out[4]) == 0xBB);
+  CHECK(std::to_integer<uint8_t>(out[7]) == 0xBB);
+
+  const auto viewA = map.directView(0xC000, 0x10);
+  REQUIRE(viewA.size() == 0x10);
+  CHECK(std::to_integer<uint8_t>(viewA[0]) == 0xAA);
+  const auto viewB = map.directView(0xC040, 0x10);
+  REQUIRE(viewB.size() == 0x10);
+  CHECK(std::to_integer<uint8_t>(viewB[0]) == 0xBB);
+}
+
+TEST_CASE("memory map rejects a region naming an unknown backing part", "[memory]") {
+  const std::vector<std::byte> backing = makeBacking(0x100);
+  MemoryMap map;
+  map.setBackingParts({backing});
+
+  MemoryRegion bad = region(0xD000, 0x10, 0x00, 0x10, MemoryPermissions::Read, "orphan");
+  bad.backingIndex = 5;  // no such part
+  map.addRegion(bad);
+
+  auto finalized = map.finalize();
+  REQUIRE_FALSE(finalized);
+  CHECK(finalized.error().code() == DiagCode::BadFormat);
+}
+
 TEST_CASE("memory map reports its bounds and sorts regions", "[memory]") {
   const std::vector<std::byte> backing = makeBacking(0x1000);
   MemoryMap map;

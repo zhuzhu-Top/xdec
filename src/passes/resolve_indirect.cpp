@@ -14,6 +14,7 @@
 #include "xdec/analysis/image_eval.h"
 #include "xdec/analysis/index_bound.h"
 #include "xdec/analysis/jump_table.h"
+#include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 #include "xdec/il/printer.h"
 #include "xdec/support/bits.h"
@@ -57,7 +58,7 @@ class ResolveIndirect final : public pass::FunctionPass {
 
     il::Function& function = context.function();
     image_ = image;
-    analysis::ImageEval eval(function, *image);
+    analysis::ImageEval eval(function, *image, context.entryRegFacts());
     // One tree for the whole pass, matching the edges as they stand now: this
     // pass does not rebuild them until it is done, so the snapshot stays
     // consistent with what every query below sees. Targets set during this run
@@ -309,12 +310,24 @@ class ResolveIndirect final : public pass::FunctionPass {
     if (set.isTop() || set.values().empty()) {
       return {};
     }
+    static constexpr binary::CachePointerDecoder kCachePointer;
     std::vector<uint64_t> out;
     for (const uint64_t va : set.values()) {
       // Zero for the same reason a table's null slot is not an entry: an
       // unrelocated pointer slot reads as zero, and zero is not code.
-      if (va != 0 && readable(va)) {
+      if (va == 0) {
+        continue;
+      }
+      if (readable(va)) {
         out.push_back(va);
+        continue;
+      }
+      // Same tagged-pointer fallback as the table path (entriesFor above):
+      // a value this evaluator read straight out of image bytes may be a
+      // shared-cache table entry that the table matcher itself did not
+      // recognise as a table.
+      if (const uint64_t decoded = kCachePointer.decode(va); decoded != va && readable(decoded)) {
+        out.push_back(decoded);
       }
     }
     return out;
@@ -334,9 +347,7 @@ class ResolveIndirect final : public pass::FunctionPass {
     };
   }
 
-  /// Path two: whole-table enumeration, for dispatchers whose index is not
-  /// statically knowable -- and, first, the narrower answer for dispatchers
-  /// whose index *is*: read only the entries it can actually select.
+  /// Path two: table enumeration only when the index is provably finite.
   ///
   /// A table's shape says every entry is a valid branch target; it says
   /// nothing about which entries this particular branch, with this
@@ -356,19 +367,13 @@ class ResolveIndirect final : public pass::FunctionPass {
   /// (analysis/index_bound.h's preciseIndexSet), and that is the second thing
   /// tried, for the same reason and to the same standard as the first.
   ///
-  /// How far to enumerate when neither narrows anything is the older
-  /// difficulty, and there are two answers. The good one is the guard that
-  /// bounds the index (analysis/index_bound.h): it states the length, so
-  /// every entry up to it is read and any entry that is then not code means
-  /// the table was misread and nothing is claimed.
-  ///
-  /// Without a guard, all that is left is to read until an entry stops looking
-  /// like a target, which does not find the end so much as stumble over
-  /// something -- so it is bounded, and running out means the attempt failed
-  /// rather than that the table is kMaxEntries long. Truncating instead was what
-  /// this pass used to do, and it cost this sample 1900 blocks of decoded data,
-  /// four hundred of them unreachable, one of which held an indirect branch that
-  /// could never resolve and so failed the whole decompilation.
+  /// When neither the value set nor the shape names a finite candidate set, the
+  /// only remaining precise answer is a guard that bounds the index
+  /// (analysis/index_bound.h): every index from zero through that bound is
+  /// read, and any entry that is then not code means the table was misread.
+  /// There is no third path that scans until bytes stop looking like targets --
+  /// that guesswork claimed hundreds of spurious edges (absd @0x100023688) and
+  /// tripped discovery caps without ever matching the branch's real arity.
   std::vector<uint64_t> tableCandidates(pass::Context& context, analysis::ImageEval& eval,
                                         const analysis::Dominators& dominators,
                                         il::BlockId blockId, il::ExprId target) {
@@ -424,9 +429,30 @@ class ResolveIndirect final : public pass::FunctionPass {
                          table->base, provenance, index, *proven);
           return {};
         }
-        const uint64_t va = entryTarget(image, *table, index);
+        uint64_t va = entryTarget(image, *table, index);
         if (!table->relative && va == 0) {
           continue;
+        }
+        // A computed target that does not read as code might still be a
+        // tagged shared-cache pointer rather than a misread table entry --
+        // see binary::CachePointerDecoder. Masking the fully-computed va
+        // (rather than just the raw entry) also covers an offset table whose
+        // *anchor* was itself read from a tagged slot: `tag|anchor + offset`
+        // masks down to `anchor + offset` exactly, since a table's offsets
+        // are bounded far below the tag's own low bit (kMaxOffsetSpan is
+        // 64 MiB; the tag starts above bit 34, comfortably clear of any
+        // carry). Only kept when the decoded address itself checks out; a
+        // table that was genuinely misread stays misread.
+        if (va != kNoTarget && !isCode(context, va)) {
+          static constexpr binary::CachePointerDecoder kCachePointer;
+          if (const uint64_t decoded = kCachePointer.decode(va); decoded != va && isCode(context, decoded)) {
+            XDEC_LOG_DEBUG(resolveLog(),
+                           "table at {:#x}: entry {} ({:#x}) is not code, but its low bits "
+                           "({:#x}) are -- treating it as a tagged shared-cache pointer "
+                           "(tag {:#x})",
+                           table->base, index, va, decoded, kCachePointer.tag(va));
+            va = decoded;
+          }
         }
         if (va == kNoTarget || !isCode(context, va)) {
           if (tolerateDeadCombinations) {
@@ -461,8 +487,15 @@ class ResolveIndirect final : public pass::FunctionPass {
       std::vector<uint64_t> preciseIndices(indexValues.values().begin(),
                                            indexValues.values().end());
       std::sort(preciseIndices.begin(), preciseIndices.end());
+      // Same tolerance as the shape path below: a phi/select may union a
+      // live small index with a stale EntryReg arm (absd @0x100023688 is the
+      // case -- w22 is recomputed at 0x1000235d4 on the taken path but another
+      // predecessor still reads EntryReg). Dropping indices whose slots do not
+      // read as code keeps {0, 2} from ever claiming 1; it also keeps a huge
+      // dead EntryReg index from aborting the whole set when a small live one
+      // is in the same union.
       if (std::vector<uint64_t> out =
-              entriesFor(preciseIndices, "the index's value set", /*tolerateDeadCombinations=*/false);
+              entriesFor(preciseIndices, "the index's value set", /*tolerateDeadCombinations=*/true);
           !out.empty()) {
         return out;
       }
@@ -482,55 +515,21 @@ class ResolveIndirect final : public pass::FunctionPass {
       }
     }
 
-    const uint64_t limit =
-        proven.has_value() ? *proven + 1 : uint64_t{kMaxEntries};
-
-    std::vector<uint64_t> out;
-    for (uint64_t index = 0; index <= limit; ++index) {
-      if (index == limit) {
-        if (proven.has_value()) {
-          XDEC_LOG_DEBUG(resolveLog(),
-                         "table at {:#x}: {} entries, from the guard bounding its index",
-                         table->base, limit);
-          break;
-        }
-        XDEC_LOG_DEBUG(resolveLog(),
-                       "table at {:#x} (stride {}, {}-bit entries) has no end within "
-                       "{} entries and nothing bounds its index; enumerating it is "
-                       "guesswork, so nothing is claimed",
-                       table->base, table->stride, table->entryBits, kMaxEntries);
-        return {};
-      }
-      // A rejected entry means two different things. Where the length was proved,
-      // every index below it is an entry, so one that does not read as a target
-      // says the table was misread — wrong stride, wrong entry width, wrong base
-      // — and the honest response is to claim none of it. Where the length was
-      // not proved, a rejected entry is the only end marker there is.
-      const uint64_t va = entryTarget(image, *table, index);
-      // A null slot in a pointer table is an index nothing dispatches on, and
-      // it is neither a target nor an end. Not a target because address zero is
-      // not code -- a shared object's first segment can start at vaddr 0 and be
-      // mapped executable, so the plausibility test below waves it through and
-      // the CFG grows an edge to the ELF header. Not an end because a slot the
-      // linker never filled says nothing about where the table stops; treating
-      // it as the end is what makes an unbounded scan claim the prefix in front
-      // of it, which is the guesswork this path refuses to do everywhere else.
-      if (!table->relative && va == 0) {
-        continue;
-      }
-      if (va == kNoTarget || !isCode(context, va)) {
-        if (proven.has_value()) {
-          XDEC_LOG_DEBUG(resolveLog(),
-                         "table at {:#x}: entry {} of a proven {} is not code, so the "
-                         "table is being read wrong; nothing is claimed",
-                         table->base, index, limit);
-          return {};
-        }
-        break;
-      }
-      out.push_back(va);
+    if (!proven.has_value()) {
+      XDEC_LOG_DEBUG(resolveLog(),
+                     "table at {:#x}: index {} is not guard-bounded and neither the value "
+                     "set nor the index's shape named any target; nothing is claimed",
+                     table->base, il::printExpr(function, table->index));
+      return {};
     }
-    return out;
+
+    std::vector<uint64_t> guardedIndices;
+    guardedIndices.reserve(*proven + 1);
+    for (uint64_t index = 0; index <= *proven; ++index) {
+      guardedIndices.push_back(index);
+    }
+    return entriesFor(guardedIndices, "the guard bounding its index",
+                      /*tolerateDeadCombinations=*/false);
   }
 
   /// Where entry `index` points, or kNoTarget when it cannot be an entry: the
@@ -592,11 +591,6 @@ class ResolveIndirect final : public pass::FunctionPass {
 
   /// Not a valid target under any reading: no instruction is at an odd address.
   static constexpr uint64_t kNoTarget = 1;
-
-  /// How far an unbounded enumeration will read before giving up. Only reached
-  /// when no guard bounds the index; a proven length is honoured whatever it is,
-  /// and the samples here have one of 1351.
-  static constexpr uint32_t kMaxEntries = 512;
   /// Pc-relative tables keep their targets close to the anchor.
   static constexpr uint64_t kMaxOffsetSpan = 64ull << 20;
 };

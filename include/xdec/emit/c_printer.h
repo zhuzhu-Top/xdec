@@ -25,6 +25,7 @@
 #include <functional>
 #include <string>
 
+#include "xdec/analysis/entry_reg.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/emit/structure.h"
@@ -173,6 +174,12 @@ struct COptions {
   /// a Variable. Absent leaves a call result declared at its measured width,
   /// same as before this analysis existed.
   const analysis::TypedVariables* typedVariables = nullptr;
+  /// What the platform says a leaked entry register holds (see
+  /// analysis/entry_reg.h). Absent prints every `EntryReg` leaf as the
+  /// `extern` it always was; a register this resolves prints as a `#define`
+  /// instead, with the resolved value in a comment (see CContext's own
+  /// preamble assembly) -- see docs/21-entry-reg-platform.md.
+  const analysis::EntryRegFacts* entryRegs = nullptr;
   /// The `#include` path the preamble names for the portable semantics
   /// helpers (rotate, byte swap, population count, the overflow-exact
   /// condition codes -- see xdec_helpers.h) when the body used any of them.

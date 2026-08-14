@@ -2,6 +2,7 @@
 // by a fake image.
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <map>
 
 #include "il/il_test_support.h"
@@ -128,6 +129,118 @@ TEST_CASE("arithmetic over small sets cross-products within the cap",
       eval.eval(f.function.binary(ExprOp::Add, oneTwo, tenTwenty));
   REQUIRE(!set.isTop());
   CHECK(set.values().size() == 4);
+}
+
+TEST_CASE("an EntryReg leaf resolves once EntryRegFacts binds it, and stays top otherwise",
+          "[analysis][image-eval]") {
+  // Named "x1"/"x2" rather than the real dyld-leaked "x22"/"x28" because the
+  // fixture's register file (see il_test_support.h) only models x0..x7 --
+  // EntryRegFacts binds by name, so which x-number is used here is
+  // otherwise arbitrary.
+  Fixture f;
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromBase("dyld", 0x68310));
+  ImageEval eval(f.function, f.image.reader(), &facts);
+
+  // x1 has no binding at all: still top, exactly as with no facts supplied.
+  CHECK(eval.eval(f.function.entryReg(f.function.registers().find("x1"))).isTop());
+
+  // x2 is bound, but its companion's base was never given: still top.
+  const ExprId x2 = f.function.entryReg(f.function.registers().find("x2"));
+  CHECK(eval.eval(x2).isTop());
+}
+
+TEST_CASE("an EntryReg leaf resolves to a singleton once its companion base is known",
+          "[analysis][image-eval]") {
+  Fixture f;
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromBase("dyld", 0x68310));
+  facts.setCompanionBase("dyld", 0x104fe0000);
+  ImageEval eval(f.function, f.image.reader(), &facts);
+
+  const ExprId x2 = f.function.entryReg(f.function.registers().find("x2"));
+  const ValueSet set = eval.eval(x2);
+  REQUIRE(!set.isTop());
+  REQUIRE(set.values().size() == 1);
+  CHECK(set.values()[0] == 0x104fe0000 + 0x68310);
+}
+
+TEST_CASE("a select next to a bare EntryReg arm keeps only the computed one",
+          "[analysis][image-eval]") {
+  // The absd shape this exists for: one predecessor of a merge point never
+  // touched the platform-leaked register at all (so it is still the raw
+  // leak there), another predecessor assigned it something real. A select
+  // over an unknown condition would ordinarily union both arms -- but a bare
+  // EntryReg arm next to a computed one is not "the index is one of these
+  // two very different things", it is the untouched predecessor
+  // contributing nothing.
+  Fixture f;
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromLiteral(0x104fe0310));
+  ImageEval eval(f.function, f.image.reader(), &facts);
+
+  const ExprId entryX2 = f.function.entryReg(f.function.registers().find("x2"));
+  const ExprId computed = f.function.select(
+      f.function.binary(ExprOp::CmpEq, f.function.undefined(Type::integer(64)), f.i64(0)),
+      f.i64(3), f.i64(7));
+  const ExprId condition =
+      f.function.binary(ExprOp::CmpEq, f.function.undefined(Type::integer(64)), f.i64(1));
+  const ExprId merged = f.function.select(condition, entryX2, computed);
+
+  const ValueSet set = eval.eval(merged);
+  REQUIRE(!set.isTop());
+  REQUIRE(set.values().size() == 2);
+  CHECK(std::find(set.values().begin(), set.values().end(), 3) != set.values().end());
+  CHECK(std::find(set.values().begin(), set.values().end(), 7) != set.values().end());
+  CHECK(std::find(set.values().begin(), set.values().end(), 0x104fe0310) == set.values().end());
+}
+
+TEST_CASE("a select over two bare EntryReg arms is an ordinary merge, not a stale one",
+          "[analysis][image-eval]") {
+  // Both arms untouched: nothing to prefer, so both are kept -- this is not
+  // the shape unionEntryRegAware exists to filter.
+  Fixture f;
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromLiteral(0x11));
+  facts.setBinding("x3", xdec::analysis::EntryRegBinding::fromLiteral(0x22));
+  ImageEval eval(f.function, f.image.reader(), &facts);
+
+  const ExprId entryX2 = f.function.entryReg(f.function.registers().find("x2"));
+  const ExprId entryX3 = f.function.entryReg(f.function.registers().find("x3"));
+  const ExprId condition =
+      f.function.binary(ExprOp::CmpEq, f.function.undefined(Type::integer(64)), f.i64(1));
+  const ExprId merged = f.function.select(condition, entryX2, entryX3);
+
+  const ValueSet set = eval.eval(merged);
+  REQUIRE(!set.isTop());
+  REQUIRE(set.values().size() == 2);
+  CHECK(std::find(set.values().begin(), set.values().end(), 0x11) != set.values().end());
+  CHECK(std::find(set.values().begin(), set.values().end(), 0x22) != set.values().end());
+}
+
+TEST_CASE("a phi mixing a bare EntryReg input with a defined one keeps only the defined one",
+          "[analysis][image-eval]") {
+  Fixture f;
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromLiteral(0x104fe0310));
+  ImageEval eval(f.function, f.image.reader(), &facts);
+
+  const BlockId a = f.block(0x1000);
+  const BlockId b = f.block(0x1010);
+  const BlockId merge = f.block(0x1020);
+  f.function.appendBranch(a, 0x1000, merge);
+  f.function.appendBranch(b, 0x1010, merge);
+  f.function.rebuildEdges();
+
+  const il::ValueId phi = f.function.prependPhi(merge, 0x1020, Type::integer(64));
+  const ExprId entryX2 = f.function.entryReg(f.function.registers().find("x2"));
+  const std::vector<il::ExprId> inputs{entryX2, f.i64(0x42)};
+  f.function.setOperands(f.function.value(phi).definition, inputs);
+
+  const ValueSet set = eval.eval(f.function.valueRef(phi));
+  REQUIRE(!set.isTop());
+  REQUIRE(set.values().size() == 1);
+  CHECK(set.values()[0] == 0x42);
 }
 
 TEST_CASE("a phi unions its inputs, and a phi loop concedes gracefully",

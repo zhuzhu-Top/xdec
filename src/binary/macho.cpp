@@ -149,6 +149,7 @@ class MachOLoader {
     parseSymbols();
     applyDyldInfo();
     resolveRebases();
+    applyChainedFixups();
     return finish();
   }
 
@@ -215,10 +216,7 @@ class MachOLoader {
           parseLoadDylib(offset);
           break;
         case kLcDyldChainedFixups:
-          XDEC_LOG_WARN(logBinary(),
-                        "'{}' uses LC_DYLD_CHAINED_FIXUPS, which is not decoded yet; bound "
-                        "pointer slots stay unrelocated",
-                        path_);
+          parseChainedFixupsCommand(offset);
           break;
         default:
           break;
@@ -309,6 +307,16 @@ class MachOLoader {
       return;
     }
     haveEntryPoint_ = true;
+  }
+
+  void parseChainedFixupsCommand(uint64_t base) {
+    chainedFixupsDataOff_ = static_cast<uint32_t>(reader_.u32(base + kLinkeditDataOff));
+    chainedFixupsDataSize_ = static_cast<uint32_t>(reader_.u32(base + kLinkeditDataSize));
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      return;
+    }
+    haveChainedFixups_ = true;
   }
 
   void parseLoadDylib(uint64_t base) {
@@ -654,6 +662,212 @@ class MachOLoader {
     }
   }
 
+  // -- dyld chained fixups (LC_DYLD_CHAINED_FIXUPS) --------------------------
+
+  /// Walks every page of every fixed-up segment, turning each chain entry's
+  /// packed word into a `Relocation` the same way the classic opcode streams
+  /// above do -- a decoded rebase gets a concrete value overlaid onto reads
+  /// (see BinaryImage::read), a bind is left symbolic, named from the
+  /// imports table. Absent entirely on a binary old enough to use
+  /// LC_DYLD_INFO instead; both schemes are never present together.
+  void applyChainedFixups() {
+    if (!haveChainedFixups_) {
+      return;
+    }
+    const std::span<const std::byte> bytes = file_.bytes();
+    if (uint64_t{chainedFixupsDataOff_} + chainedFixupsDataSize_ > bytes.size() ||
+        chainedFixupsDataSize_ < kChainedFixupsHeaderSize) {
+      XDEC_LOG_WARN(logBinary(), "'{}': LC_DYLD_CHAINED_FIXUPS data is truncated", path_);
+      return;
+    }
+    const uint64_t header = chainedFixupsDataOff_;
+    const auto startsOffset = static_cast<uint32_t>(reader_.u32(header + kChainedFixupsStartsOffset));
+    const auto importsOffset = static_cast<uint32_t>(reader_.u32(header + kChainedFixupsImportsOffset));
+    const auto symbolsOffset = static_cast<uint32_t>(reader_.u32(header + kChainedFixupsSymbolsOffset));
+    const auto importsCount = static_cast<uint32_t>(reader_.u32(header + kChainedFixupsImportsCount));
+    const auto importsFormat = static_cast<uint32_t>(reader_.u32(header + kChainedFixupsImportsFormat));
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      XDEC_LOG_WARN(logBinary(), "'{}': malformed dyld_chained_fixups_header", path_);
+      return;
+    }
+    if (importsCount != 0 && importsFormat != kChainedImportFormatNormal) {
+      // Formats 2/3 add a separate addend field ahead of the same 4-byte
+      // header word; not implemented, so a bind here still gets a
+      // Relocation (the slot is still known to be a bind, not a rebase) but
+      // without a name attached.
+      XDEC_LOG_WARN(logBinary(),
+                    "'{}': chained imports format {} is not decoded; bound symbols in this "
+                    "image stay unnamed",
+                    path_, importsFormat);
+    }
+    imports_ = {header, importsOffset, symbolsOffset, importsCount, importsFormat};
+
+    const uint64_t startsBase = header + startsOffset;
+    const auto segCount = static_cast<uint32_t>(reader_.u32(startsBase + kChainedStartsSegCount));
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      return;
+    }
+    for (uint32_t segmentIndex = 0; segmentIndex < segCount; ++segmentIndex) {
+      const auto segInfoOffset = static_cast<uint32_t>(reader_.u32(
+          startsBase + kChainedStartsSegInfoOffset + uint64_t{segmentIndex} * 4));
+      if (reader_.failed()) {
+        reader_.clearFailure();
+        return;
+      }
+      // 0 means dyld_chained_starts_in_image itself has nothing to say about
+      // this segment -- most commonly __TEXT, __LINKEDIT, and __PAGEZERO,
+      // none of which carry pointers dyld binds.
+      if (segInfoOffset == 0 || segmentIndex >= segments_.size()) {
+        continue;
+      }
+      walkSegmentChains(segments_[segmentIndex], startsBase + segInfoOffset);
+    }
+  }
+
+  void walkSegmentChains(const Segment& segment, uint64_t segInfoBase) {
+    const auto pageSize = static_cast<uint16_t>(reader_.u16(segInfoBase + kChainedSegPageSize));
+    const auto pointerFormat =
+        static_cast<uint16_t>(reader_.u16(segInfoBase + kChainedSegPointerFormat));
+    const uint64_t segmentOffset = reader_.u64(segInfoBase + kChainedSegSegmentOffset);
+    const auto pageCount = static_cast<uint16_t>(reader_.u16(segInfoBase + kChainedSegPageCount));
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      return;
+    }
+    if (pointerFormat != kChainedPtr64 && pointerFormat != kChainedPtr64Offset) {
+      // arm64e's pointer-authentication formats (1/9/12 and their auth
+      // variants) are the main thing left out here: this project's one
+      // chained-fixups fixture (dyld, x86_64/arm64 desktop-style pointers)
+      // never exercises them, and guessing at bitfield widths with nothing
+      // to check the guess against would be worse than leaving the slots
+      // unrelocated with a name for what was skipped.
+      XDEC_LOG_WARN(logBinary(),
+                    "'{}': chained fixup pointer format {} is not decoded; segment '{}''s "
+                    "bound pointer slots stay unrelocated",
+                    path_, pointerFormat, segment.name);
+      return;
+    }
+    const uint64_t imageBase = segments_.empty() ? 0 : segments_.front().vmaddr;
+    for (uint16_t page = 0; page < pageCount; ++page) {
+      auto pageStart = static_cast<uint16_t>(
+          reader_.u16(segInfoBase + kChainedSegPageStart + uint64_t{page} * 2));
+      if (reader_.failed()) {
+        reader_.clearFailure();
+        return;
+      }
+      if (pageStart == kChainedPtrStartNone) {
+        continue;
+      }
+      if ((pageStart & kChainedPtrStartMulti) != 0) {
+        // A page dense enough to need more than one chain start carries an
+        // overflow index here instead, into a second table this loader does
+        // not walk; naming it beats silently treating the index as an
+        // in-page offset and decoding the wrong bytes.
+        XDEC_LOG_WARN(logBinary(),
+                      "'{}': page {} of segment '{}' has more than one fixup chain, which is "
+                      "not decoded; its bound pointer slots stay unrelocated",
+                      path_, page, segment.name);
+        continue;
+      }
+      walkChain(segment, segmentOffset + uint64_t{page} * pageSize, pageStart, pointerFormat,
+               imageBase);
+    }
+  }
+
+  /// One page's chain, from its first slot to the `next == 0` terminator.
+  /// `pageBase` is the segment-relative byte offset of the page; `pageStart`
+  /// is the in-page byte offset of the first slot, straight from
+  /// dyld_chained_starts_in_segment::page_start.
+  void walkChain(const Segment& segment, uint64_t pageBase, uint16_t pageStart,
+                uint16_t pointerFormat, uint64_t imageBase) {
+    uint64_t offsetInPage = pageStart;
+    // 4-byte stride for both formats this loader decodes (arm64e's is 8);
+    // see DYLD_CHAINED_PTR_64/64_OFFSET in dyld's fixup-chains.h.
+    constexpr uint64_t kStride = 4;
+    while (true) {
+      const uint64_t fileOffset = segment.fileoff + pageBase + offsetInPage;
+      if (fileOffset + 8 > file_.bytes().size()) {
+        XDEC_LOG_WARN(logBinary(), "'{}': fixup chain in segment '{}' runs past end of file",
+                      path_, segment.name);
+        return;
+      }
+      const uint64_t word = reader_.u64(fileOffset);
+      if (reader_.failed()) {
+        reader_.clearFailure();
+        return;
+      }
+      const uint64_t va = segment.vmaddr + pageBase + offsetInPage;
+      const uint64_t next = (word >> 51) & 0xfffu;
+      if ((word & (uint64_t{1} << 63)) != 0) {
+        emitChainedBind(va, word);
+      } else {
+        emitChainedRebase(va, word, pointerFormat, imageBase);
+      }
+      if (next == 0) {
+        return;
+      }
+      offsetInPage += next * kStride;
+    }
+  }
+
+  void emitChainedRebase(uint64_t va, uint64_t word, uint16_t pointerFormat, uint64_t imageBase) {
+    // Shared by both formats this loader decodes: target:36, high8:8,
+    // reserved:7, next:12, bind:1 (already known to be 0 here).
+    const uint64_t target = word & 0xfffffffffull;         // 36 bits
+    const uint64_t high8 = (word >> 36) & 0xffull;          // 8 bits
+    const uint64_t value =
+        (pointerFormat == kChainedPtr64Offset ? imageBase + target : target) | (high8 << 56);
+    Relocation relocation;
+    relocation.va = va;
+    relocation.kind = RelocKind::Relative;
+    relocation.width = kPointerSize;
+    relocation.value = value;
+    relocation.hasValue = true;
+    relocations_.push_back(relocation);
+  }
+
+  void emitChainedBind(uint64_t va, uint64_t word) {
+    // Shared by both formats this loader decodes: ordinal:24, addend:8,
+    // reserved:19, next:12, bind:1 (already known to be 1 here).
+    const auto ordinal = static_cast<uint32_t>(word & 0xffffffu);   // 24 bits
+    const auto addend = static_cast<int64_t>((word >> 24) & 0xffu);  // 8 bits, unsigned per spec
+    const std::string name = resolveChainedImportName(ordinal);
+    if (name.empty()) {
+      return;  // Ordinal out of range or the import table could not be read.
+    }
+    Relocation relocation;
+    relocation.va = va;
+    relocation.kind = RelocKind::GotSlot;
+    relocation.width = kPointerSize;
+    relocation.addend = addend;
+    relocation.symbolIndex = importSymbolIndex(name);
+    relocations_.push_back(relocation);
+  }
+
+  /// `dyld_chained_import` (format 1) only -- see the warning in
+  /// applyChainedFixups for the addend-carrying formats 2/3.
+  std::string resolveChainedImportName(uint32_t ordinal) {
+    if (imports_.format != kChainedImportFormatNormal || ordinal >= imports_.count) {
+      return {};
+    }
+    const uint64_t entry = imports_.importsOffset + uint64_t{ordinal} * 4;
+    const auto word = static_cast<uint32_t>(reader_.u32(imports_.header + entry));
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      return {};
+    }
+    const uint32_t nameOffset = (word >> kChainedImportNameOffsetShift) & kChainedImportNameOffsetMask;
+    const std::string_view name =
+        reader_.cstring(imports_.header + imports_.symbolsOffset + nameOffset);
+    if (reader_.failed()) {
+      reader_.clearFailure();
+      return {};
+    }
+    return std::string{name};
+  }
+
   // -- assembly -------------------------------------------------------------
 
   Result<std::unique_ptr<BinaryImage>> finish() {
@@ -691,7 +905,7 @@ class MachOLoader {
     }
 
     contents.memory = std::move(memory_);
-    contents.file = std::move(file_);
+    contents.store.addPart(path_, std::move(file_));
     return std::make_unique<BinaryImage>(std::move(contents));
   }
 
@@ -718,6 +932,21 @@ class MachOLoader {
   uint32_t bindSize_ = 0;
   uint32_t lazyBindOffset_ = 0;
   uint32_t lazyBindSize_ = 0;
+
+  uint32_t chainedFixupsDataOff_ = 0;
+  uint32_t chainedFixupsDataSize_ = 0;
+  bool haveChainedFixups_ = false;
+
+  /// Where to look up a chained bind's imported symbol name, resolved once
+  /// per file rather than threaded through every walkChain call.
+  struct ChainedImportsTable {
+    uint64_t header = 0;         // dyld_chained_fixups_header's own file offset
+    uint32_t importsOffset = 0;  // relative to `header`
+    uint32_t symbolsOffset = 0;  // relative to `header`
+    uint32_t count = 0;
+    uint32_t format = 0;
+  };
+  ChainedImportsTable imports_;
 
   // Rebase opcode interpreter state.
   uint32_t rebaseSegment_ = 0;

@@ -35,6 +35,7 @@ void configure(pass::Manager& manager, const ByteReader& reader,
   manager.setTypeDatabase(options.types);
   manager.setSyscallTable(options.syscalls);
   manager.setNames(options.names);
+  manager.setEntryRegFacts(options.entryRegs);
   // Inert below Resolved, which is as far as every round but the last goes, so
   // it belongs here with the rest rather than only on the finishing Manager.
   manager.setSealUnresolvedBranches(options.sealUnresolvedBranches);
@@ -162,6 +163,7 @@ struct Probe {
     // once discovery is over, and doing it here would destroy the branches the
     // remaining rounds exist to resolve.
     context.setMemoryFacts(options.memory);
+    context.setEntryRegFacts(options.entryRegs);
     context.setDiscoverySink([this, &options](const pass::Discovery& found) {
       if (options.maxDiscoveryPerBranch != 0 &&
           found.missing.size() > options.maxDiscoveryPerBranch) {
@@ -184,6 +186,13 @@ struct Probe {
   }
 };
 
+/// The wall behind the intra-round settle loop (see its call site): however
+/// deep a single round's own discoveries chain into each other, a round
+/// only ever gets this many extra lift-and-probe passes before it yields to
+/// the outer round accounting, the same "structural argument deserves a hard
+/// backstop anyway" reasoning kRoundCeiling exists for.
+constexpr unsigned kSettleCeiling = 16;
+
 }  // namespace
 
 Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader& reader,
@@ -198,91 +207,18 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
   // What the rounds proved about the branches leading to them.
   Resolutions resolved;
 
-  // The one run whose result is returned: the whole pipeline, observed so dumps
-  // land, over a fresh lift of every entry with every proved edge already in
-  // place. Both ways out of the loop end here, so a run cut short by the cap
-  // still yields the function the rounds did manage to uncover.
-  auto finish = [&]() -> Result<DriverResult> {
-    auto whole = spec::liftFunction(engine, reader, entry, options.memory);
-    if (!whole) {
-      return std::move(whole).takeUnexpected();
-    }
-    if (entries.size() > 1) {
-      const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*whole->function, engine, reader, extra, options.memory);
-      if (!more) {
-        return std::move(more).takeUnexpected();
-      }
-    }
-    pass::Manager manager(options.observer);
-    configure(manager, reader, options);
-    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, il::Maturity::Cfg));
-    applyResolutions(*whole->function, resolved);
-    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, options.target));
-    // The second half of the jump-table candidate defence (see
-    // analysis/reachability.h): every block the candidate filtering and the
-    // discovery loop above actually needed should be reachable from the
-    // entry by now. One that is not was lifted for nothing -- silently
-    // harmless, since nothing downstream emits it, but worth surfacing rather
-    // than leaving to be noticed as an unexplained unused local.
-    const std::unordered_set<il::BlockId> reachable =
-        analysis::reachableBlocks(*whole->function);
-    if (reachable.size() < whole->function->blockCount()) {
-      report.unreachableBlocks = whole->function->blockCount() - reachable.size();
-      XDEC_LOG_WARN(driverLog(),
-                    "{} block(s) in the lifted function have no path from entry; nothing "
-                    "emits them, but a resolve or discovery step claimed one that turns "
-                    "out not to be reachable",
-                    report.unreachableBlocks);
-    }
-    return DriverResult{std::move(whole->function), std::move(report)};
-  };
-
-  // Grows a round at a time while rounds keep proving something; see
-  // DriverOptions::extendWhileProving.
-  unsigned budget = std::min(options.maxRounds, DriverOptions::kRoundCeiling);
-
-  for (unsigned round = 0; round < budget; ++round) {
-    // Fresh and consistent: the whole function at Lifted, every round.
-    auto lifted = spec::liftFunction(engine, reader, entry, options.memory);
-    if (!lifted) {
-      return std::move(lifted).takeUnexpected();
-    }
-    if (entries.size() > 1) {
-      const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
-      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra, options.memory);
-      if (!more) {
-        return std::move(more).takeUnexpected();
-      }
-    }
-    ++report.rounds;
-
-    // Targets at or below Ssa need no discovery loop: run once, observed.
-    if (options.target <= il::Maturity::Ssa) {
-      pass::Manager manager(options.observer);
-      configure(manager, reader, options);
-      XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, options.target));
-      return DriverResult{std::move(lifted->function), std::move(report)};
-    }
-
-    {
-      pass::Manager manager;  // intermediate rounds run unobserved
-      configure(manager, reader, options);
-      // Stop at Cfg to put last round's edges back before SSA is built over
-      // them; see the header for why doing it after would be too late.
-      XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, il::Maturity::Cfg));
-      applyResolutions(*lifted->function, resolved);
-      XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, il::Maturity::Ssa));
-    }
-
-    Probe probe;
-    XDEC_TRY_VOID(probe.run(*lifted->function, reader, options));
-
-    const std::size_t liftedFrom = entries.size();  // before this round's finds
+  // Admits a probe's discoveries into `entries`/`known` (fence and
+  // total-entry cap applied exactly as a single-pass round always has),
+  // logging the same shape-of-discovery warnings a round has always logged.
+  // Factored out because the intra-round settle loop below calls this once
+  // per internal pass, not just once per round: a chain of discoveries a
+  // round finds inside itself is admitted the same way regardless of which
+  // pass within the round found it.
+  const auto admitDiscoveries = [&](const std::set<uint64_t>& discoveries) -> std::size_t {
     std::size_t foundNew = 0;
     std::size_t outsideFence = 0;
     std::size_t capped = 0;
-    for (const uint64_t va : probe.discoveries) {
+    for (const uint64_t va : discoveries) {
       if (options.fence.active() && !options.fence.contains(va)) {
         ++outsideFence;
         // Advisory unless the caller asked otherwise (see FunctionFence), and
@@ -357,32 +293,191 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
                     "and likely means the fence itself is wrong for this function",
                     report.rounds, outsideFence, options.fence.start, options.fence.end);
     }
-    if (probe.declined > 0) {
-      XDEC_LOG_INFO(driverLog(),
-                    "round {} left {} branch(es) unresolved whose candidate sets were "
-                    "wider than the {}-per-branch discovery cap",
-                    report.rounds, probe.declined, options.maxDiscoveryPerBranch);
+    return foundNew;
+  };
+
+  // Whether some resolved branch's own target address is stuck: fully known
+  // (admitted, not merely awaiting a fence or cap decision) yet still not a
+  // real block in the freshly lifted function -- unmapped memory, usually.
+  // Distinct from "not yet lifted": the settle loop above already lifts
+  // everything admission accepts, so if a known target still has no block
+  // here, no further pass or round will change that, and a round declaring
+  // convergence at this point would be reporting a fixpoint that quietly
+  // leaves this branch's edge out of it.
+  const auto hasStuckResolution = [&](const il::Function& function) -> bool {
+    for (const auto& [branch, targets] : resolved) {
+      for (const uint64_t target : targets) {
+        if (known.contains(target) && !function.blockAt(target).valid()) {
+          return true;
+        }
+      }
     }
-    // Resolving a branch is progress even when it revealed no new address: the
-    // edge it adds is what lets the next round's SSA reach one level further in,
-    // and stopping here would leave that level unanalysed. Measured per edge,
-    // not per branch, because a dispatcher's target set widens a few entries at
-    // a time across rounds while the count of branches holding one stands still.
-    const Resolutions found = harvest(*lifted->function);
-    std::size_t foundEdges = absorb(resolved, found);
-    // Edges of branches that could not resolve only because their targets had
-    // no blocks yet. Carrying them is what makes a chain of them cost one round
-    // per level instead of two: the round that lifts the block also gets its
-    // incoming edge, so SSA sees a reachable block and the branch *it* ends
-    // with resolves in that same round (see the header).
-    foundEdges += absorb(resolved, probe.pending);
-    XDEC_LOG_INFO(driverLog(),
-                  "round {}: {} block(s) from {} entr(ies), {} branch(es) resolved, {} "
-                  "new address(es), {} new edge(s)",
-                  report.rounds, lifted->function->blockCount(), liftedFrom, found.size(),
-                  foundNew, foundEdges);
+    return false;
+  };
+
+  // Fresh-lifts the whole function from `entry` plus every entry known so
+  // far -- the same "one consistent maturity, never a quilt" lift every
+  // round already did, now also reused mid-round by the settle loop to bring
+  // a pass's own just-admitted discoveries in as real blocks.
+  const auto liftKnown = [&]() -> Result<spec::LiftedFunction> {
+    auto lifted = spec::liftFunction(engine, reader, entry, options.memory);
+    if (!lifted) {
+      return std::move(lifted).takeUnexpected();
+    }
+    if (entries.size() > 1) {
+      const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
+      auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra, options.memory);
+      if (!more) {
+        return std::move(more).takeUnexpected();
+      }
+    }
+    return lifted;
+  };
+
+  // The one run whose result is returned: the whole pipeline, observed so dumps
+  // land, over a fresh lift of every entry with every proved edge already in
+  // place. Both ways out of the loop end here, so a run cut short by the cap
+  // still yields the function the rounds did manage to uncover.
+  auto finish = [&]() -> Result<DriverResult> {
+    auto whole = spec::liftFunction(engine, reader, entry, options.memory);
+    if (!whole) {
+      return std::move(whole).takeUnexpected();
+    }
+    if (entries.size() > 1) {
+      const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
+      auto more = spec::liftBlocksInto(*whole->function, engine, reader, extra, options.memory);
+      if (!more) {
+        return std::move(more).takeUnexpected();
+      }
+    }
+    pass::Manager manager(options.observer);
+    configure(manager, reader, options);
+    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, il::Maturity::Cfg));
+    applyResolutions(*whole->function, resolved);
+    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, options.target));
+    // The second half of the jump-table candidate defence (see
+    // analysis/reachability.h): every block the candidate filtering and the
+    // discovery loop above actually needed should be reachable from the
+    // entry by now. One that is not was lifted for nothing -- silently
+    // harmless, since nothing downstream emits it, but worth surfacing rather
+    // than leaving to be noticed as an unexplained unused local.
+    const std::unordered_set<il::BlockId> reachable =
+        analysis::reachableBlocks(*whole->function);
+    if (reachable.size() < whole->function->blockCount()) {
+      report.unreachableBlocks = whole->function->blockCount() - reachable.size();
+      XDEC_LOG_WARN(driverLog(),
+                    "{} block(s) in the lifted function have no path from entry; nothing "
+                    "emits them, but a resolve or discovery step claimed one that turns "
+                    "out not to be reachable",
+                    report.unreachableBlocks);
+    }
+    return DriverResult{std::move(whole->function), std::move(report)};
+  };
+
+  // Grows a round at a time while rounds keep proving something; see
+  // DriverOptions::extendWhileProving.
+  unsigned budget = std::min(options.maxRounds, DriverOptions::kRoundCeiling);
+
+  for (unsigned round = 0; round < budget; ++round) {
+    // Fresh and consistent: the whole function at Lifted, every round.
+    auto lifted = liftKnown();
+    if (!lifted) {
+      return std::move(lifted).takeUnexpected();
+    }
+    ++report.rounds;
+
+    // Targets at or below Ssa need no discovery loop: run once, observed.
+    if (options.target <= il::Maturity::Ssa) {
+      pass::Manager manager(options.observer);
+      configure(manager, reader, options);
+      XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, options.target));
+      return DriverResult{std::move(lifted->function), std::move(report)};
+    }
+
+    // A round settles to its own fixed point before the outer loop asks
+    // whether *it* found anything. Resolve-indirect shaping a branch's full
+    // candidate set is not the same as those candidates being blocks: the
+    // first one is a pass; the second needs a re-lift. Without this, a chain
+    // of discoveries nested inside a single round -- one target's own
+    // indirect branch only shapeable once *it* has a block -- cost one
+    // *round* of the outer budget per link, which is what left absd's 9a4
+    // still sealed at a 4-round budget despite resolve-indirect having
+    // already shaped all three of its targets by then. See the header for
+    // why one round is supposed to open one level of a dispatcher chain;
+    // this loop is what makes that true when a level itself takes more than
+    // one probe to see.
+    std::size_t foundNew = 0;
+    std::size_t foundEdges = 0;
+    for (unsigned settle = 0; settle < kSettleCeiling; ++settle) {
+      {
+        pass::Manager manager;  // intermediate passes run unobserved
+        configure(manager, reader, options);
+        // Stop at Cfg to put the last pass's edges back before SSA is built
+        // over them; see the header for why doing it after would be too late.
+        XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, il::Maturity::Cfg));
+        applyResolutions(*lifted->function, resolved);
+        XDEC_TRY_VOID(manager.runTo(*lifted->function, registry, il::Maturity::Ssa));
+      }
+
+      Probe probe;
+      XDEC_TRY_VOID(probe.run(*lifted->function, reader, options));
+
+      const std::size_t liftedFrom = entries.size();  // before this pass's finds
+      const std::size_t passNew = admitDiscoveries(probe.discoveries);
+      foundNew += passNew;
+      if (probe.declined > 0) {
+        XDEC_LOG_INFO(driverLog(),
+                      "round {} left {} branch(es) unresolved whose candidate sets were "
+                      "wider than the {}-per-branch discovery cap",
+                      report.rounds, probe.declined, options.maxDiscoveryPerBranch);
+      }
+      // Resolving a branch is progress even when it revealed no new address:
+      // the edge it adds is what lets the next pass's SSA reach one level
+      // further in, and stopping here would leave that level unanalysed.
+      // Measured per edge, not per branch, because a dispatcher's target set
+      // widens a few entries at a time while the count of branches holding
+      // one stands still.
+      const Resolutions found = harvest(*lifted->function);
+      std::size_t passEdges = absorb(resolved, found);
+      // Edges of branches that could not resolve only because their targets
+      // had no blocks yet. Carrying them is what makes a chain of them cost
+      // one pass per level instead of two: the pass that lifts the block
+      // also gets its incoming edge, so SSA sees a reachable block and the
+      // branch *it* ends with resolves in that same pass (see the header).
+      passEdges += absorb(resolved, probe.pending);
+      foundEdges += passEdges;
+      XDEC_LOG_INFO(driverLog(),
+                    "round {} pass {}: {} block(s) from {} entr(ies), {} branch(es) "
+                    "resolved, {} new address(es), {} new edge(s)",
+                    report.rounds, settle + 1, lifted->function->blockCount(), liftedFrom,
+                    found.size(), passNew, passEdges);
+      if (passNew == 0) {
+        // Nothing this pass admitted needs lifting; another pass over the
+        // same blocks would just re-derive what this one already proved.
+        break;
+      }
+      // The pass's own discoveries are only candidates until they are real
+      // blocks; lift them in before asking resolve-indirect about them again.
+      auto relifted = liftKnown();
+      if (!relifted) {
+        return std::move(relifted).takeUnexpected();
+      }
+      lifted = std::move(relifted);
+    }
 
     if (foundNew == 0 && foundEdges == 0) {
+      if (hasStuckResolution(*lifted->function)) {
+        // See hasStuckResolution: a real, permanent gap, not a convergence.
+        // The function is still emitted as far as the rounds got it, same as
+        // a round-cap stop, but report.converged stays false so the report
+        // does not claim a fixpoint this run never actually reached.
+        XDEC_LOG_WARN(driverLog(),
+                      "round {}: a resolved branch's target never became a reachable "
+                      "block (likely unmapped memory); stopping here rather than "
+                      "reporting a convergence that leaves it out",
+                      report.rounds);
+        return finish();
+      }
       report.converged = true;
       return finish();
     }

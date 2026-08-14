@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "il/il_test_support.h"
+#include "xdec/analysis/entry_reg.h"
 #include "xdec/il/function.h"
 #include "xdec/il/verify.h"
 #include "xdec/pass/pass.h"
@@ -55,11 +56,13 @@ Function unresolvable() {
   return function;
 }
 
-bool run(Function& function, bool seal) {
+bool run(Function& function, bool seal, xdec::ByteReader image = emptyImage(),
+        const xdec::analysis::EntryRegFacts* entryRegs = nullptr) {
   const auto pass = xdec::passes::makeResolveIndirectPass();
   xdec::pass::Context context(function);
-  context.setImage(emptyImage());
+  context.setImage(std::move(image));
   context.setSealUnresolvedBranches(seal);
+  context.setEntryRegFacts(entryRegs);
   auto result = pass->run(context);
   const std::string error = result ? std::string{} : result.error().format();
   INFO(error);
@@ -303,4 +306,35 @@ TEST_CASE("an entry pointing back at the read itself stays a target",
   REQUIRE(targets.size() == 2);
   CHECK(std::find(targets.begin(), targets.end(), handler) != targets.end());
   CHECK(std::find(targets.begin(), targets.end(), entry) != targets.end());
+}
+
+TEST_CASE("a branch through a bare leaked entry register resolves once EntryRegFacts anchors it",
+          "[passes][resolve-indirect]") {
+  // `br x2` with nothing else in the function ever defining x2 -- the
+  // obfuscated-entry shape this whole facility exists for (see
+  // analysis/entry_reg.h and docs/20-absd-entry-registers.md, where the real
+  // register is x22; x2 stands in here because the fixture's register file
+  // only models x0..x7). With no facts at all this is exactly
+  // `unresolvable()` above, and only EntryRegFacts binding the register
+  // changes that.
+  Function function(Arch::AArch64, xdec::test::arm64Registers(), 0x1000);
+  const BlockId entry = function.createBlock(0x1000);
+  function.setEntryBlock(entry);
+  const BlockId target = function.createBlock(0x2000);
+  function.appendIndirectBranch(entry, 0x1004,
+                                function.entryReg(function.registers().find("x2")));
+  function.rebuildEdges();
+  function.setMaturity(Maturity::Ssa);
+
+  FakeTableImage image;
+  image.qwords[0x2000] = 0;  // readable(), so the resolved address counts as code
+
+  xdec::analysis::EntryRegFacts facts;
+  facts.setBinding("x2", xdec::analysis::EntryRegBinding::fromLiteral(0x2000));
+
+  CHECK_FALSE(run(function, /*seal=*/false, image.reader(), nullptr));  // no facts: unresolved
+  CHECK(run(function, /*seal=*/false, image.reader(), &facts));
+  const auto targets = function.targets(terminatorOf(function, entry));
+  REQUIRE(targets.size() == 1);
+  CHECK(targets[0] == target);
 }

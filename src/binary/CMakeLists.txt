@@ -1,5 +1,8 @@
 xdec_add_library(xdec_binary
   SOURCES
+    backing_store.cpp
+    dyld_cache/dyld_cache_loader.cpp
+    dyld_cache/dyld_cache_metadata.cpp
     elf.cpp
     image.cpp
     macho.cpp

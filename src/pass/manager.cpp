@@ -58,6 +58,7 @@ Result<std::vector<RunStats>> Manager::run(
     context.setSealUnresolvedBranches(seal_);
     context.setTypeDatabase(types_);
     context.setSyscallTable(syscalls_);
+    context.setEntryRegFacts(entryRegs_);
     if (names_) {
       context.setNames(names_);
     }

@@ -17,13 +17,29 @@
 // never has to depend on the type system just to know a type preset's name.
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace xdec::binary {
 
 class BinaryImage;
+
+/// One register a platform's loader leaks a companion image's address
+/// through, before the program's own entry ever runs -- dyld's `ADRL
+/// sConfigBuffer`/`_NSConcreteStackBlock` landing in x21/x22 ahead of Mach-O's
+/// `BLR` into `LC_MAIN` (see docs/20-absd-entry-registers.md). Named data an
+/// obfuscated entry's `analysis::EntryRegFacts` binds against once the named
+/// companion is actually opened (see SessionContext::open); this struct only
+/// states the formula.
+struct EntryRegOffset {
+  std::string reg;        // e.g. "x22"
+  std::string companion;  // e.g. "dyld"; matched against a sidecar/discovered
+                          // EntryCompanion of the same name
+  uint64_t offset = 0;
+};
 
 /// What a target platform implies for type import and call resolution, all of
 /// it named data a caller applies rather than a policy this struct enforces
@@ -42,6 +58,16 @@ struct TargetProfile {
   /// after a name is resolved and before it is bound against a TypeDatabase;
   /// a name with no entry here passes through unchanged.
   std::map<std::string, std::string> symbolAliases;
+  /// Entry registers this platform's loader leaks a companion image's address
+  /// through (see EntryRegOffset). Empty for a platform with no such leaks
+  /// (ELF/Android's entry registers are all genuinely caller-supplied) --
+  /// then analysis::EntryRegFacts stays exactly as empty as it always was.
+  std::vector<EntryRegOffset> entryRegOffsets;
+  /// Entry registers this platform can name as a fixed value with no
+  /// companion image at all -- x28's kernel-handoff residue, measured as "0"
+  /// on every device this project has tried (see docs/20 §7.4). A sidecar's
+  /// own literal for the same register overrides this per binary.
+  std::unordered_map<std::string, uint64_t> entryRegLiterals;
 };
 
 /// Infers a `TargetProfile` from what the image itself says: format,

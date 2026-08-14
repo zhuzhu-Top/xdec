@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to '<binary>.entry.json' next to the real absd file (SessionContext::open auto-discovers it; see docs/21-entry-reg-platform.md). No xdec CLI flag is involved -- this is the whole handoff from a device capture (tools/ios_lldb_absd_entry.py writes exactly this shape) to the decompiler.",
+
+  "literal": {
+    "x28": "0x0"
+  },
+
+  "companions": [
+    {
+      "name": "dyld",
+      "path": "dyld",
+      "base": "0x104f78000"
+    }
+  ]
+}

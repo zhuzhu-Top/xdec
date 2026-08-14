@@ -216,6 +216,61 @@ TEST_CASE("a run capped mid-round on total entries still finishes",
   CHECK_FALSE(result->function->blockAt(0x5010).valid());
 }
 
+// A chain of two indirect branches, each behind its own global pointer, is
+// what a dispatcher looks like one level removed from the simplest case
+// above. Before the intra-round settle loop, resolve-indirect could shape
+// both branches' candidates well before the discovery they depend on had a
+// block, but each level still cost the *outer* round budget one round to
+// actually admit and re-probe -- so a two-level chain needed a budget deep
+// enough to cover both levels, one round at a time. The settle loop chases a
+// round's own discoveries to their own fixed point before the outer budget
+// is charged for it, so a single round of budget is now enough to walk the
+// whole chain: see driver.cpp for where that loop lives.
+TEST_CASE("a chain of indirect branches settles within one round's budget",
+          "[decompile][driver]") {
+  FlatMemory memory;
+  memory.putInsn(0x1000, 0xB0000008);  // adrp x8, #0x2000 (from 0x1000's page)
+  memory.putInsn(0x1004, 0xF9400108);  // ldr x8, [x8]
+  memory.putInsn(0x1008, 0xD61F0100);  // br x8
+  memory.putInsn(0x1010, 0xD0000009);  // adrp x9, #0x3000 (from 0x1010's page)
+  memory.putInsn(0x1014, 0xF9400129);  // ldr x9, [x9]
+  memory.putInsn(0x1018, 0xD61F0120);  // br x9
+  memory.putInsn(0x1020, 0xD65F03C0);  // ret
+  memory.putQword(0x2000, 0x1010);
+  memory.putQword(0x3000, 0x1020);
+
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+
+  xdec::decompile::DriverOptions options;
+  options.maxRounds = 1;
+  // A wall, not a budget: if the chain still needed one round per level,
+  // this would leave the second branch sealed rather than resolved.
+  options.extendWhileProving = false;
+  auto result = xdec::decompile::decompile(engine(), memory.reader(), 0x1000, registry,
+                                           options);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+
+  CHECK(result->report.rounds == 1);
+  const il::Function& function = *result->function;
+  CHECK(function.maturity() == il::Maturity::Resolved);
+  const il::BlockId first = function.blockAt(0x1010);
+  const il::BlockId second = function.blockAt(0x1020);
+  REQUIRE(first.valid());
+  REQUIRE(second.valid());
+  // Both branches resolved to exactly one target each, so fold-resolved-branch
+  // turned both into plain Branch ops -- neither is left as an unresolved
+  // (and, with sealing on, opaque) IndirectBranch.
+  const il::Op& firstBranch = function.op(function.block(function.blockAt(0x1000)).ops.back());
+  const il::Op& secondBranch = function.op(function.block(first).ops.back());
+  REQUIRE(firstBranch.code == il::OpCode::Branch);
+  REQUIRE(secondBranch.code == il::OpCode::Branch);
+  CHECK(function.targets(firstBranch)[0] == first);
+  CHECK(function.targets(secondBranch)[0] == second);
+}
+
 TEST_CASE("a table slot pointing nowhere stays unresolved and fails honestly",
           "[decompile][driver]") {
   const FlatMemory memory = program(0x9999);  // unmapped

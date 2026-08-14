@@ -412,6 +412,17 @@ class Assembler {
       externs += std::format("uint64_t {}(); // {:#x}\n", callee, address);
     }
     for (const auto& [leaf, width] : ctx_.entryLeaves) {
+      // A leaf `options.entryRegs` actually resolved is a platform fact, not
+      // an unknown external -- see analysis/entry_reg.h and
+      // CContext::anchoredEntryLeaves. Printed as a `#define` so every use
+      // reads the concrete value directly, with the formula that produced it
+      // in a comment for whoever is checking it against docs/21.
+      if (const auto anchored = ctx_.anchoredEntryLeaves.find(leaf);
+          anchored != ctx_.anchoredEntryLeaves.end()) {
+        externs += std::format("#define {} {:#x}ULL // resolved by platform entry-reg facts\n",
+                               leaf, anchored->second);
+        continue;
+      }
       externs += std::format("extern const {} {};\n", intType(width), leaf);
     }
     externs += syscallDeclarations();

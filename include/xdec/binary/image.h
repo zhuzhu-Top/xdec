@@ -15,40 +15,19 @@
 #include <string_view>
 #include <vector>
 
+#include "xdec/binary/backing_store.h"
+#include "xdec/binary/format_metadata.h"
 #include "xdec/binary/memory_map.h"
 #include "xdec/support/result.h"
 #include "xdec/support/target.h"
 
 namespace xdec::binary {
 
-enum class BinaryFormat : uint8_t { Unknown, Elf, Pe, MachO };
+enum class BinaryFormat : uint8_t { Unknown, Elf, Pe, MachO, DyldCache };
 [[nodiscard]] std::string_view toString(BinaryFormat format) noexcept;
 
 enum class BinaryKind : uint8_t { Unknown, Executable, SharedObject, Relocatable, Core };
 [[nodiscard]] std::string_view toString(BinaryKind kind) noexcept;
-
-/// Owns the raw file bytes. The data address is stable across moves, so spans
-/// handed to a MemoryMap stay valid when the buffer is moved into an image.
-class FileBuffer {
- public:
-  FileBuffer() = default;
-
-  static Result<FileBuffer> fromFile(const std::filesystem::path& path);
-
-  /// Copies an in-memory image. Used by tests that synthesise binaries and by
-  /// callers that already hold the bytes.
-  static FileBuffer fromBytes(std::span<const std::byte> bytes);
-
-  [[nodiscard]] std::span<const std::byte> bytes() const noexcept {
-    return std::span<const std::byte>{data_.get(), size_};
-  }
-  [[nodiscard]] std::size_t size() const noexcept { return size_; }
-  [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-
- private:
-  std::unique_ptr<std::byte[]> data_;
-  std::size_t size_ = 0;
-};
 
 struct Section {
   std::string name;
@@ -158,13 +137,18 @@ struct ImageContents {
   uint64_t entryPoint = 0;
   bool hasEntryPoint = false;
   std::string path;
-  FileBuffer file;
+  /// Owning file bytes. A single file for ELF/Mach-O; several parts for a
+  /// split dyld shared cache. See backing_store.h.
+  BackingStore store;
   MemoryMap memory;
   std::vector<Section> sections;
   std::vector<Symbol> symbols;
   std::vector<Relocation> relocations;
   std::vector<std::string> neededLibraries;
   std::string soname;
+  /// Format-specific data; null for formats that need none. See
+  /// format_metadata.h.
+  std::unique_ptr<FormatMetadata> formatMetadata;
 };
 
 class BinaryImage {
@@ -194,7 +178,10 @@ class BinaryImage {
   [[nodiscard]] std::span<const std::string> neededLibraries() const noexcept {
     return contents_.neededLibraries;
   }
-  [[nodiscard]] std::size_t fileSize() const noexcept { return contents_.file.size(); }
+  [[nodiscard]] std::size_t fileSize() const noexcept { return contents_.store.totalSize(); }
+  [[nodiscard]] const FormatMetadata* formatMetadata() const noexcept {
+    return contents_.formatMetadata.get();
+  }
 
   // -- address queries ------------------------------------------------------
 
@@ -278,5 +265,13 @@ Result<std::unique_ptr<BinaryImage>> loadElf(FileBuffer file, std::string path);
 /// Loads a little-endian 64-bit Mach-O image from an already-read buffer.
 /// Exposed for tests that synthesise images in memory.
 Result<std::unique_ptr<BinaryImage>> loadMachO(FileBuffer file, std::string path);
+
+/// Loads a dyld shared cache rooted at `mainPath` (an `arm64`/`arm64e`-suffixed
+/// main file such as `dyld_shared_cache_arm64`), discovering and opening its
+/// subcache and symbols siblings on disk. Unlike loadElf/loadMachO this reads
+/// more than the one buffer already passed to openBinary, because a cache's
+/// mapped address space routinely spans several physical files.
+Result<std::unique_ptr<BinaryImage>> loadDyldCache(FileBuffer mainFile,
+                                                   std::filesystem::path mainPath);
 
 }  // namespace xdec::binary

@@ -118,6 +118,12 @@ class CContext {
   std::map<uint64_t, std::string> callees;
   /// Entry-value externs the body referenced, with the width each carries.
   std::map<std::string, uint32_t> entryLeaves;
+  /// The subset of `entryLeaves` that `options.entryRegs` actually resolved,
+  /// each with the concrete value it resolved to -- what tells the preamble
+  /// to print `#define __entry_x22 0x...ULL` there instead of the bare
+  /// `extern` a leaf with no such fact still gets (see c_expr.cpp's EntryReg
+  /// case and c_printer.cpp's preamble()).
+  std::map<std::string, uint64_t> anchoredEntryLeaves;
   /// Syscalls the body reached, by the name it called them with, each mapped to
   /// the prototype the preamble declares. Keyed by name rather than number so a
   /// syscall issued from two places is declared once.

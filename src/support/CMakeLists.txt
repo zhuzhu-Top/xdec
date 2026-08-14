@@ -2,6 +2,7 @@ xdec_add_library(xdec_support
   SOURCES
     arena.cpp
     compiler.cpp
+    composite_reader.cpp
     diag.cpp
     json.cpp
     log.cpp

@@ -104,6 +104,48 @@ inline constexpr uint64_t kDyldInfoLazyBindSize = 36;
 // entry_point_command (LC_MAIN) fields, relative to the load command's own base.
 inline constexpr uint64_t kEntryPointOffset = 8;
 
+// linkedit_data_command fields (LC_DYLD_CHAINED_FIXUPS carries one), relative
+// to the load command's own base.
+inline constexpr uint64_t kLinkeditDataOff = 8;
+inline constexpr uint64_t kLinkeditDataSize = 12;
+
+// dyld_chained_fixups_header fields, relative to the command's dataoff.
+inline constexpr uint64_t kChainedFixupsStartsOffset = 4;
+inline constexpr uint64_t kChainedFixupsImportsOffset = 8;
+inline constexpr uint64_t kChainedFixupsSymbolsOffset = 12;
+inline constexpr uint64_t kChainedFixupsImportsCount = 16;
+inline constexpr uint64_t kChainedFixupsImportsFormat = 20;
+inline constexpr uint64_t kChainedFixupsHeaderSize = 28;
+
+// dyld_chained_starts_in_image fields, relative to dataoff + starts_offset.
+inline constexpr uint64_t kChainedStartsSegCount = 0;
+inline constexpr uint64_t kChainedStartsSegInfoOffset = 4;  // + 4 * segment index
+
+// dyld_chained_starts_in_segment fields, relative to that segment's own
+// dyld_chained_starts_in_image[seg_info_offset[i]] base.
+inline constexpr uint64_t kChainedSegPageSize = 4;
+inline constexpr uint64_t kChainedSegPointerFormat = 6;
+inline constexpr uint64_t kChainedSegSegmentOffset = 8;
+inline constexpr uint64_t kChainedSegPageCount = 20;
+inline constexpr uint64_t kChainedSegPageStart = 22;  // + 2 * page index
+
+// A page with no fixup chain at all, versus one whose first chain entry is
+// itself an overflow index into a second array this loader does not walk
+// (dense pages needing more than one chain start per page -- rare).
+inline constexpr uint16_t kChainedPtrStartNone = 0xFFFF;
+inline constexpr uint16_t kChainedPtrStartMulti = 0x8000;
+
+// dyld_chained_import (format 1: DYLD_CHAINED_IMPORT), one 32-bit word.
+inline constexpr uint32_t kChainedImportFormatNormal = 1;
+inline constexpr uint32_t kChainedImportNameOffsetShift = 9;
+inline constexpr uint32_t kChainedImportNameOffsetMask = 0x7fffffu;  // 23 bits
+
+// DYLD_CHAINED_PTR_* pointer formats. Only the two this loader has real
+// fixtures for (2, 6 -- see macho.cpp) are decoded; the rest are named in a
+// warning and left unrelocated, same as before this existed.
+inline constexpr uint16_t kChainedPtr64 = 2;
+inline constexpr uint16_t kChainedPtr64Offset = 6;
+
 // Rebase opcodes (REBASE_OPCODE_*), packed as (opcode << 4 | immediate).
 inline constexpr uint8_t kRebaseOpcodeMask = 0xf0;
 inline constexpr uint8_t kRebaseImmediateMask = 0x0f;

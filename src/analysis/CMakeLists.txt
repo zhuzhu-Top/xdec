@@ -7,6 +7,7 @@ xdec_add_library(xdec_analysis
     dispatch_values.cpp
     dispatcher_shape.cpp
     dominators.cpp
+    entry_reg.cpp
     expr_reuse.cpp
     guard_cascade.cpp
     image_eval.cpp

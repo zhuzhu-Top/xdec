@@ -1084,7 +1084,7 @@ class ElfLoader {
     // The file buffer moves last: the memory map holds spans into it, and
     // FileBuffer keeps its data address stable across moves.
     contents.memory = std::move(memory_);
-    contents.file = std::move(file_);
+    contents.store.addPart(path_, std::move(file_));
     return std::make_unique<BinaryImage>(std::move(contents));
   }
 

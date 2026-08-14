@@ -22,6 +22,8 @@ std::string_view toString(BinaryFormat format) noexcept {
       return "pe";
     case BinaryFormat::MachO:
       return "macho";
+    case BinaryFormat::DyldCache:
+      return "dyld-cache";
   }
   return "unknown";
 }
@@ -100,50 +102,6 @@ std::string_view toString(RelocKind kind) noexcept {
       return "tls-descriptor";
   }
   return "unknown";
-}
-
-// ---------------------------------------------------------------------------
-// FileBuffer
-// ---------------------------------------------------------------------------
-
-Result<FileBuffer> FileBuffer::fromFile(const std::filesystem::path& path) {
-  std::error_code error;
-  const auto fileSize = std::filesystem::file_size(path, error);
-  if (error) {
-    return err(DiagCode::IoError,
-               std::format("cannot stat '{}': {}", path.string(), error.message()));
-  }
-  if (fileSize == 0) {
-    return err(DiagCode::BadFormat, std::format("'{}' is empty", path.string()));
-  }
-
-  std::FILE* handle = std::fopen(path.string().c_str(), "rb");
-  if (handle == nullptr) {
-    return err(DiagCode::IoError, std::format("cannot open '{}'", path.string()));
-  }
-
-  FileBuffer buffer;
-  buffer.size_ = static_cast<std::size_t>(fileSize);
-  buffer.data_ = std::make_unique<std::byte[]>(buffer.size_);
-  const std::size_t read = std::fread(buffer.data_.get(), 1, buffer.size_, handle);
-  std::fclose(handle);
-
-  if (read != buffer.size_) {
-    return err(DiagCode::IoError,
-               std::format("short read on '{}': got {} of {} bytes", path.string(), read,
-                           buffer.size_));
-  }
-  return buffer;
-}
-
-FileBuffer FileBuffer::fromBytes(std::span<const std::byte> bytes) {
-  FileBuffer buffer;
-  buffer.size_ = bytes.size();
-  buffer.data_ = std::make_unique<std::byte[]>(buffer.size_ == 0 ? 1 : buffer.size_);
-  if (!bytes.empty()) {
-    std::memcpy(buffer.data_.get(), bytes.data(), bytes.size());
-  }
-  return buffer;
 }
 
 // ---------------------------------------------------------------------------
@@ -506,6 +464,12 @@ Result<std::unique_ptr<BinaryImage>> openBinary(const std::filesystem::path& pat
   if (bytes.size() >= 4 && magic(0) == 0x7F && magic(1) == 'E' && magic(2) == 'L' &&
       magic(3) == 'F') {
     return loadElf(std::move(file), path.string());
+  }
+
+  // Every dyld shared cache magic starts with "dyld_v1" followed by a
+  // space-padded architecture suffix ("  arm64", " arm64e", ...).
+  if (bytes.size() >= 7 && std::memcmp(bytes.data(), "dyld_v1", 7) == 0) {
+    return loadDyldCache(std::move(file), path);
   }
 
   // Recognise the formats we do not handle yet by name, so the diagnostic says

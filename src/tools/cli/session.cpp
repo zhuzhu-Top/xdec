@@ -1,12 +1,15 @@
 #include "session.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <system_error>
 
 #include "common.h"
 #include "xdec/analysis/plt_stub.h"
 #include "xdec/spec/compile.h"
 #include "xdec/spec/parse.h"
+#include "xdec/support/composite_reader.h"
 #include "xdec/types/parse.h"
 
 namespace xdec::cli {
@@ -181,6 +184,7 @@ xdec::Result<SessionContext> SessionContext::open(std::string_view path,
   ctx.memory_ = memoryFactsOf(*ctx.image);
   ctx.reader_ = imageReaderOf(*ctx.image);
   ctx.profile = xdec::binary::inferTargetProfile(*ctx.image);
+  ctx.buildEntryRegFacts(std::filesystem::path{path});
 
   std::vector<std::string> typeSources = load.typeSources;
   if (typeSources.empty()) {
@@ -230,12 +234,140 @@ xdec::Result<SessionContext> SessionContext::open(std::string_view path,
   return ctx;
 }
 
+void SessionContext::buildEntryRegFacts(const std::filesystem::path& binaryPath) {
+  // Platform defaults first, lowest priority: a sidecar's own measurement
+  // (below) overrides these per binary, the same relationship
+  // TargetProfile::typePresets has with an explicit `--types`.
+  for (const auto& [reg, value] : profile.entryRegLiterals) {
+    entryRegs_.setBinding(reg, xdec::analysis::EntryRegBinding::fromLiteral(value));
+  }
+  for (const auto& offset : profile.entryRegOffsets) {
+    entryRegs_.setBinding(
+        offset.reg, xdec::analysis::EntryRegBinding::fromBase(offset.companion, offset.offset));
+  }
+
+  // Unlike the platform defaults above, a sidecar is always worth looking
+  // for even when the platform itself leaks nothing: it may carry
+  // per-function facts a platform profile has no business knowing --
+  // a captured argument pointer and the bytes it pointed to (MemorySeed),
+  // say -- rather than a platform-wide register leak.
+  //
+  // `XDEC_ENTRY_SIDECAR` mirrors `XDEC_SPEC` above: an explicit override for
+  // the one-off/CI case, ahead of the per-binary file convention.
+  std::optional<xdec::analysis::EntrySidecar> sidecar;
+  std::filesystem::path sidecarPath;
+  if (const char* fromEnv = std::getenv("XDEC_ENTRY_SIDECAR");
+      fromEnv != nullptr && *fromEnv != '\0') {
+    sidecarPath = std::filesystem::path{fromEnv};
+  } else if (const auto discovered = xdec::analysis::discoverEntrySidecar(binaryPath)) {
+    sidecarPath = *discovered;
+  }
+  if (!sidecarPath.empty()) {
+    auto loaded = xdec::analysis::loadEntrySidecar(sidecarPath);
+    if (!loaded) {
+      // Auto-discovered, not requested: a malformed sidecar should not stop a
+      // decompilation that never asked for one, same reasoning as the
+      // default syscall table above. Degrades to platform defaults only.
+      print("note: entry sidecar {} did not parse ({}); using platform defaults only",
+            sidecarPath.string(), loaded.error().format());
+    } else {
+      sidecar = std::move(*loaded);
+      // Highest priority: a measurement of this exact binary/device beats
+      // any formula, the same way an explicit CLI flag would have.
+      for (const auto& [reg, value] : sidecar->literals) {
+        entryRegs_.setBinding(reg, xdec::analysis::EntryRegBinding::fromLiteral(value));
+      }
+      for (const xdec::analysis::MemorySeed& seed : sidecar->memorySeeds) {
+        entryRegs_.addMemorySeed(seed);
+      }
+    }
+  }
+
+  // Every companion name a binding actually needs, in first-seen order, so a
+  // sidecar naming a companion this platform's profile never references is
+  // never opened for nothing.
+  std::vector<std::string> neededCompanions;
+  for (const auto& offset : profile.entryRegOffsets) {
+    if (std::find(neededCompanions.begin(), neededCompanions.end(), offset.companion) ==
+        neededCompanions.end()) {
+      neededCompanions.push_back(offset.companion);
+    }
+  }
+
+  xdec::CompositeByteReader composite;
+  composite.addRegion({.name = "", .reader = imageReaderOf(*image), .runtimeBase = 0, .fileBase = 0});
+
+  for (const std::string& name : neededCompanions) {
+    std::filesystem::path companionPath;
+    std::optional<uint64_t> explicitBase;
+    if (sidecar.has_value()) {
+      for (const xdec::analysis::EntryCompanion& candidate : sidecar->companions) {
+        if (candidate.name == name) {
+          // Relative to the binary's own directory, not the process's CWD:
+          // a sidecar is meant to travel with the binary it describes (see
+          // the exported "dyld" convention in ios_lldb_absd_entry.py), and a
+          // bare filename in it should mean "next to me", the same as the
+          // default-discovery guess just below would have found.
+          companionPath = candidate.path.is_absolute()
+                             ? candidate.path
+                             : binaryPath.parent_path() / candidate.path;
+          explicitBase = candidate.runtimeBase;
+          break;
+        }
+      }
+    }
+    if (companionPath.empty()) {
+      // Convention, not configuration: a companion the platform names lives
+      // next to the binary under its own name (a desktop dyld dump beside
+      // the absd it belongs to, say). No sidecar is needed for this to work
+      // at all, only to correct it (a measured runtime base, a different
+      // path).
+      const std::filesystem::path directory = binaryPath.parent_path();
+      for (const std::filesystem::path& guess : {directory / name, directory / (name + ".bin")}) {
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(guess, ec) && !ec) {
+          companionPath = guess;
+          break;
+        }
+      }
+    }
+    if (companionPath.empty()) {
+      print("note: no companion image named '{}' found next to {} (and none given in a "
+            "sidecar); entry register(s) anchored to it stay unresolved",
+            name, binaryPath.string());
+      continue;
+    }
+    auto companionImage = xdec::binary::openBinary(companionPath);
+    if (!companionImage) {
+      print("note: companion image '{}' at {} did not open ({}); entry register(s) "
+            "anchored to it stay unresolved",
+            name, companionPath.string(), companionImage.error().format());
+      continue;
+    }
+    const uint64_t preferredBase = (*companionImage)->memory().lowestAddress();
+    const uint64_t runtimeBase = explicitBase.value_or(preferredBase);
+    entryRegs_.setCompanionBase(name, runtimeBase);
+    composite.addRegion({.name = name,
+                         .reader = imageReaderOf(**companionImage),
+                         .runtimeBase = runtimeBase,
+                         .fileBase = preferredBase});
+    companions_.push_back(std::move(*companionImage));
+  }
+
+  // Composing zero extra regions would change nothing; only replace the
+  // plain primary-image reader once a companion actually joined it.
+  if (composite.regionCount() > 1) {
+    reader_ = composite.reader();
+  }
+}
+
 xdec::decompile::DriverOptions SessionContext::driverOptions() const {
   xdec::decompile::DriverOptions options;
   options.memory = memory();
   options.types = hasTypes_ ? &types : nullptr;
   options.syscalls = hasSyscalls_ ? &syscalls : nullptr;
   options.names = names();
+  options.entryRegs = entryRegs_.empty() ? nullptr : &entryRegs_;
   return options;
 }
 

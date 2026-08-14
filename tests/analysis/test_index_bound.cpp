@@ -227,6 +227,60 @@ TEST_CASE("the same shape names its two values, not just their ceiling",
   CHECK(*values == std::vector<uint64_t>{0xa, 0xb});
 }
 
+TEST_CASE("a complementary pair buried inside a longer OR chain still collapses to one value",
+          "[analysis][index-bound]") {
+  // absd's own 8dc shape: three or more OR terms chained (`t26 | t27 | ... |
+  // !(t_n != t_m)`), where one pair among them -- not necessarily the two
+  // immediate siblings at the top of the tree -- asks the same question on
+  // opposite polarities. `a | (!a | b)` is 1 on every path (a and its
+  // complement cannot both be 0), but a's complement is nested one level
+  // down from a itself, past where the direct two-term BitFactor check a few
+  // lines above this one can see it. Before the chain was flattened first,
+  // this fell through to the generic cross product and answered the safe
+  // but loose {0, 1} -- not wrong, but claiming a table entry (index 0) the
+  // branch can never actually select.
+  Fixture f;
+  const ExprId a =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x0"), f.i64(0)));
+  const ExprId notA =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpNe, f.reg("x0"), f.i64(0)));
+  const ExprId b =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x1"), f.i64(0)));
+  const ExprId index = f.function.binary(ExprOp::Or, a, f.function.binary(ExprOp::Or, notA, b));
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{1});
+}
+
+TEST_CASE("an OR chain with no complementary pair at all still resolves via the generic path",
+          "[analysis][index-bound]") {
+  // The chain-flattening addition has to be strictly additive: three
+  // genuinely unrelated flags OR'd together, none of them each other's
+  // complement, still answers -- just via the ordinary two-at-a-time
+  // recursion, the same as before this shape had its own case.
+  Fixture f;
+  const ExprId a =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x0"), f.i64(0)));
+  const ExprId b =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x1"), f.i64(0)));
+  const ExprId c =
+      f.function.cast(ExprOp::ZExt, Type::integer(32),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x2"), f.i64(0)));
+  const ExprId index = f.function.binary(ExprOp::Or, a, f.function.binary(ExprOp::Or, b, c));
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{0, 1});
+}
+
 TEST_CASE("a select over two constants is both of them", "[analysis][index-bound]") {
   // The other half of the walk: an arm at a time, unioned. The condition is
   // deliberately unanalysable, because which arm runs does not matter -- both
@@ -239,6 +293,51 @@ TEST_CASE("a select over two constants is both of them", "[analysis][index-bound
   const auto values = preciseIndexSet(f.function, index);
   REQUIRE(values.has_value());
   CHECK(*values == std::vector<uint64_t>{3, 7});
+}
+
+TEST_CASE("a phi's arms are unioned the same way a select's would be",
+          "[analysis][index-bound]") {
+  // absd's own 938 shape: a loop-carried dispatcher state (reg:x10) merges a
+  // huge one-time seed with a comparison's zero-extended result on the back
+  // edge. `exactValues` used to stop at the `val:iN(%k)` wrapper and call the
+  // whole thing unknown; reading through to the phi it names, the same way
+  // ImageEval's evalValue already does, answers through it instead.
+  Fixture f;
+  const il::ValueId phi = f.function.prependPhi(f.entry, 0x1000, Type::integer(64));
+  const ExprId seed = f.i64(0x1000234b8);
+  const ExprId fromCompare =
+      f.function.cast(ExprOp::ZExt, Type::integer(64),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x0"), f.i64(0)));
+  f.function.setOperands(f.function.value(phi).definition,
+                         std::vector<ExprId>{seed, fromCompare});
+  const ExprId index = f.function.valueRef(phi);
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{0, 1, 0x1000234b8});
+}
+
+TEST_CASE("a phi mixing a bare EntryReg input with a defined one keeps only the defined one",
+          "[analysis][index-bound]") {
+  // Same policy as ImageEval::unionEntryRegAware, for the same reason: a
+  // platform fact this walk cannot look up (no EntryRegFacts reaches here)
+  // should not poison an otherwise small, real merge on the back edge with
+  // the one-time seed that only ever flows in on entry.
+  Fixture f;
+  const il::ValueId phi = f.function.prependPhi(f.entry, 0x1000, Type::integer(64));
+  const ExprId entryX2 = f.reg("x2");
+  const ExprId fromCompare =
+      f.function.cast(ExprOp::ZExt, Type::integer(64),
+                      f.function.binary(ExprOp::CmpEq, f.reg("x0"), f.i64(0)));
+  f.function.setOperands(f.function.value(phi).definition,
+                         std::vector<ExprId>{entryX2, fromCompare});
+  const ExprId index = f.function.valueRef(phi);
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{0, 1});
 }
 
 TEST_CASE("an index whose shape narrows nothing yields no value set",
@@ -256,4 +355,57 @@ TEST_CASE("an index whose shape narrows nothing yields no value set",
   f.terminate();
 
   CHECK_FALSE(preciseIndexSet(f.function, index).has_value());
+}
+
+TEST_CASE("a cinc shape names both values even where wrapping the base costs one "
+          "recursion level too many",
+          "[analysis][index-bound]") {
+  // A `select(cond, state + 1, state)` whose `state` arm on its own just
+  // barely fits under exactValues' recursion budget (kMaxDepth, above): the
+  // *direct* reference resolves, but the *same* state one Add deeper (inside
+  // the `+ 1` arm's own recursive walk) no longer does, one level over
+  // budget. Before this shape had its own case, that asymmetry made the
+  // whole select fall through to `nullopt` even though the base's values
+  // were, in fact, known -- exactly the "known base, unresolved sibling arm"
+  // situation armBound's own comment already names for the guard-bound case
+  // (a cinc reads the guard through a constant offset the arm adds); this is
+  // its value-set counterpart, for a base whose own resolution is already
+  // right at the edge of what this walk can afford.
+  Fixture f;
+  ExprId state = f.i64(5);
+  // Eleven Add-by-zero wrappers: resolving `state` from the select's arms
+  // (one call frame in) costs exactly up to depth 12, the cap; resolving it
+  // from *inside* the `+ 1` arm's own Add case (two frames in) costs 13 and
+  // is refused.
+  for (int i = 0; i < 11; ++i) {
+    state = f.function.binary(ExprOp::Add, state, f.i64(0));
+  }
+  const ExprId condition = f.function.binary(ExprOp::CmpEq, f.reg("x1"), f.i64(0));
+  const ExprId index = f.function.select(
+      condition, f.function.binary(ExprOp::Add, state, f.i64(1)), state);
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{5, 6});
+}
+
+TEST_CASE("a csinc-style select with the base on the true edge also names both values",
+          "[analysis][index-bound]") {
+  // Same asymmetry, arms swapped: the base runs on the true edge and the
+  // increment on the false edge, exercising the other direction of the
+  // known/unknown-arm search.
+  Fixture f;
+  ExprId state = f.i64(10);
+  for (int i = 0; i < 11; ++i) {
+    state = f.function.binary(ExprOp::Add, state, f.i64(0));
+  }
+  const ExprId condition = f.function.binary(ExprOp::CmpEq, f.reg("x1"), f.i64(0));
+  const ExprId index =
+      f.function.select(condition, state, f.function.binary(ExprOp::Add, state, f.i64(1)));
+  f.terminate();
+
+  const auto values = preciseIndexSet(f.function, index);
+  REQUIRE(values.has_value());
+  CHECK(*values == std::vector<uint64_t>{10, 11});
 }

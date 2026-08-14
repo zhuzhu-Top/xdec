@@ -36,6 +36,10 @@ class SyscallTable;
 class TypeDatabase;
 }  // namespace xdec::types
 
+namespace xdec::analysis {
+class EntryRegFacts;
+}  // namespace xdec::analysis
+
 namespace xdec::pass {
 
 /// What the image's symbol table says starts at an address.
@@ -145,6 +149,17 @@ class Context {
   void setSyscallTable(const types::SyscallTable* table) noexcept { syscalls_ = table; }
   [[nodiscard]] const types::SyscallTable* syscallTable() const noexcept { return syscalls_; }
 
+  /// What the platform (not the image) says a leaked entry register holds --
+  /// see analysis/entry_reg.h. Absent is the default and costs nothing: a
+  /// pass that reads it (resolve-indirect, through analysis::ImageEval) finds
+  /// every EntryReg leaf top, exactly as before this existed.
+  void setEntryRegFacts(const analysis::EntryRegFacts* facts) noexcept {
+    entryRegs_ = facts;
+  }
+  [[nodiscard]] const analysis::EntryRegFacts* entryRegFacts() const noexcept {
+    return entryRegs_;
+  }
+
   /// The image's symbol table, for the one thing a pass can do with a name that
   /// it cannot do with an address: look up what a header declared under it.
   /// Unset resolves nothing, which is what a pipeline with no image gets.
@@ -191,6 +206,7 @@ class Context {
   NameAt names_;
   bool seal_ = false;
   std::function<void(const Discovery&)> discoverySink_;
+  const analysis::EntryRegFacts* entryRegs_ = nullptr;
 };
 
 class Pass {

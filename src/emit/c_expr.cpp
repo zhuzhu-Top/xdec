@@ -276,6 +276,11 @@ std::string ExprPrinter::inner(il::ExprId id) {
       const il::RegisterInfo& info = ctx_.function.registers()[root];
       const std::string name = std::format("__entry_{}", info.name);
       ctx_.entryLeaves.emplace(name, info.bits == 0 ? 64 : info.bits);
+      if (ctx_.options.entryRegs != nullptr) {
+        if (const std::optional<uint64_t> resolved = ctx_.options.entryRegs->resolve(info.name)) {
+          ctx_.anchoredEntryLeaves.emplace(name, *resolved);
+        }
+      }
       return name;
     }
     case il::ExprOp::Add:

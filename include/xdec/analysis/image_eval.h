@@ -11,9 +11,12 @@
 // The discipline:
 //   - Bounded. Sets cap at kCap values; overflow degrades to top ("unknown"),
 //     never to wrong answers. A resolver that sees top does not resolve.
-//   - Undef-tolerant. Undef and EntryReg evaluate to top, and top propagates
-//     by the rules of the operation (top + 3 is top; select(top, a, b) is
-//     a ∪ b). Nothing throws, nothing aborts.
+//   - Undef-tolerant. Undef always evaluates to top; EntryReg does too unless
+//     an EntryRegFacts binds it to a platform-fixed value (see
+//     analysis/entry_reg.h), in which case it is that value, a singleton set,
+//     same as any other constant. Top propagates by the rules of the
+//     operation (top + 3 is top; select(top, a, b) is a ∪ b). Nothing throws,
+//     nothing aborts.
 //   - Memory is the image. Loads read through the ByteReader; an unmapped
 //     address is top, never a zero-fill.
 #pragma once
@@ -23,6 +26,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xdec/analysis/entry_reg.h"
 #include "xdec/il/function.h"
 #include "xdec/support/reader.h"
 
@@ -66,8 +70,13 @@ class ValueSet {
 
 class ImageEval {
  public:
-  ImageEval(const il::Function& function, ByteReader reader)
-      : function_(function), reader_(std::move(reader)) {}
+  /// `entryRegs` is what turns an `EntryReg` leaf from top into a value where
+  /// the platform, not the image, is the one that fixes it (dyld's leaked
+  /// x21/x22, say -- see analysis/entry_reg.h). Absent (the default) keeps
+  /// every EntryReg leaf top, exactly as before this parameter existed.
+  ImageEval(const il::Function& function, ByteReader reader,
+            const EntryRegFacts* entryRegs = nullptr)
+      : function_(function), reader_(std::move(reader)), entryRegs_(entryRegs) {}
 
   /// The values `id` can take, within the set bound. Memoised per call site;
   /// phi cycles contribute the empty set at the re-entry point (the cyclic
@@ -81,7 +90,26 @@ class ImageEval {
   [[nodiscard]] ValueSet evalBinary(const il::Expr& expr);
   [[nodiscard]] ValueSet evalSelect(const il::Expr& expr);
   [[nodiscard]] ValueSet evalCast(const il::Expr& expr);
+  [[nodiscard]] ValueSet evalEntryReg(const il::Expr& expr);
   [[nodiscard]] ValueSet loadFrom(const ValueSet& addresses, il::Type type);
+
+  /// True when `id` is a bare `EntryReg` leaf -- a platform-leaked register
+  /// read with no transform at all, as opposed to an expression merely
+  /// *derived* from one (a cast, an add). See unionEntryRegAware for why the
+  /// distinction matters.
+  [[nodiscard]] bool isRawEntryReg(il::ExprId id) const;
+
+  /// The union a phi or select's arms would get anyway, except that a bare
+  /// EntryReg leaf sitting next to a genuinely computed arm is excluded
+  /// first. A merge with one predecessor that never touched the register and
+  /// another that assigned it a real value is not "the value is one of
+  /// these two very different things" -- it is the untouched predecessor
+  /// contributing nothing, the same shape resolve_indirect.cpp's own
+  /// `tolerateDeadCombinations` already treats as a combination this call
+  /// site cannot reach, one layer further up. When every arm is a bare
+  /// EntryReg leaf (or there is only one arm), nothing is excluded: that is
+  /// an ordinary entry-only merge, not a stale one.
+  [[nodiscard]] ValueSet unionEntryRegAware(std::span<const il::ExprId> arms);
 
   /// Cross-product application with the cap as the budget: when |a|×|b|
   /// would exceed the cap, the answer is top rather than a partial set.
@@ -93,6 +121,7 @@ class ImageEval {
 
   const il::Function& function_;
   ByteReader reader_;
+  const EntryRegFacts* entryRegs_ = nullptr;
   std::unordered_map<il::ExprId, ValueSet> memo_;
   std::unordered_map<il::ValueId, ValueSet> valueMemo_;
   /// Re-entered evaluations (phi loops) contribute the empty set at the inner

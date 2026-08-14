@@ -15,6 +15,7 @@
 #include <string_view>
 #include <vector>
 
+#include "xdec/analysis/entry_reg.h"
 #include "xdec/binary/image.h"
 #include "xdec/binary/target_profile.h"
 #include "xdec/decompile/driver.h"
@@ -165,10 +166,18 @@ struct SessionContext : ToolSession {
   /// Same lifetime requirement.
   [[nodiscard]] xdec::emit::SymbolResolver symbols() const { return symbolResolverOf(*image); }
 
-  /// A DriverOptions with `memory`/`types`/`syscalls`/`names` set from this
-  /// session -- everything decompile()/decompileToC() need that this session
-  /// alone determines. The caller still sets `target`, round/fence options,
-  /// and anything else that varies per call.
+  /// What the platform says a leaked entry register holds, once any
+  /// companion images it names have actually been opened (see
+  /// buildEntryRegFacts()). Empty -- every EntryReg leaf stays unresolved,
+  /// same as before this existed -- for a platform with no such leaks, or
+  /// when a needed companion (dyld) was never found. Same lifetime
+  /// requirement as memory()/reader().
+  [[nodiscard]] const xdec::analysis::EntryRegFacts& entryRegFacts() const { return entryRegs_; }
+
+  /// A DriverOptions with `memory`/`types`/`syscalls`/`names`/`entryRegs` set
+  /// from this session -- everything decompile()/decompileToC() need that
+  /// this session alone determines. The caller still sets `target`,
+  /// round/fence options, and anything else that varies per call.
   [[nodiscard]] xdec::decompile::DriverOptions driverOptions() const;
 
  private:
@@ -179,7 +188,26 @@ struct SessionContext : ToolSession {
   /// own doc comment), so they must be stable member storage, not a fresh
   /// memoryFactsOf(*image)/imageReaderOf(*image) each time they are read.
   xdec::MemoryFacts memory_;
+  /// Reads the primary image, then -- once buildEntryRegFacts() has opened
+  /// any companion it needed -- falls through to each of those in turn (see
+  /// CompositeByteReader). A pipeline with no companion still reads exactly
+  /// as before this existed: composing zero extra regions changes nothing.
   xdec::ByteReader reader_;
+  /// What binary::TargetProfile::entryRegOffsets/entryRegLiterals and an
+  /// optional sidecar (see analysis::discoverEntrySidecar) together resolve
+  /// this binary's leaked entry registers to. Never set by a CLI flag --
+  /// see docs/21-entry-reg-platform.md for why this is inferred instead.
+  xdec::analysis::EntryRegFacts entryRegs_;
+  /// Companion images buildEntryRegFacts() opened (dyld, for a Mach-O
+  /// target). Kept alive here because `reader_`'s composed regions capture
+  /// each one's bytes by reference, the same way `image` itself must outlive
+  /// `reader_`'s primary region.
+  std::vector<std::unique_ptr<BinaryImage>> companions_;
+
+  /// Resolves this session's EntryRegFacts and folds any companion images it
+  /// needed into `reader_`. Called once, from open(), after `profile` and
+  /// `reader_` are both set.
+  void buildEntryRegFacts(const std::filesystem::path& binaryPath);
 };
 
 }  // namespace xdec::cli
