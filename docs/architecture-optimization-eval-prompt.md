@@ -2,7 +2,7 @@
 
 > **文档性质**：xdec 项目 **唯一可执行改进方案**（非外部模型提示词）。详细算法与 API 草图见 [18-architecture-optimization-plan.md](18-architecture-optimization-plan.md)；DispatchRegion 见 [17-dispatch-region.md](17-dispatch-region.md)；核心/插件边界见 [00-core-vs-plugin-prompt.md](00-core-vs-plugin-prompt.md)。
 >
-> **版本**：2026-08-12（J1 已落地；goto 专项诊断已纳入 §4）
+> **版本**：2026-08-13（J1/J2e/J2/J2f/J2g 已落地；J2g×J2f 折叠顺序修复见 §6.8.1）
 >
 > **约束**：核心通用、IL/形状驱动、合成 fixture 证明、**禁止** libscplugin 硬编码；L2 仅观测，不作门禁特判。
 
@@ -20,14 +20,14 @@
 
 **一句话结论**：xdec 已是「IL 正确、分析可观测、对 honest / bc_lib 类样本合格」的框架；下一阶段 ROI 在 **补齐 structurizer 对 scatter-dispatcher 的消费路径**（Track B），Track A 与 Track B 并行、不互相阻塞。
 
-### 1.1 回归基线（2026-08-12，J1 后）
+### 1.1 回归基线（2026-08-13，J2g×J2f 顺序修复后）
 
 | 层级 | 内容 | 状态 |
 |------|------|------|
-| 单元测试 | Catch2，**612** test cases，133664 assertions | 全过 |
+| 单元测试 | Catch2，**641** test cases，133822 assertions | 全过 |
 | L0 eval | **98** 个 NDK ground-truth | baseline 98/98，typed 38/38 |
 | L1 samples | **5** 个真实 `.so` 形状指标 | 5/5 |
-| L2 观测 | `sample_libscplugin` @ `0x1164f8` | 非门禁；见 §4 |
+| L2 观测 | `sample_libscplugin` @ `0x1164f8` | 非门禁；goto 388→326→**289**，见 §4.4/§6.8/§6.8.1、[FINDINGS.md](../eval/FINDINGS.md) |
 
 ### 1.2 已落地项（相对初版 eval 提示词）
 
@@ -37,9 +37,13 @@
 | **C：AnalysisCache** | ⚠️ 部分 | `analysis_cache.h`；`dispatchRegions()` 已接入；pass→invalidate 桥接 **未接** |
 | **H：PipelineFixture** | ⚠️ 部分 | `tests/fixture/pipeline_fixture.h`；`test_decompile_to_c.cpp` 已用 |
 | **J1：region-aware 2-way defer** | ✅ | `StructureOptions`、`switchFor` 门控、`test_structure_dispatch_region.cpp` |
+| **J2e：join block epilogue** | ✅ | `analysis::findDispatchJoins`、`joinHubByTail()`，§6.3 |
+| **J2：collapseRegionDispatchTree** | ✅（libscplugin 零命中，诚实结果） | `structure_dispatch_region.cpp`，§6.4 |
+| **J2f：labeled natural loop** | ✅ | `collapseLabeledNaturalLoops`，§6.5 |
+| **J2g：unique goto expansion** | ✅ | `expandUniqueCaseGotos`，§6.8 |
+| **J2g×J2f：pre-loop 折叠顺序** | ✅ | `expandUniqueCaseGotos` 跑两遍，§6.8.1 |
 | libscplugin Phase 0–1 | ✅ | `ObfuscationProfile`、`DispatchRegion`、`quantify_c.py` |
-| libscplugin Phase 2a/2c/2d | ❌ | J2 / handler clone / join epilogue **未做** |
-| libscplugin Phase 3–4 边际 | ⚠️ | H2 Select 折叠有效；路由三写、region mega-switch 未做 |
+| libscplugin Phase 3–4 边际 | ⚠️ | H2 Select 折叠有效；路由三写（J3）未做 |
 
 ---
 
@@ -164,7 +168,9 @@ L_0x11a180: switch (...) { case ...: goto ...; }
 | **J2d** region handler clone ✅ | 265 case goto 中多前驱、小 body（不再分发） | **−0**（实测；libscplugin 的共享 handler 几乎全部会再分发，见 §6.2） | ~1.5w（实际约 1d + 排查 0.5d） | 低 |
 | **J2e** join block epilogue | 19 merge hub | **−50~−80** | ~1w | 中 |
 | **J2** collapseRegionDispatchTree | 234 嵌套 2-case switch 树 | **407→150~250** | ~3w | 中 |
-| **J2f** labeled natural loop | 149 回边 | **−60~−100** | ~1w | 低 |
+| **J2f** labeled natural loop ✅ | 149 回边 | **−19**（实测 407→388，见 FINDINGS） | ~1w | 低 |
+| **J2g** unique goto expansion ✅ | 裸 case/`default` 槽指向只被引用一次的 orphan | **−62**（实测 388→326，见 FINDINGS） | ~3d | 低 |
+| **J2g×J2f** pre-loop 折叠顺序 ✅ | J2f 把 remnant 拼进循环体、抹掉分组边界后 J2g 才跑，folding 永久错过 | **−37**（实测 326→289，见 FINDINGS） | ~1d | 低 |
 | J3/J4/J5 | 路由三写 / dead load | **−0~−20** | ~2w | 低 |
 
 **理论下限**（`sharedTail=false` 的 scatter 形态）：**~50–100 goto**；无法到 0（与 afRDLog 3642 goto 同类问题）。
@@ -321,6 +327,89 @@ std::optional<RegionSwitchPlan> collapseRegionDispatchTree(
 **落点**：扩展 `collectDeadOps` / `deadJumpTableLoad`；`--emit-report` 的 `dispatch-load-sites` 下降。
 
 **对 goto**：无直接影响。
+
+### 6.8 J2g — Unique goto expansion ✅ 已完成
+
+**问题**：J2f 之后仍剩的裸 `goto`——`switchFor` 给一个 case 找 body 时
+`claimCaseBody`/`claimDispatcherCaseBody`/`claimOrCloneSharedCaseBody`
+全部失败（典型原因：handler 自己吸收的后续 block 撞上了另一个 case 共享的
+merge，`regionClosed` 拒绝），`caseBodies[i]` 留空；两轮无检查的 RPO 补扫
+随后把这个 handler 收成一个独立顶层分组，打印时既要单独一行 `label:`，又要
+在原 case 里补一行 `goto label;`——如果整棵树里只有这一处引用这个 label，
+两者都纯属多余。
+
+**方案**：`Structurizer::expandUniqueCaseGotos`（`collapseLabeledNaturalLoops`
+之后、`stable_sort` 之前跑）——建 orphan 索引（干净的顶层分组：`items[0]`
+恰是自己 head 的 `Block`）、用 `countReferences`（`collectReferences` 的
+计数版）拿整棵树的引用计数，再用 `expandGotoTargets` 递归遍历每个
+`Switch`（包括已内联的 `caseBodies` 深处，覆盖真实样本里"外层已内联、裸槽
+在更深处"的常见形状），对 `refCount==1` 的裸 case/`default` 槽尝试
+`cloneStmt` 折叠整个 orphan 分组进去——但仅当 IL 级
+`predecessors.size()==1`（防止一个自然循环回边被 J2f 改写成 `Continue`
+后，树扫描看不见这个"隐藏的第二引用"）、`alwaysLeaves`、且不含嵌套
+`Switch`（`containsSwitch`，避免把整棵子 dispatch 树错塞进一个 case）全部
+成立。默认开启，不新增 CLI 开关。
+
+**测试**：`tests/emit/test_structure_unique_goto_expand.cpp`——一个正例
+（两条 case 因共享下游 block 的 `regionClosed` 冲突都失败 claim，各自成为
+只被引用一次的顶层分组，两个都被折叠回自己的 case）+ 三个负例（IL 双前驱；
+handler 自身无 terminator 故 `alwaysLeaves` 判否；handler 自身是嵌套
+dispatch 故 `containsSwitch` 判否，即使它经自己的 `epilogue` 确实"leaves"）。
+
+**验收**（`sample_libscplugin`，实测，见 [FINDINGS.md](../eval/FINDINGS.md)）：
+goto **388→326**，labels **317→231**，行数 **6702→6572**（`max_lines: 6600`
+的既有阈值突破随行数下降自愈，`samples/run.ps1` 回到 5/5）；switch/`while(true)`
+均不变。`xdec_tests.exe` **640** test cases 全过；L0/L1 零回归。
+
+### 6.8.1 J2g × J2f 执行顺序 — 循环体内 remnant 补折叠 ✅ 已完成
+
+**问题**（用户实测指出，`sample_libscplugin.c` 5705-5711 行 `goto
+L_0x1224c8;`/`goto L_0x11efc0;` 未被 J2g 折叠）：§6.8 的
+`expandUniqueCaseGotos` 只跑在 `collapseLabeledNaturalLoops`（J2f）**之后**
+一次，而 J2f 恰恰会把"自然循环"里每个贡献分组（`loopPtr->blocks` 里除
+header 外的每个成员，按 `ownerOf` 去重）**整段拼接**进循环体
+`Sequence`——拼接后这些分组各自的顶层 `groups[i]` 条目不复存在，只剩
+拼进同一个 `Sequence` 的匿名 `Block` 分段，J2g 事后重建的 `orphanIndex`
+（要求 `region->items.front()->block == head`）自然找不到它们，
+folding 被永久错过（诊断加的 `[J2G-DBG]` 输出证实两个目标都停在
+"no clean orphan group"）。用 `docs/analysis`（NaturalLoop 反向遍历
+predecessors）确认：只要一个 handler 能在不离开循环的前提下走到回边
+latch，它就会被算作贡献者，即便它自己并不闭合那条回边——这正是
+`0x1224c8`/`0x11efc0` 的形状：各自单独 `goto` 到循环内部某个由另一个
+handler 拥有的合并点。
+
+**方案**：`Structurizer::run()` 里 `expandUniqueCaseGotos` 改成跑**两遍**——
+一遍在 `collapseLabeledNaturalLoops` **之前**（此时候选 remnant 仍是各自
+独立的顶层分组，能在 J2f 把它们拼进循环体、抹掉分组边界之前先按
+`switch` case 的唯一引用折叠掉），一遍在其后（保留原有的、专门补
+J2f 完全没碰到的顶层 remnant 的第二次机会）。两遍共用同一份实现，
+不新增任何状态或开关：折叠只挪动（`cloneStmt`+`consumed` 剔除），不
+复制，所以顺序对折叠本身是安全的；J2f 自身不变——`contributing` 集合
+在所有成员都已被第一遍折叠进 header 分组自己的 `switch` 时会退化成
+空集，但 `collapseLabeledNaturalLoops` 仍然无条件把该 `switch` 包进
+`while (true)` 并对它（递归进已折叠的 `caseBodies`）跑
+`continueAtBackEdges`，回边不会因为提前折叠而丢失结构。
+
+**测试**：`test_structure_unique_goto_expand.cpp` 新增一例——两个 case
+各自因共享 `merge` 的 `regionClosed` 冲突失败 claim（同 §6.8 正例的
+构造手法），但 `merge` 自己再跳回 dispatcher 形成回边，使
+`loopByHeader_` 里出现以 dispatcher 为 header、成员覆盖两个 handler
+的自然循环——断言两个 case 都被折叠（不再是裸 `goto`）、循环仍然
+以 `while (true)` 形式存在且包着同一个 `switch`、且树里已没有任何裸
+`goto dispatcher`（而是转成了 `continue`），直接复现并锁定这次修复。
+
+**验收**（`sample_libscplugin`，实测）：goto **326→289**，行数
+**6572→6498**；switch（234）/`while(true)`（49）均不变，证明补折叠没有
+影响任何一个已识别的自然循环。`xdec_tests.exe` **641** test cases 全过
+（较 §6.8 新增 1 例、18 条断言）；L0 98/98、L1 5/5 零回归。
+
+> 排查中曾观察到 `sample_libscplugin`（102 round、664 extra entries 的
+> 真实大样本）在 driver 的 SSA 校验阶段（`il::verify`）有**极低概率**
+> （多批复测约 2/24）随机 `SIGSEGV`；栈回溯落在 `Manager::run` 之前的
+> IL 构建/校验路径，Structurizer 尚未被调用，且改动前的基线在同等规模
+> 复测（16 次）里同样为 0 次崩溃——不足以证明与本改动无关，但已确认
+> 崩溃帧完全在本次改动的调用路径之外。记为已知、极稀有、与本项无直接
+> 因果关系的 flaky 项，留待单独复现/修复，不阻塞本次改进落地。
 
 ---
 

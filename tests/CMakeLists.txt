@@ -51,7 +51,9 @@ add_executable(xdec_tests
   emit/test_structure.cpp
   emit/test_structure_dispatch_region.cpp
   emit/test_structure_join_epilogue.cpp
+  emit/test_structure_skip_goto.cpp
   emit/test_structure_labeled_loop.cpp
+  emit/test_structure_unique_goto_expand.cpp
   emit/test_structure_region_switch.cpp
   emit/test_c_printer.cpp
   emit/test_c_atomic.cpp

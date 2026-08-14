@@ -1407,9 +1407,10 @@ TEST_CASE("kRegionPatterns reserves J2's region-switch slot ahead of its own "
           "[emit][structure]") {
   // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): frozen
   // now, so a later reorder/rename cannot silently drift from what this
-  // table (and StructureOptions::regionStructuring's own comment) claim --
-  // same discipline as kCondBranchPatterns above, for a table with exactly
-  // one entry so far because there is exactly one region-level pass planned.
+  // table claims -- same discipline as kCondBranchPatterns above, for a
+  // table with exactly one entry so far because there is exactly one
+  // region-level pass planned (Structurizer::collapseRegionDispatchTree,
+  // run unconditionally).
   using xdec::emit::kRegionPatterns;
   REQUIRE(kRegionPatterns.size() == 1);
   CHECK(kRegionPatterns[0].name == "region-switch");

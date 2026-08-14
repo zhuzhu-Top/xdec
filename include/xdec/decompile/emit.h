@@ -108,11 +108,9 @@ struct DecompileToCOptions {
   emit::COptions emit;
   /// See emit::StructureOptions. `minRegionSites`/`deferRegionCollapse`'s own
   /// defaults already drive J1's collapse-defer gate through every caller of
-  /// decompileToC(); `regionStructuring` (see its own comment, and J2 --
-  /// docs/architecture-optimization-eval-prompt.md §3 Phase 3) is the one
-  /// field here a caller might actually want to flip, since flipping it is
-  /// the only way to observe collapseRegionDispatchTree's effect outside a
-  /// unit test.
+  /// decompileToC(); `deferRegionCollapse` is a test/diagnostic-only
+  /// override (see its own comment), never set on decompileToC()'s own
+  /// default path.
   emit::StructureOptions structure;
   /// Platform hints for typed-variable recovery's import-slot aliasing (see
   /// analysis::TypedVariables::recover's `profile` parameter). Absent skips

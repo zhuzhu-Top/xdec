@@ -275,4 +275,8 @@ Result<std::unique_ptr<BinaryImage>> openBinary(const std::filesystem::path& pat
 /// synthesise images in memory.
 Result<std::unique_ptr<BinaryImage>> loadElf(FileBuffer file, std::string path);
 
+/// Loads a little-endian 64-bit Mach-O image from an already-read buffer.
+/// Exposed for tests that synthesise images in memory.
+Result<std::unique_ptr<BinaryImage>> loadMachO(FileBuffer file, std::string path);
+
 }  // namespace xdec::binary

@@ -487,7 +487,7 @@ Result<std::string> decompileFunction(
 
 ### 8.2 迁移机制
 
-- **Feature flag**：`DecompileToCOptions::regionStructuring = false` 默认；L2 观测开 true
+- **Feature flag**：`DecompileToCOptions::regionStructuring = false` 默认；L2 观测开 true（后续「结构化优化默认开启」改动已移除该字段，J2 现在无条件运行，见 docs/19、eval/FINDINGS.md）
 - **Golden**：`eval/` 签名不变；`samples/` manifest 阈值 **只升不降** 除非用户 `-UpdateBaseline`
 - **诊断**：`--emit-report` 增 `region-switch: absorbed N sites` 行
 - **回滚**：J2 独立 `.cpp`，可 CMake option 禁用

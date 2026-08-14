@@ -48,6 +48,23 @@ struct Fixture {
     return function.select(cond, i64(replacement), inner);
   }
 
+  /// An offset-table dispatch site at `dispatch`: `brind anchor +
+  /// sext(load32(tableBase + (index << 2)))`, resolved to `targets`. The
+  /// anchor is the site's own, which is what makes this shape worth its own
+  /// helper: two sites reading one table rarely share one.
+  void offsetDispatchSite(BlockId dispatch, uint64_t tableBase, uint64_t anchor, ExprId index,
+                          const std::vector<BlockId>& targets) {
+    const uint64_t va = function.block(dispatch).va;
+    const ExprId address =
+        function.binary(ExprOp::Add, i64(tableBase), function.binary(ExprOp::Shl, index, i64(2)));
+    const ExprId loaded =
+        function.valueRef(function.appendLoad(dispatch, va, Type::integer(32), address));
+    const ExprId target = function.binary(ExprOp::Add, i64(anchor),
+                                          function.cast(ExprOp::SExt, Type::integer(64), loaded));
+    const il::OpId brind = function.appendIndirectBranch(dispatch, va, target);
+    function.setTargets(brind, targets);
+  }
+
   /// A pointer-table dispatch site at `dispatch`: `brind load(tableBase +
   /// (index << 3))`, resolved to `targets`.
   void dispatchSite(BlockId dispatch, uint64_t tableBase, ExprId index,
@@ -163,6 +180,51 @@ TEST_CASE("three unrelated two-way sites reading the same table and clamp form o
   REQUIRE(site.caseValues.size() == 2);
   CHECK(site.caseValues[0] == 0xb6);
   CHECK(site.caseValues[1] == 0x2a2);
+}
+
+TEST_CASE("offset-table sites anchored at themselves are still one region",
+          "[analysis][dispatch-region]") {
+  // The shape a scatter dispatcher takes when its table holds offsets rather
+  // than pointers: every site adds the entry to its own address, so no two
+  // anchors agree. Filing each one as a region of its own would be reading
+  // "where this site sits" as "which table it reads", and would leave the
+  // pooled evidence findDispatchJoins works from with a single site per pool
+  // -- nothing to pool.
+  Fixture f;
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId h1a = f.block(0x3000);
+  const BlockId h1b = f.block(0x3010);
+  const BlockId h2a = f.block(0x3100);
+  const BlockId h2b = f.block(0x3110);
+
+  f.offsetDispatchSite(d1, 0x1e70a0, 0x2000, f.entryReg("x0"), {h1a, h1b});
+  f.offsetDispatchSite(d2, 0x1e70a0, 0x2100, f.entryReg("x1"), {h2a, h2b});
+  f.function.rebuildEdges();
+
+  const auto regions = findDispatchRegions(f.function);
+  REQUIRE(regions.size() == 1);
+  CHECK(regions.front().tableBase == 0x1e70a0);
+  CHECK(regions.front().sites.size() == 2);
+}
+
+TEST_CASE("sites reading different tables stay different regions",
+          "[analysis][dispatch-region]") {
+  // The other half of the rule above: dropping the anchor from the region's
+  // identity must not go so far as to pool sites that read different memory.
+  Fixture f;
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId h1a = f.block(0x3000);
+  const BlockId h1b = f.block(0x3010);
+  const BlockId h2a = f.block(0x3100);
+  const BlockId h2b = f.block(0x3110);
+
+  f.offsetDispatchSite(d1, 0x1e70a0, 0x2000, f.entryReg("x0"), {h1a, h1b});
+  f.offsetDispatchSite(d2, 0x1e8000, 0x2100, f.entryReg("x1"), {h2a, h2b});
+  f.function.rebuildEdges();
+
+  CHECK(findDispatchRegions(f.function).size() == 2);
 }
 
 TEST_CASE("a region's pooled targets can still vote a shared tail across many small sites",
@@ -437,6 +499,97 @@ TEST_CASE("findDispatchJoins declines a hub with a predecessor outside the regio
   const auto regions = findDispatchRegions(f.function);
   REQUIRE(regions.size() == 1);
   CHECK(findDispatchJoins(f.function, regions.front()).empty());
+}
+
+TEST_CASE("buildDispatchNestGraph chains three sites whose handlers re-enter the same table",
+          "[analysis][dispatch-region][dispatch-nest]") {
+  // docs/19-scatter-dispatch-target-shape.md's own reference shape: each
+  // site's "keep dispatching" arm runs a short handler (here just a plain
+  // branch, standing in for the couple of MBA ops a real one has) that
+  // lands squarely on the next site's own dispatch block -- d1 -> d2 -> d3,
+  // one root, depth 2, both d2 and d3 counted as nested.
+  Fixture f;
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId d3 = f.block(0x2200);
+  const BlockId leaf1 = f.block(0x3000);
+  const BlockId chain1 = f.block(0x3010);
+  const BlockId leaf2 = f.block(0x3100);
+  const BlockId chain2 = f.block(0x3110);
+  const BlockId leaf3a = f.block(0x3200);
+  const BlockId leaf3b = f.block(0x3210);
+
+  const ExprId b1 = f.function.select(f.function.binary(ExprOp::CmpNe, f.entryReg("x0"), f.i64(0)),
+                                      f.i64(0x2a2), f.i64(0xb6));
+  const ExprId b2 = f.function.select(f.function.binary(ExprOp::CmpNe, f.entryReg("x1"), f.i64(0)),
+                                      f.i64(0x69), f.i64(0x1cf));
+  const ExprId b3 = f.function.select(f.function.binary(ExprOp::CmpNe, f.entryReg("x2"), f.i64(0)),
+                                      f.i64(0x213), f.i64(0x1));
+
+  f.dispatchSite(d1, 0x1e70a0, f.clampedIndex(b1, 0x2cc, 0x213), {leaf1, chain1});
+  f.dispatchSite(d2, 0x1e70a0, f.clampedIndex(b2, 0x2cc, 0x213), {leaf2, chain2});
+  f.dispatchSite(d3, 0x1e70a0, f.clampedIndex(b3, 0x2cc, 0x213), {leaf3a, leaf3b});
+  f.function.appendReturn(leaf1, f.function.block(leaf1).va);
+  f.function.appendBranch(chain1, f.function.block(chain1).va, d2);
+  f.function.appendReturn(leaf2, f.function.block(leaf2).va);
+  f.function.appendBranch(chain2, f.function.block(chain2).va, d3);
+  f.function.appendReturn(leaf3a, f.function.block(leaf3a).va);
+  f.function.appendReturn(leaf3b, f.function.block(leaf3b).va);
+  f.function.rebuildEdges();
+
+  const auto regions = findDispatchRegions(f.function);
+  REQUIRE(regions.size() == 1);
+  CHECK_FALSE(regions.front().sharedTail.has_value());
+
+  const auto nest = xdec::analysis::buildDispatchNestGraph(f.function, regions.front());
+  REQUIRE(nest.roots.size() == 1);
+  CHECK(nest.roots.front() == d1);
+  CHECK(nest.maxDepth == 2);
+  CHECK(nest.nestedSiteCount == 2);
+  const auto d1Children = nest.children.find(d1);
+  REQUIRE(d1Children != nest.children.end());
+  REQUIRE(d1Children->second.size() == 1);
+  CHECK(d1Children->second.front() == d2);
+  const auto d2Children = nest.children.find(d2);
+  REQUIRE(d2Children != nest.children.end());
+  REQUIRE(d2Children->second.size() == 1);
+  CHECK(d2Children->second.front() == d3);
+  CHECK_FALSE(nest.children.contains(d3));
+}
+
+TEST_CASE("buildDispatchNestGraph reports every site as its own root when none re-enter the table",
+          "[analysis][dispatch-region][dispatch-nest]") {
+  Fixture f;
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId h1a = f.block(0x3000);
+  const BlockId h1b = f.block(0x3010);
+  const BlockId h2a = f.block(0x3100);
+  const BlockId h2b = f.block(0x3110);
+
+  const ExprId b1 = f.function.select(f.function.binary(ExprOp::CmpNe, f.entryReg("x0"), f.i64(0)),
+                                      f.i64(0x2a2), f.i64(0xb6));
+  const ExprId b2 = f.function.select(f.function.binary(ExprOp::CmpNe, f.entryReg("x1"), f.i64(0)),
+                                      f.i64(0x69), f.i64(0x1cf));
+
+  f.dispatchSite(d1, 0x1e70a0, f.clampedIndex(b1, 0x2cc, 0x213), {h1a, h1b});
+  f.dispatchSite(d2, 0x1e70a0, f.clampedIndex(b2, 0x2cc, 0x213), {h2a, h2b});
+  f.function.appendReturn(h1a, f.function.block(h1a).va);
+  f.function.appendReturn(h1b, f.function.block(h1b).va);
+  f.function.appendReturn(h2a, f.function.block(h2a).va);
+  f.function.appendReturn(h2b, f.function.block(h2b).va);
+  f.function.rebuildEdges();
+
+  const auto regions = findDispatchRegions(f.function);
+  REQUIRE(regions.size() == 1);
+
+  const auto nest = xdec::analysis::buildDispatchNestGraph(f.function, regions.front());
+  CHECK(nest.children.empty());
+  CHECK(nest.maxDepth == 0);
+  CHECK(nest.nestedSiteCount == 0);
+  REQUIRE(nest.roots.size() == 2);
+  CHECK(std::find(nest.roots.begin(), nest.roots.end(), d1) != nest.roots.end());
+  CHECK(std::find(nest.roots.begin(), nest.roots.end(), d2) != nest.roots.end());
 }
 
 TEST_CASE("findDispatchJoins does not count a single feeding tail as a join",

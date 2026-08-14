@@ -70,6 +70,20 @@ StructuredFunction run(Function& function, const StructureOptions& options = {})
   return xdec::testing::structureFunction(function, options);
 }
 
+/// The first Switch in the tree, so a test can inspect what switchFor
+/// attached to it rather than only which statement kinds came out.
+const Stmt* firstSwitch(const std::unique_ptr<Stmt>& stmt) {
+  if (stmt->kind == StmtKind::Switch) {
+    return stmt.get();
+  }
+  for (const auto& item : stmt->items) {
+    if (const Stmt* found = firstSwitch(item)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
 /// Flattens the structured tree into its statement kinds and the Block
 /// statements it visits, same walker test_structure_dispatch_region.cpp
 /// already uses.
@@ -151,6 +165,56 @@ TEST_CASE("three deferred region sites whose private tails all fall into "
   CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), tail2) == 1);
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 2);
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Break) == 1);
+}
+
+TEST_CASE("a join hub that relays a register to the block below it carries a frame",
+          "[emit][structure][join-epilogue]") {
+  // The same three-tail join, except `hub` falls through to `landing` instead
+  // of returning, and both of them merge x5 -- the two-phi relay
+  // analysis::LiveRegisterFrame recognises. A voted dispatcher shape gets its
+  // frame from its own `hub`; this one has no such block of its own, and the
+  // block below the pooled hub is it.
+  Fixture f;
+  const BlockId site1 = f.block(0x8000);
+  const BlockId site2 = f.block(0x8100);
+  const BlockId tail0 = f.block(0x9000);
+  const BlockId tail1 = f.block(0x9010);
+  const BlockId tail2 = f.block(0x9020);
+  const BlockId hub = f.block(0xa000);
+  const BlockId landing = f.block(0xa100);
+  const BlockId afterLast = f.block(0xb000);
+  constexpr uint64_t tableBase = 0x30b7f0;
+
+  f.twoWaySite(f.entry, tableBase, 0x10, 0x20, tail0, site1);
+  f.twoWaySite(site1, tableBase, 0x30, 0x40, tail1, site2);
+  f.twoWaySite(site2, tableBase, 0x50, 0x60, tail2, afterLast);
+  f.function.appendBranch(tail0, 0x9000, hub);
+  f.function.appendBranch(tail1, 0x9010, hub);
+  f.function.appendBranch(tail2, 0x9020, hub);
+
+  const ExprId fromEntry = f.function.entryReg(f.function.registers().find("x5"));
+  const ExprId incoming[] = {fromEntry, fromEntry, fromEntry};
+  const il::OpId hubPhi = f.function.appendPhi(hub, 0xa000, Type::integer(64), incoming);
+  f.function.annotate(hubPhi, "reg:x5");
+  f.function.appendBranch(hub, 0xa000, landing);
+  const ExprId landingIncoming[] = {f.function.valueRef(f.function.op(hubPhi).result)};
+  const il::OpId landingPhi =
+      f.function.appendPhi(landing, 0xa100, Type::integer(64), landingIncoming);
+  f.function.annotate(landingPhi, "reg:x5");
+  f.function.appendReturn(landing, 0xa100);
+  f.function.appendReturn(afterLast, 0xb000);
+  f.function.rebuildEdges();
+
+  StructureOptions options;
+  options.deferRegionCollapse = true;
+  const StructuredFunction result = run(f.function, options);
+  const Stmt* claimed = firstSwitch(result.root);
+  REQUIRE(claimed != nullptr);
+  REQUIRE(claimed->mergeBlock == hub);
+  REQUIRE(claimed->frame.has_value());
+  REQUIRE(claimed->frame->slots.size() == 1);
+  CHECK(claimed->frame->slots.front().shadowPhiAtMerge == hubPhi);
+  CHECK(claimed->frame->slots.front().livePhiAtHub == landingPhi);
 }
 
 TEST_CASE("a hub with a fourth, non-region predecessor is left to goto "

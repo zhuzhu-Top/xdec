@@ -545,7 +545,12 @@ VariableTable VariableTable::recover(const il::Function& function,
     table.locals_.push_back(std::move(var));
   }
 
-  // Temps: one per phi, in block order.
+  // Temps: one per phi, in block order. A scatter dispatcher's own state lives
+  // in registers rather than the slot promoted above, and naming those phis
+  // `state` too was tried and dropped -- see eval/FINDINGS.md's 2026-08-13
+  // note for the measurements: nothing in this corpus keeps a scatter region's
+  // state in one register a reader could follow, so every rule that named
+  // something named the wrong thing.
   uint32_t ordinal = 0;
   for (const il::OpId opId : scan.phis_) {
     const il::Op& op = function.op(opId);

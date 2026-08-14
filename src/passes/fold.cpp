@@ -1,6 +1,7 @@
 // Constant folding and lazy-flag condition folding (see transform.h).
 #include "transform.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -262,9 +263,27 @@ class FlagPhiDistributor {
     const il::OpId phiOp = info.definition;
     const std::vector<il::ExprId> incoming(function_.operands(function_.op(phiOp)).begin(),
                                            function_.operands(function_.op(phiOp)).end());
-    // Cached before recursing: a loop-carried flags phi's back edge names
-    // this same value, and that edge must find this phi here rather than
-    // recurse into building it again.
+    // A loop-carried flags phi's back edge names this same value: nothing
+    // upstream can resolve it without re-executing the loop, so that edge's
+    // arm could only ever be an honest FlagCond over `flags` again -- the
+    // exact expression this call exists to replace. A phi built around one
+    // arm that is just its own trigger restated is not distributing
+    // anything; it is relabelling the original FlagCond. And unlike the memo
+    // above (scoped to this one call), nothing about that relabelling
+    // survives to the *next* ssa-optimize iteration -- a fresh
+    // FlagPhiDistributor, its cache empty, meets the same unresolved
+    // FlagCond (now one arm of the phi this call is about to build) and
+    // builds another phi around it, forever: the fixed +1 phi and its whole
+    // operand list per iteration this comment exists to stop. Refusing
+    // before any phi is created is what leaves the original FlagCond alone
+    // -- and alone, unlike its ever-lengthening replacement, it is already a
+    // fixpoint.
+    if (std::find(incoming.begin(), incoming.end(), flags) != incoming.end()) {
+      return il::ExprId{};
+    }
+    // Cached before recursing: a merge of merges can reach the same (phi,
+    // code) pair by more than one path, and a second arrival must find this
+    // phi here rather than recurse into building it again.
     const il::ValueId newPhi =
         function_.prependPhi(info.block, function_.op(phiOp).va, il::Type::integer(1));
     cache_.emplace(key, newPhi);
@@ -272,11 +291,13 @@ class FlagPhiDistributor {
     std::vector<il::ExprId> rewritten;
     rewritten.reserve(incoming.size());
     for (const il::ExprId in : incoming) {
-      il::ExprId arm = (in == flags) ? il::ExprId{} : resolveRec(in, code, depth + 1);
-      if (!arm.valid()) {
-        arm = function_.flagCondition(in, code);
-      }
-      rewritten.push_back(arm);
+      // Not a direct self-reference (ruled out above already) but still
+      // unresolvable on its own terms -- a load, a call result, a flags
+      // value from a register this rewrite does not track, or a deeper
+      // phi with its own loop-carried edge. That costs only this one arm
+      // its own honest FlagCond, not every other arm the phi merges.
+      const il::ExprId arm = resolveRec(in, code, depth + 1);
+      rewritten.push_back(arm.valid() ? arm : function_.flagCondition(in, code));
     }
     function_.setOperands(function_.value(newPhi).definition, rewritten);
     return function_.valueRef(newPhi);

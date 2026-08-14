@@ -122,6 +122,9 @@ bool Structurizer::continueAtBackEdges(Stmt* node, il::BlockId header) {
   }
   found |= continueAtBackEdges(node->thenArm.get(), header);
   found |= continueAtBackEdges(node->elseArm.get(), header);
+  // J2e-if: an `If`'s own epilogue (see switchFor's 2-way collapse) is
+  // exactly as capable of holding a back edge as a Switch's epilogue is.
+  found |= continueAtBackEdges(node->epilogue.get(), header);
   return found;
 }
 

@@ -1,13 +1,15 @@
 // J1 (docs/18-architecture-optimization-plan.md §5.2): switchFor's two-way
 // table dispatch collapse is right for an isolated site, but wrong for one
-// of many sites all reading through the same physical table (see
-// analysis::DispatchRegion) -- collapsing every one away loses the table
-// identity tying them together. These tests exercise the collapse-defer
-// gate (StructureOptions::minRegionSites/deferRegionCollapse) directly: a
-// region large enough keeps table-mode switches, a region too small (or no
-// region at all) collapses exactly as before, and the two ways of reaching
-// "defer" -- an organically large region, and the diagnostic override --
-// each work on their own.
+// of many sites all reading through the same physical table and converging
+// on a shared tail (see analysis::DispatchRegion) -- collapsing that one
+// away loses the table identity tying it to the rest of the flattened state
+// machine. These tests exercise the collapse-defer gate (StructureOptions::
+// minRegionSites/deferRegionCollapse) directly: a region large enough *and*
+// voting a sharedTail keeps table-mode switches, a region too small (or one
+// with no sharedTail at all -- the scatter shape, docs/19-scatter-dispatch-
+// target-shape.md) collapses to nested if/else-if, and the two ways of
+// reaching "defer" -- an organically large sharedTail region, and the
+// diagnostic override -- each work on their own.
 #include <catch2/catch_test_macros.hpp>
 
 #include <vector>
@@ -167,11 +169,20 @@ TEST_CASE("a chained two-way table dispatch region below the collapse-defer "
 }
 
 TEST_CASE("a chained two-way table dispatch region at or above the "
-          "collapse-defer floor keeps table-mode switches instead",
+          "collapse-defer floor still recovers a nested if/else-if chain "
+          "when it has no shared tail",
           "[emit][structure][dispatch-region]") {
-  // 8 sites organically crosses the default floor with no diagnostic
-  // override at all -- the real production gate (StructureOptions::
-  // minRegionSites), not just the test-only deferRegionCollapse switch.
+  // docs/19-scatter-dispatch-target-shape.md: 8 sites organically crosses
+  // the default floor (StructureOptions::minRegionSites) with no diagnostic
+  // override at all, but each site's "smaller" arm is a private leaf and
+  // "larger" chains to the next site -- the region votes no
+  // analysis::DispatchRegion::sharedTail at all, which is the scatter
+  // shape, not the flattened N-way state machine a table-mode switch's own
+  // hub/epilogue machinery has anything to offer. The region-membership
+  // defer only ever protects a region that *does* vote a sharedTail (see
+  // the sibling test below), so this collapses to `if`/`else` exactly as an
+  // isolated site would, and the chain recurses into one nested
+  // if/else-if tree rather than 8 separate table-mode switches.
   Fixture f;
   const BlockId tail = f.block(0x9100);
   f.chainedTwoWaySites(f.entry, 8, 0x30b7f0, tail);
@@ -181,32 +192,62 @@ TEST_CASE("a chained two-way table dispatch region at or above the "
   const StructuredFunction result = run(f.function);
   Walk walk;
   walk.visit(result.root);
-  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 0);
-  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 8);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 8);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
-  for (const Stmt* switchStmt : allSwitches(result.root.get())) {
-    CHECK(switchStmt->tableMode);
-    REQUIRE(switchStmt->caseValues.size() == 2);
-  }
 }
 
-TEST_CASE("lowering minRegionSites defers a small region's sites while an "
-          "isolated site through a different table still collapses",
+TEST_CASE("lowering minRegionSites defers a small shared-tail region's "
+          "sites while an isolated site through a different table still "
+          "collapses",
           "[emit][structure][dispatch-region]") {
   // Two independent clusters in one function: a 3-site region through
-  // tableBase A (deferred once the floor is lowered to 3) and one isolated
-  // site through a wholly different tableBase B (its own 1-site region,
-  // still well under the lowered floor). Selectivity, not a blanket switch:
-  // membership plus size is what the gate actually reads, not merely
-  // whether *some* region exists in the function.
+  // tableBase A whose handlers all pool into one shared tail (deferred once
+  // the floor is lowered to 3 -- the region-membership defer only ever
+  // protects a region that votes a sharedTail, so this one needs both
+  // conditions at once, same shape as "a region that voted a shared tail
+  // still defers..." above) and one isolated site through a wholly
+  // different tableBase B (its own 1-site region, nowhere near even the
+  // lowered floor, and with no sharedTail possible at all below
+  // matchRegionSharedTail's own 3-pooled-target floor). Selectivity, not a
+  // blanket switch: membership, size, and sharedTail together are what the
+  // gate actually reads, not merely whether *some* region exists in the
+  // function.
   Fixture f;
-  const BlockId isolatedDispatch = f.block(0x7000);
-  f.chainedTwoWaySites(f.entry, 3, 0x30b7f0, isolatedDispatch);
   const BlockId isolatedSmaller = f.block(0xa000);
-  const BlockId isolatedLarger = f.block(0xa100);
-  f.twoWaySite(isolatedDispatch, 0x2a2428, 0x10, 0x20, isolatedSmaller, isolatedLarger);
+  const BlockId regionRoot = f.block(0x1100);
+  const BlockId skip1 = f.block(0x1200);
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId d3 = f.block(0x2200);
+  std::vector<BlockId> handlers;
+  for (int i = 0; i < 6; ++i) {
+    handlers.push_back(f.block(0x3000 + 0x10 * static_cast<uint64_t>(i)));
+  }
+  const BlockId merge = f.block(0x4000);
+  const BlockId hub = f.block(0x5000);
+
+  // The isolated tableBase-B site: its "smaller" arm is a private leaf,
+  // "larger" falls straight into the tableBase-A region's own if-chain
+  // fan-out below.
+  f.twoWaySite(f.entry, 0x2a2428, 0x10, 0x20, isolatedSmaller, regionRoot);
   f.function.appendReturn(isolatedSmaller, 0xa000);
-  f.function.appendReturn(isolatedLarger, 0xa100);
+
+  const ExprId selectorA = f.function.binary(
+      ExprOp::CmpNe, f.function.entryReg(f.function.registers().find("x0")), f.i64(0));
+  const ExprId selectorB = f.function.binary(
+      ExprOp::CmpNe, f.function.entryReg(f.function.registers().find("x1")), f.i64(0));
+  f.function.appendCondBranch(regionRoot, 0x1100, selectorA, d1, skip1);
+  f.function.appendCondBranch(skip1, 0x1200, selectorB, d2, d3);
+
+  f.twoWaySite(d1, 0x30b7f0, 0x10, 0x20, handlers[0], handlers[1]);
+  f.twoWaySite(d2, 0x30b7f0, 0x30, 0x40, handlers[2], handlers[3]);
+  f.twoWaySite(d3, 0x30b7f0, 0x50, 0x60, handlers[4], handlers[5]);
+  for (const BlockId handler : handlers) {
+    f.function.appendBranch(handler, f.function.block(handler).va, merge);
+  }
+  f.function.appendBranch(merge, f.function.block(merge).va, hub);
+  f.function.appendReturn(hub, f.function.block(hub).va);
   f.function.rebuildEdges();
 
   StructureOptions options;
@@ -214,13 +255,14 @@ TEST_CASE("lowering minRegionSites defers a small region's sites while an "
   const StructuredFunction result = run(f.function, options);
   Walk walk;
   walk.visit(result.root);
-  // The 3-site region (tableBase A) is at the lowered floor: its sites keep
-  // their table-mode switches.
+  // The 3-site region (tableBase A) votes a sharedTail and is at the
+  // lowered floor: its sites keep their table-mode switches.
   CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 3);
   // The isolated site (tableBase B, region size 1) is nowhere near the
-  // lowered floor either: it still collapses to a plain if/else.
-  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 1);
-  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  // lowered floor, and could not vote a sharedTail regardless: it still
+  // collapses to a plain if/else, same as regionRoot's and skip1's own
+  // ordinary (non-table) if-chain.
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 3);
   bool foundIsolatedIf = false;
   std::vector<const Stmt*> stack{result.root.get()};
   while (!stack.empty()) {
@@ -230,8 +272,7 @@ TEST_CASE("lowering minRegionSites defers a small region's sites while an "
       Walk ifWalk;
       if (stmt->thenArm) ifWalk.visit(stmt->thenArm);
       if (stmt->elseArm) ifWalk.visit(stmt->elseArm);
-      if (std::count(ifWalk.blocks.begin(), ifWalk.blocks.end(), isolatedSmaller) == 1 ||
-          std::count(ifWalk.blocks.begin(), ifWalk.blocks.end(), isolatedLarger) == 1) {
+      if (std::count(ifWalk.blocks.begin(), ifWalk.blocks.end(), isolatedSmaller) == 1) {
         foundIsolatedIf = true;
       }
     }
@@ -284,19 +325,23 @@ TEST_CASE("a handler two deferred region sites both fall into is cloned into "
   CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), sharedHandler) == 2);
 }
 
-TEST_CASE("an organically large region still clones a handler two of its "
-          "own non-adjacent sites share",
+TEST_CASE("an organically large scatter region still clones a handler two "
+          "of its own non-adjacent sites share",
           "[emit][structure][dispatch-region]") {
-  // Same shape as above, but reached through minRegionSites alone (no
-  // deferRegionCollapse override), with 8 chained sites (site indices 0..7)
-  // so the region organically crosses the default floor, and the two
-  // sharing sites (2 and 5) two apart in the chain rather than adjacent --
-  // confirms the clone fallback fires regardless of which two of a
-  // region's many sites happen to share a handler, not just a hand-picked
-  // pair at the start. Built by hand rather than through
-  // Fixture::chainedTwoWaySites, which only hands back the region's first
-  // (entry) dispatch block -- this needs every site's own BlockId to
-  // retarget two of them at the same shared handler.
+  // Same clone fallback as the deferred-region test above, but with 8
+  // chained sites (site indices 0..7) -- well above minRegionSites -- and
+  // the two sharing sites (2 and 5) two apart in the chain rather than
+  // adjacent -- confirms the clone fallback fires regardless of which two
+  // of a region's many sites happen to share a handler, not just a
+  // hand-picked pair at the start. This region has no sharedTail (each
+  // non-sharing site's "smaller" arm is its own private leaf), so by
+  // default every site still collapses to if/else, not table-mode
+  // switches -- the clone has to fire from the if/else path's own
+  // claimOrCloneSharedCaseBody call, not switchFor's table-mode case loop.
+  // Built by hand rather than through Fixture::chainedTwoWaySites, which
+  // only hands back the region's first (entry) dispatch block -- this needs
+  // every site's own BlockId to retarget two of them at the same shared
+  // handler.
   Fixture f;
   constexpr std::size_t kCount = 8;
   constexpr uint64_t tableBase = 0x30b7f0;
@@ -330,7 +375,8 @@ TEST_CASE("an organically large region still clones a handler two of its "
   const StructuredFunction result = run(f.function);
   Walk walk;
   walk.visit(result.root);
-  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 8);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 8);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
   CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), sharedHandler) == 2);
 }
 
@@ -377,6 +423,88 @@ TEST_CASE("a handler shared with a non-table predecessor still falls back "
   // The handler itself still prints exactly once, under its own label, for
   // every predecessor (both switches and `extra`) to reach through a goto.
   CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), sharedHandler) == 1);
+}
+
+TEST_CASE("a region that voted a shared tail still defers to table-mode "
+          "switches",
+          "[emit][structure][dispatch-region]") {
+  // The positive twin of the scatter-shape test above: three sites reached
+  // from entry through an ordinary (non-table) if-chain -- not through each
+  // other's own dispatch arms -- so none of them chains into another site,
+  // yet their pooled targets all converge on one shared epilogue (see the
+  // analysis-level "region's pooled targets can still vote a shared tail"
+  // test this mirrors). That is the real flattened-dispatcher shape
+  // switchFor's table-mode printing still earns its keep for, so the
+  // region-membership defer must still hold for it.
+  Fixture f;
+  const BlockId skip1 = f.block(0x1100);
+  const BlockId d1 = f.block(0x2000);
+  const BlockId d2 = f.block(0x2100);
+  const BlockId d3 = f.block(0x2200);
+  std::vector<BlockId> handlers;
+  for (int i = 0; i < 6; ++i) {
+    handlers.push_back(f.block(0x3000 + 0x10 * static_cast<uint64_t>(i)));
+  }
+  const BlockId merge = f.block(0x4000);
+  const BlockId hub = f.block(0x5000);
+
+  const ExprId selectorA = f.function.binary(
+      ExprOp::CmpNe, f.function.entryReg(f.function.registers().find("x0")), f.i64(0));
+  const ExprId selectorB = f.function.binary(
+      ExprOp::CmpNe, f.function.entryReg(f.function.registers().find("x1")), f.i64(0));
+  f.function.appendCondBranch(f.entry, 0x1000, selectorA, d1, skip1);
+  f.function.appendCondBranch(skip1, 0x1100, selectorB, d2, d3);
+
+  f.twoWaySite(d1, 0x30b7f0, 0x10, 0x20, handlers[0], handlers[1]);
+  f.twoWaySite(d2, 0x30b7f0, 0x30, 0x40, handlers[2], handlers[3]);
+  f.twoWaySite(d3, 0x30b7f0, 0x50, 0x60, handlers[4], handlers[5]);
+  for (const BlockId handler : handlers) {
+    f.function.appendBranch(handler, f.function.block(handler).va, merge);
+  }
+  f.function.appendBranch(merge, f.function.block(merge).va, hub);
+  f.function.appendReturn(hub, f.function.block(hub).va);
+  f.function.rebuildEdges();
+
+  StructureOptions options;
+  options.minRegionSites = 3;
+  const StructuredFunction result = run(f.function, options);
+  Walk walk;
+  walk.visit(result.root);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 2);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 3);
+}
+
+TEST_CASE("a sharedTail-less region's if/else collapse still inlines a "
+          "short handler shared by two chained sites instead of leaving a "
+          "goto",
+          "[emit][structure][dispatch-region]") {
+  // docs/19-scatter-dispatch-target-shape.md §2.4: a handler two of a
+  // sharedTail-less region's own sites share is exactly
+  // claimOrCloneSharedCaseBody's shape (every predecessor a resolved
+  // two-target table dispatch through this region's own table) -- already
+  // wired as the if/else collapse's own fallback (see switchFor), which by
+  // default is what a sharedTail-less region's sites always reach.
+  Fixture f;
+  const BlockId site1 = f.block(0x8000);
+  const BlockId sharedHandler = f.block(0x9000);
+  const BlockId tail = f.block(0xa000);
+  f.twoWaySite(f.entry, 0x30b7f0, 0x10, 0x20, sharedHandler, site1);
+  f.twoWaySite(site1, 0x30b7f0, 0x30, 0x40, sharedHandler, tail);
+  f.function.appendReturn(sharedHandler, 0x9000);
+  f.function.appendReturn(tail, 0xa000);
+  f.function.rebuildEdges();
+
+  StructureOptions options;
+  options.minRegionSites = 2;
+  const StructuredFunction result = run(f.function, options);
+  Walk walk;
+  walk.visit(result.root);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::If) == 2);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 0);
+  CHECK(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Goto) == 0);
+  // Cloned once per site that falls into it, not printed once behind a
+  // label reached by two gotos.
+  CHECK(std::count(walk.blocks.begin(), walk.blocks.end(), sharedHandler) == 2);
 }
 
 TEST_CASE("the deferRegionCollapse diagnostic switch defers a lone two-way "

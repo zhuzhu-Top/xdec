@@ -46,6 +46,8 @@ int usage() {
   printLine("      options: --to <maturity> --out <dir> --plugin <path>");
   printLine("  decompile <binary> <address> [...] the full pipeline: lift, resolve, emit C");
   printLine("      options: -o <file.c> --rounds <n> --no-annotate --allow-unresolved");
+  printLine("               --max-span <bytes> (drop discoveries past entry+bytes)");
+  printLine("               --discovery-cap <n> (skip branches offering more targets)");
   printLine("               --types <header|preset> (repeatable)");
   printLine("               --syscall-table <file|name|none> (default aarch64-linux)");
   printLine("               --reuse-report (count same-block subexpression duplication)");
@@ -54,8 +56,6 @@ int usage() {
   printLine("               --helpers-header <path|none> (default xdec_helpers.h)");
   printLine("               --arg-naming <indexed|reg> (default indexed: arg1, arg2, ...)");
   printLine("               --security-hints <comment|keep> (default comment)");
-  printLine("               --region-structuring (J2 diagnostic: collapse a nested dispatch");
-  printLine("                 region's tree into fewer switches; default off)");
   printLine("  exec <binary> <workload>         execute blocks against scripted states");
   printLine("  memdump <binary> <out>           dump the relocated memory view for emulators");
   printLine("  decode                           decode hex words from stdin (fuzzer iface)");

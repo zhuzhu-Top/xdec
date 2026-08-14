@@ -99,6 +99,64 @@ class Structurizer {
   /// since it keeps the header's original `BlockId`.
   void collapseLabeledNaturalLoops(std::vector<std::pair<il::BlockId, StmtPtr>>& groups);
 
+  /// J2g (docs/architecture-optimization-eval-prompt.md §6.6, "Unique Goto
+  /// Expansion"): a switch case (or default arm) `claimCaseBody`/
+  /// `claimDispatcherCaseBody` never managed to inline prints as a bare
+  /// `goto` to its handler, which then keeps its own separate top-level
+  /// `groups` entry and label purely to hold the handful of lines that
+  /// `goto` was always going to run next. When that entry is otherwise
+  /// unreferenced anywhere in the finished tree -- the switch slot really is
+  /// the only place left naming it -- there is nothing for the label to
+  /// serve, so the entry folds whole into the case body and disappears
+  /// instead. Mutates `groups` in place, exactly as collapseLabeledNaturalLoops
+  /// does, erasing every entry this absorbs.
+  ///
+  /// Structurizer::run calls this twice around collapseLabeledNaturalLoops
+  /// (docs/architecture-optimization-eval-prompt.md §6.8.1): once before, so
+  /// a remnant that is also a natural loop's own contributing member folds
+  /// into its one switch case while it is still its own top-level entry --
+  /// collapseLabeledNaturalLoops would otherwise splice it whole into the
+  /// loop body's own Sequence first, at which point its top-level entry (and
+  /// the only thing this pass' own orphan index keys on) is gone and no later
+  /// pass can single it back out -- and once after, to catch whatever never
+  /// belonged to any loop and so collapseLabeledNaturalLoops left standing on
+  /// its own. Safe to run before a loop has claimed its own back edges as
+  /// `continue`: a fold that inlines a plain `goto` back to the loop header
+  /// leaves it exactly that, a `Goto` node, for collapseLabeledNaturalLoops'
+  /// own continueAtBackEdges to still find and flip once it wraps that
+  /// header's switch, wherever the fold has since buried it.
+  void expandUniqueCaseGotos(std::vector<std::pair<il::BlockId, StmtPtr>>& groups);
+
+  /// Phase 4 (goto-elimination plan §"J2f 扩展"): `wrapAsLoop`'s own
+  /// `while (true)` sometimes wraps nothing but a single guard --
+  /// `if (cond) { continue; } else { WORK }`, Phase 0's scatter collapse
+  /// having turned what would have been the loop's own `CondBranch`
+  /// terminator into exactly that `If` instead of a shape `tryLoop` itself
+  /// would have recognised. That is already a genuine `while (cond)`, with
+  /// `WORK` running once, unconditionally, the moment the spin ends; walks
+  /// every `While(true)` in `node`'s own tree and rewrites each one whose
+  /// body is exactly that shape, splicing `WORK` in right after (the same
+  /// "return the tail, let the caller splice it" shape Phase 2's
+  /// `trySplitSkipGoto`, structure.cpp, uses for its own promoted content).
+  void simplifyGuardedSpins(StmtPtr& node);
+
+  /// `simplifyGuardedSpins`'s own per-`While` check and rewrite. Returns the
+  /// `WORK` arm to splice in after `whileStmt` on a match, leaving
+  /// `whileStmt` itself as a plain `while (cond) {}`; null when `whileStmt`
+  /// does not match (left untouched).
+  StmtPtr trySimplifyGuardedSpin(Stmt& whileStmt);
+
+  /// expandUniqueCaseGotos' own recursive walk of one top-level group's
+  /// finished subtree, looking for a switch slot to fold. `owner` is that
+  /// group's own index into `groups`, carried through the recursion so a
+  /// slot naming `owner`'s own entry -- an unrecognized back edge, not an
+  /// orphan -- never folds a copy of a group into itself.
+  void expandGotoTargets(Stmt* node, std::size_t owner,
+                        const std::map<il::BlockId, std::size_t>& orphanIndex,
+                        const std::map<il::BlockId, std::size_t>& refCount,
+                        std::set<std::size_t>& consumed,
+                        std::vector<std::pair<il::BlockId, StmtPtr>>& groups);
+
   /// The function's dispatch regions (see analysis::findDispatchRegions),
   /// computed at most once per Structurizer instance regardless of how many
   /// of the two callers below end up asking for it: `tryDispatcherLoop`
@@ -117,6 +175,15 @@ class Structurizer {
   /// organically.
   [[nodiscard]] bool isMemberOfLargeDispatchRegion(il::BlockId block);
 
+  /// docs/19-scatter-dispatch-target-shape.md's own carve-out from
+  /// `isMemberOfLargeDispatchRegion`'s blanket defer: whether `block`
+  /// belongs to a region that crosses `minRegionSites` *and* that region
+  /// has voted a analysis::DispatchRegion::sharedTail -- the one shape a
+  /// table-mode switch is still earning its keep for. A region with no
+  /// sharedTail is the honest scatter case and this returns false for it,
+  /// letting switchFor's 2-way collapse through same as an isolated site.
+  [[nodiscard]] bool isMemberOfSharedTailRegion(il::BlockId block);
+
   /// tryDispatcherLoop's fallback for a `dispatch` whose own target count
   /// never clears matchDispatcherShape's floor: looks for a region `dispatch`
   /// belongs to and asks analysis::confirmDispatcherShapeFromRegion to
@@ -131,10 +198,20 @@ class Structurizer {
   /// discipline `dispatchRegions()` itself already holds to.
   const std::map<il::BlockId, il::BlockId>& joinHubByTail();
 
-  /// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3,
-  /// StructureOptions::regionStructuring): flattens `stmt` -- a table-mode
-  /// Switch `switchFor` just finished building for `dispatch` -- against any
-  /// of its own case bodies that turn out to be exactly one more resolved
+  /// The live-register relay a pooled join hub carries, for a switch whose
+  /// epilogue came from `joinHubByTail` rather than from a single-block
+  /// analysis::matchDispatcherShape vote. The shape's own `hub` -- the block
+  /// the relay lands in, which is what tells a per-case save from an identity
+  /// -- is taken to be the join hub's one successor; a hub that branches
+  /// somewhere conditional has no single such block, and gets no frame rather
+  /// than a guessed one.
+  std::optional<analysis::LiveRegisterFrame> frameThroughJoinHub(il::BlockId dispatch,
+                                                                il::BlockId hub) const;
+
+  /// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): called
+  /// unconditionally once `switchFor` finishes building a table-mode
+  /// `stmt` for `dispatch`. Flattens `stmt` against any of its own case
+  /// bodies that turn out to be exactly one more resolved
   /// dispatch site of the same `region`, reached privately and reading the
   /// identical already-evaluated discriminant (`Stmt::cond`, not merely a
   /// structurally similar one). See structure_dispatch_region.cpp's own

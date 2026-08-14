@@ -79,18 +79,31 @@
 namespace xdec::decompile {
 
 /// A function's known extent, from its ELF symbol size when the entry point
-/// has one. This is advisory, not enforced (see DriverOptions::fence): a
-/// discovery outside it is logged, not dropped, because a symbol's recorded
-/// size is not always trustworthy enough to bet a correct decompilation on --
-/// stripped or hand-written tables can legitimately reach past it, and
-/// refusing to lift an address the code genuinely branches to would trade a
-/// bleed-through bug for a missing-block one. What it is good for today is
-/// exactly what the noreturn and jump-table fixes were found by: a number in
-/// a log line for a case that looks too big, instead of nothing until someone
-/// reads the output by hand.
+/// has one. Advisory by default (see `enforce`): a discovery outside it is
+/// logged, not dropped, because a symbol's recorded size is not always
+/// trustworthy enough to bet a correct decompilation on -- stripped or
+/// hand-written tables can legitimately reach past it, and refusing to lift an
+/// address the code genuinely branches to would trade a bleed-through bug for
+/// a missing-block one. What it is good for that way is exactly what the
+/// noreturn and jump-table fixes were found by: a number in a log line for a
+/// case that looks too big, instead of nothing until someone reads the output
+/// by hand.
 struct FunctionFence {
   uint64_t start = 0;
   uint64_t end = 0;  // exclusive; start == end means "no fence"
+  /// Whether an address outside the extent is *dropped* rather than logged.
+  ///
+  /// The advisory reading above assumes the fence is a symbol's recorded size,
+  /// which might undershoot the real function. A caller that set the fence to
+  /// bound its own work rather than to describe a symbol means the opposite:
+  /// on a flattened binary whose dispatch tables are shared image-wide,
+  /// following every discovery is not "finding the rest of this function", it
+  /// is decompiling the program -- absd's `start()` reaches tens of thousands
+  /// of lines that way, none of them the entry anyone asked about. Such a
+  /// caller says so here, and accepts the missing blocks that come with it:
+  /// output is partial by construction, and honest about it, rather than
+  /// complete and unreadable.
+  bool enforce = false;
 
   [[nodiscard]] bool active() const noexcept { return end > start; }
   [[nodiscard]] bool contains(uint64_t va) const noexcept {
@@ -151,6 +164,26 @@ struct DriverOptions {
   /// legitimate count on purpose, the same role kRoundCeiling plays for
   /// rounds, for entries instead.
   std::size_t maxTotalEntries = 2048;
+  /// How many not-yet-lifted targets a *single* branch may contribute in one
+  /// round, or zero for no limit. Zero by default, and that is not timidity:
+  /// a real table of 1351 entries is in this repository's own sample set, and
+  /// a cap low enough to be useful against a bad enumeration would throw that
+  /// one away.
+  ///
+  /// What it is for is the opposite case, where the count itself is the
+  /// evidence. A dispatch in a flattened function selects among that
+  /// function's states -- a handful, or a few dozen -- so a branch offering
+  /// three hundred targets off a table the whole binary shares (absd's
+  /// `0x100080ec0`) has not found three hundred states; it has run off the end
+  /// of its own entries into the next function's, and lifting them buries the
+  /// function that was asked for. A caller who knows it is looking at that
+  /// shape says so with a number here.
+  ///
+  /// Over the cap the branch contributes *nothing*, rather than the first N.
+  /// A prefix would be the worst of both: the branch still has targets
+  /// missing, so it still never resolves, and the blocks lifted for the prefix
+  /// are there anyway.
+  std::size_t maxDiscoveryPerBranch = 0;
 };
 
 /// What the loop did, for CLI reporting and tests.

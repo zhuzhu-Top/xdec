@@ -147,6 +147,9 @@ struct Probe {
   /// The edges those addresses belong to, so the next round can put them back
   /// before it builds SSA over the blocks it is about to lift.
   Resolutions pending;
+  /// Branches whose candidate set was too wide to believe (see
+  /// DriverOptions::maxDiscoveryPerBranch), counted so the round can say so.
+  std::size_t declined = 0;
 
   Result<void> run(il::Function& function, const ByteReader& reader,
                    const DriverOptions& options) {
@@ -159,7 +162,20 @@ struct Probe {
     // once discovery is over, and doing it here would destroy the branches the
     // remaining rounds exist to resolve.
     context.setMemoryFacts(options.memory);
-    context.setDiscoverySink([this](const pass::Discovery& found) {
+    context.setDiscoverySink([this, &options](const pass::Discovery& found) {
+      if (options.maxDiscoveryPerBranch != 0 &&
+          found.missing.size() > options.maxDiscoveryPerBranch) {
+        // See DriverOptions::maxDiscoveryPerBranch. Neither the addresses nor
+        // the edge is taken: the candidate set is what would have been put
+        // back before SSA, and putting back a set this pass is being told not
+        // to believe would open exactly the edges the cap exists to refuse.
+        ++declined;
+        XDEC_LOG_DEBUG(driverLog(),
+                       "branch {:#x} offers {} unlifted target(s), past the {}-per-branch "
+                       "cap; none are taken and the branch is left unresolved",
+                       found.branch, found.missing.size(), options.maxDiscoveryPerBranch);
+        return;
+      }
       discoveries.insert(found.missing.begin(), found.missing.end());
       pending[found.branch] = found.targets;
     });
@@ -269,16 +285,19 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
     for (const uint64_t va : probe.discoveries) {
       if (options.fence.active() && !options.fence.contains(va)) {
         ++outsideFence;
-        // Advisory only (see FunctionFence), and deliberately quiet about it:
-        // a linker-recorded size that undershoots by a few bytes -- a jump
-        // table placed right past the code the size accounts for, say -- is
-        // routine and not a sign of anything wrong, so this is a debug trace
-        // for a real bleed-through investigation to pull up, not a warning
-        // every ordinary run would print.
+        // Advisory unless the caller asked otherwise (see FunctionFence), and
+        // deliberately quiet about it: a linker-recorded size that undershoots
+        // by a few bytes -- a jump table placed right past the code the size
+        // accounts for, say -- is routine and not a sign of anything wrong, so
+        // this is a debug trace for a real bleed-through investigation to pull
+        // up, not a warning every ordinary run would print.
         XDEC_LOG_DEBUG(driverLog(),
-                       "discovery {:#x} is outside the entry's symbol extent [{:#x}, {:#x}); "
-                       "lifting it anyway",
-                       va, options.fence.start, options.fence.end);
+                       "discovery {:#x} is outside the entry's extent [{:#x}, {:#x}); {}",
+                       va, options.fence.start, options.fence.end,
+                       options.fence.enforce ? "dropping it" : "lifting it anyway");
+        if (options.fence.enforce) {
+          continue;
+        }
       }
       if (known.contains(va)) {
         continue;
@@ -323,12 +342,26 @@ Result<DriverResult> decompile(const spec::SpecEngine& engine, const ByteReader&
                     "than bounded by a caller's function (pass a symbol with a size, or "
                     "double-check the entry address)",
                     report.rounds, foundNew);
+    } else if (options.fence.active() && options.fence.enforce && outsideFence > 0) {
+      // Not a warning: the caller set an enforcing fence precisely so this
+      // would happen, and the output being partial is the bargain it made.
+      // Still worth a line, because "partial" is only useful if it is visible.
+      XDEC_LOG_INFO(driverLog(),
+                    "round {} dropped {} discovered address(es) outside the requested "
+                    "extent [{:#x}, {:#x}); the function is emitted without them",
+                    report.rounds, outsideFence, options.fence.start, options.fence.end);
     } else if (options.fence.active() && outsideFence > kLargeFencedOverrunWarning) {
       XDEC_LOG_WARN(driverLog(),
                     "round {} discovered {} address(es) outside the entry's symbol extent "
                     "[{:#x}, {:#x}); this is too many to be the usual few-byte undershoot, "
                     "and likely means the fence itself is wrong for this function",
                     report.rounds, outsideFence, options.fence.start, options.fence.end);
+    }
+    if (probe.declined > 0) {
+      XDEC_LOG_INFO(driverLog(),
+                    "round {} left {} branch(es) unresolved whose candidate sets were "
+                    "wider than the {}-per-branch discovery cap",
+                    report.rounds, probe.declined, options.maxDiscoveryPerBranch);
     }
     // Resolving a branch is progress even when it revealed no new address: the
     // edge it adds is what lets the next round's SSA reach one level further in,

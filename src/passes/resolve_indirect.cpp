@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <span>
 #include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include "xdec/analysis/dominators.h"
 #include "xdec/analysis/image_eval.h"
@@ -151,6 +154,46 @@ class ResolveIndirect final : public pass::FunctionPass {
     return !holes.empty();
   }
 
+  /// Where in `block` this branch reads the table it dispatches through: the
+  /// address of the last memory read in `block` that `target` depends on,
+  /// following values transitively. Nullopt when the expression reads no
+  /// memory this block defines -- the read happened somewhere else, and
+  /// nothing about where a target lands inside this block can skip it.
+  [[nodiscard]] static std::optional<uint64_t> lastTableReadIn(const il::Function& function,
+                                                               il::BlockId block,
+                                                               il::ExprId target) {
+    std::optional<uint64_t> read;
+    std::vector<il::ExprId> work{target};
+    std::vector<bool> seenValue(function.valueCount(), false);
+    while (!work.empty()) {
+      const il::Expr& expr = function.expr(work.back());
+      work.pop_back();
+      if (expr.op == il::ExprOp::Value) {
+        const il::ValueId value{static_cast<uint32_t>(expr.immediate)};
+        if (!function.hasValue(value) || seenValue[value.index()]) {
+          continue;
+        }
+        seenValue[value.index()] = true;
+        const il::ValueInfo& info = function.value(value);
+        if (info.block != block || !function.hasOp(info.definition)) {
+          continue;
+        }
+        const il::Op& definition = function.op(info.definition);
+        if (definition.code == il::OpCode::Load && definition.va != il::kNoOpAddress) {
+          read = read ? std::max(*read, definition.va) : definition.va;
+        }
+        for (const il::ExprId operand : function.operands(definition)) {
+          work.push_back(operand);
+        }
+        continue;
+      }
+      for (uint32_t index = 0; index < expr.operandCount; ++index) {
+        work.push_back(expr.operands[index]);
+      }
+    }
+    return read;
+  }
+
   /// Collect candidates from both paths, then resolve all-or-nothing: every
   /// candidate must land on an existing block, or the branch keeps its
   /// unresolved state and every missing address is reported for the driver.
@@ -174,13 +217,33 @@ class ResolveIndirect final : public pass::FunctionPass {
     // union would only ever add duplicates; where the table path aborted
     // because an entry misread, a stale value set filling in the gap would
     // hide exactly the mismatch that abort exists to report.
+    const uint64_t branchVa = function.op(terminatorId).va;
+    // A candidate landing between this branch's own table read and the branch
+    // is not a target. Taking it would re-run the arithmetic that turns an
+    // entry into an address -- without re-reading the entry -- on the address
+    // that arithmetic just produced: an anchor-relative table would compute
+    // `target + anchor` and land nowhere at all. A candidate at or before the
+    // read is a different thing entirely and stays: that one re-reads the
+    // table, which is just an ordinary dispatch loop.
+    //
+    // Dropping the entry costs at most one wrong target and buys much more:
+    // the self edge it would otherwise create puts a phi in front of the
+    // table load, and a table behind a phi is one no later analysis
+    // recognises as a table at all -- not matchJumpTable, so not the
+    // index-mode switch, and not findDispatchRegions either.
+    const std::optional<uint64_t> tableRead = lastTableReadIn(function, blockId, operands[0]);
+    const auto skipsOwnTableRead = [&](uint64_t va) {
+      return tableRead.has_value() && va > *tableRead && va <= branchVa;
+    };
+
     std::vector<uint64_t> candidates =
         tableCandidates(context, eval, dominators, blockId, operands[0]);
+    std::erase_if(candidates, skipsOwnTableRead);
     const std::size_t fromTable = candidates.size();
     if (candidates.empty()) {
       candidates = valueSetCandidates(eval, operands[0]);
+      std::erase_if(candidates, skipsOwnTableRead);
     }
-    const uint64_t branchVa = function.op(terminatorId).va;
     if (candidates.empty()) {
       // The expression itself, because a shape that did not match is a question
       // about what the shape actually was, and no summary of it substitutes for
@@ -288,8 +351,12 @@ class ResolveIndirect final : public pass::FunctionPass {
   /// every slot an obfuscator's dead state, padding, or neighboring table
   /// happened to leave bound-reachable.
   ///
-  /// How far to enumerate when the value set does not narrow anything (it is
-  /// `top`, or every value it offers gets discarded below) is the older
+  /// Where the index is computed from something no evaluator can see through
+  /// -- a call's return value, a stack canary -- its *shape* still narrows it
+  /// (analysis/index_bound.h's preciseIndexSet), and that is the second thing
+  /// tried, for the same reason and to the same standard as the first.
+  ///
+  /// How far to enumerate when neither narrows anything is the older
   /// difficulty, and there are two answers. The good one is the guard that
   /// bounds the index (analysis/index_bound.h): it states the length, so
   /// every entry up to it is read and any entry that is then not code means
@@ -327,51 +394,90 @@ class ResolveIndirect final : public pass::FunctionPass {
         analysis::boundOnIndex(function, dominators, blockId, table->index);
     const ByteReader& image = *context.image();
 
-    // The precise path: the index's own value set, when it is not top. A
-    // value the structural bound does not admit means the two proofs
-    // disagree about this table, which is a reason to distrust the precise
-    // set (fall through to the structural path below) rather than to pick a
-    // winner between two claims that cannot both be right. An entry that does
-    // not read as code is the same signal path two already treats as
-    // "misread the table, claim nothing" -- the value set being wrong about
-    // an index is not a reason to make up an answer for it, either.
-    const analysis::ValueSet indexValues = eval.eval(table->index);
-    if (!indexValues.isTop() && !indexValues.values().empty()) {
-      std::vector<uint64_t> preciseIndices(indexValues.values().begin(),
-                                           indexValues.values().end());
-      std::sort(preciseIndices.begin(), preciseIndices.end());
+    // The precise paths: enumerate the entries the index can actually select,
+    // rather than every entry a length admits. A value the structural bound
+    // does not admit means the two proofs disagree about this table, which is
+    // a reason to distrust the precise set (fall through to the next source)
+    // rather than to pick a winner between two claims that cannot both be
+    // right, whichever path found the set.
+    //
+    // An entry that does not read as code is read differently by the two
+    // paths, though. The evaluator's value set is a claim about which values
+    // occur, full stop -- a bad entry means that claim was wrong, so the
+    // proven-length path below treats it as "misread the table, claim
+    // nothing" and so does this one. The shape-derived set is a weaker claim:
+    // preciseIndexSet proves which values an expression's *structure* admits,
+    // not which of them this call site's calling context can actually reach
+    // -- two independent shr.u(x,31)-shaped bits combine to four values where
+    // only two are live, because the fourth bit is fixed by a dominating
+    // dispatch this analysis does not look at. A bad entry there is exactly
+    // that fourth bit's combination, not a reason to distrust the other
+    // three -- so it is dropped, not treated as proof the whole set is wrong.
+    const auto entriesFor = [&](std::span<const uint64_t> indices, std::string_view provenance,
+                                bool tolerateDeadCombinations) -> std::vector<uint64_t> {
       std::vector<uint64_t> out;
-      bool trustworthy = true;
-      for (const uint64_t index : preciseIndices) {
+      for (const uint64_t index : indices) {
         if (proven.has_value() && index > *proven) {
           XDEC_LOG_DEBUG(resolveLog(),
-                         "table at {:#x}: the index's value set includes {} but the guard "
-                         "bounds it to {}; the two disagree, so the value set is not "
-                         "trusted and the structural bound is used instead",
-                         table->base, index, *proven);
-          trustworthy = false;
-          break;
+                         "table at {:#x}: {} includes {} but the guard bounds the index "
+                         "to {}; the two disagree, so it is not trusted",
+                         table->base, provenance, index, *proven);
+          return {};
         }
         const uint64_t va = entryTarget(image, *table, index);
         if (!table->relative && va == 0) {
           continue;
         }
         if (va == kNoTarget || !isCode(context, va)) {
+          if (tolerateDeadCombinations) {
+            XDEC_LOG_DEBUG(resolveLog(),
+                           "table at {:#x}: entry {} from {} is not code; treated as a "
+                           "combination this call site cannot reach, not as a misread table",
+                           table->base, index, provenance);
+            continue;
+          }
           XDEC_LOG_DEBUG(resolveLog(),
-                         "table at {:#x}: entry {} from the index's value set is not "
-                         "code, so the value set is being misread; falling back to the "
-                         "structural bound",
-                         table->base, index);
-          trustworthy = false;
-          break;
+                         "table at {:#x}: entry {} from {} is not code, so it is being "
+                         "misread; falling back",
+                         table->base, index, provenance);
+          return {};
         }
         out.push_back(va);
       }
-      if (trustworthy && !out.empty()) {
+      if (!out.empty()) {
         XDEC_LOG_DEBUG(resolveLog(),
                        "table at {:#x}: {} of its entries are the ones the index {} can "
-                       "actually take",
-                       table->base, out.size(), il::printExpr(function, table->index));
+                       "actually take, per {}",
+                       table->base, out.size(), il::printExpr(function, table->index),
+                       provenance);
+      }
+      return out;
+    };
+
+    // Concrete values first, from the evaluator every other resolver in this
+    // file already trusts.
+    const analysis::ValueSet indexValues = eval.eval(table->index);
+    if (!indexValues.isTop() && !indexValues.values().empty()) {
+      std::vector<uint64_t> preciseIndices(indexValues.values().begin(),
+                                           indexValues.values().end());
+      std::sort(preciseIndices.begin(), preciseIndices.end());
+      if (std::vector<uint64_t> out =
+              entriesFor(preciseIndices, "the index's value set", /*tolerateDeadCombinations=*/false);
+          !out.empty()) {
+        return out;
+      }
+    }
+
+    // Then the index's shape, which answers where concrete values cannot
+    // (analysis/index_bound.h's preciseIndexSet). This is the path an
+    // obfuscated dispatch takes: an index computed from a call's return value
+    // is top to any evaluator that needs the value, and still only ever two
+    // numbers once the shift and the OR around it are read.
+    if (const std::optional<std::vector<uint64_t>> shaped =
+            analysis::preciseIndexSet(function, table->index)) {
+      if (std::vector<uint64_t> out =
+              entriesFor(*shaped, "the index's shape", /*tolerateDeadCombinations=*/true);
+          !out.empty()) {
         return out;
       }
     }

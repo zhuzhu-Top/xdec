@@ -1,0 +1,179 @@
+// iOS SDK preset: the libSystem/Mach/CoreFoundation/IOKit surface a userspace
+// iOS binary reaches through dyld bind slots (see docs/10-import-resolution.md
+// and src/binary/macho.cpp's rebase/bind opcode interpreter).
+//
+// Not a copy of the Apple SDK headers -- the set of declarations that shows up
+// when reading a decompiled Mach-O AArch64 binary's imports, kept just
+// detailed enough that resolve-call stops printing these as
+// `sub_<va>(a0, a1, ..., a7)` eight-argument mystery calls. Import with
+// `--types ios-sdk`, or let `inferTargetProfile` pick it up automatically for
+// a Mach-O + AArch64 image.
+//
+// Mach-O exported/imported names keep their linker-mangled leading
+// underscore (`_malloc`, `_CFRelease`, ...) -- `nlist_64.n_strx`, unlike ELF,
+// spells every C symbol that way, and macho.cpp's loader preserves it rather
+// than guessing at a demangled form. Declaring the underscored spelling
+// directly here is what lets a bind-resolved call bind against this header
+// without a `TargetProfile::symbolAliases` entry per function; only a
+// genuine spelling mismatch (there are none known yet, unlike Bionic's
+// `__errno`) would need one.
+//
+// The fixed-width integer names and off_t/time_t/pid_t/uid_t/gid_t/mode_t are
+// built into the type database and are not repeated here.
+
+// ---------------------------------------------------------------------------
+// Mach
+// ---------------------------------------------------------------------------
+
+typedef unsigned int mach_port_t;
+typedef int kern_return_t;
+typedef unsigned int boolean_t;
+typedef unsigned int natural_t;
+typedef unsigned long vm_address_t;
+typedef unsigned long vm_size_t;
+typedef unsigned int mach_msg_option_t;
+typedef unsigned int mach_msg_size_t;
+typedef unsigned int mach_msg_timeout_t;
+
+// mach_msg_header_t's fields are never read directly by the calls this
+// preset types -- every caller just forwards a buffer it already built --
+// so it stays opaque rather than guessing at padding no site here needs.
+struct mach_msg_header_t;
+
+kern_return_t _mach_msg(struct mach_msg_header_t *msg, mach_msg_option_t option,
+                        mach_msg_size_t send_size, mach_msg_size_t rcv_size,
+                        mach_port_t rcv_name, mach_msg_timeout_t timeout,
+                        mach_port_t notify);
+void _mach_msg_destroy(struct mach_msg_header_t *msg);
+kern_return_t _mach_port_deallocate(mach_port_t task, mach_port_t name);
+kern_return_t _vm_allocate(mach_port_t target_task, vm_address_t *address, vm_size_t size,
+                           int flags);
+kern_return_t _vm_deallocate(mach_port_t target_task, vm_address_t address, vm_size_t size);
+
+kern_return_t _bootstrap_look_up(mach_port_t bp, const char *service_name, mach_port_t *sp);
+kern_return_t _bootstrap_check_in(mach_port_t bp, const char *service_name, mach_port_t *sp);
+
+void _voucher_mach_msg_set(struct mach_msg_header_t *msg);
+
+// ---------------------------------------------------------------------------
+// CoreFoundation
+// ---------------------------------------------------------------------------
+
+typedef unsigned long CFTypeID;
+typedef long CFIndex;
+typedef unsigned char Boolean;
+typedef unsigned long CFOptionFlags;
+typedef const void *CFTypeRef;
+typedef struct __CFAllocator *CFAllocatorRef;
+typedef struct __CFString *CFStringRef;
+typedef struct __CFData *CFDataRef;
+typedef struct __CFNumber *CFNumberRef;
+typedef struct __CFRunLoop *CFRunLoopRef;
+typedef struct __CFRunLoopSource *CFRunLoopSourceRef;
+typedef struct __CFMachPort *CFMachPortRef;
+typedef struct __CFFileDescriptor *CFFileDescriptorRef;
+typedef struct __CFDictionary *CFMutableDictionaryRef;
+
+struct CFRange {
+  CFIndex location;
+  CFIndex length;
+};
+
+CFTypeID _CFGetTypeID(CFTypeRef cf);
+void _CFRelease(CFTypeRef cf);
+void *_CFAllocatorAllocate(CFAllocatorRef allocator, CFIndex size, CFOptionFlags hint);
+void _CFAllocatorDeallocate(CFAllocatorRef allocator, void *ptr);
+
+CFTypeID _CFDataGetTypeID(void);
+void _CFDataGetBytes(CFDataRef theData, struct CFRange range, unsigned char *buffer);
+
+CFTypeID _CFNumberGetTypeID(void);
+Boolean _CFNumberGetValue(CFNumberRef number, int theType, void *valuePtr);
+
+CFRunLoopRef _CFRunLoopGetCurrent(void);
+CFRunLoopRef _CFRunLoopGetMain(void);
+void _CFRunLoopRun(void);
+void _CFRunLoopStop(CFRunLoopRef rl);
+void _CFRunLoopAddSource(CFRunLoopRef rl, CFRunLoopSourceRef source, CFStringRef mode);
+
+CFMachPortRef _CFMachPortCreateWithPort(CFAllocatorRef allocator, mach_port_t portNum,
+                                        void *callout, void *context, Boolean *shouldFreeInfo);
+CFRunLoopSourceRef _CFMachPortCreateRunLoopSource(CFAllocatorRef allocator, CFMachPortRef port,
+                                                  CFIndex order);
+void _CFMachPortInvalidate(CFMachPortRef port);
+
+CFFileDescriptorRef _CFFileDescriptorCreate(CFAllocatorRef allocator, int fd,
+                                            Boolean closeOnInvalidate, void *callout,
+                                            void *context);
+void _CFFileDescriptorEnableCallBacks(CFFileDescriptorRef f, CFOptionFlags callBackTypes);
+int _CFFileDescriptorGetNativeDescriptor(CFFileDescriptorRef f);
+void _CFFileDescriptorInvalidate(CFFileDescriptorRef f);
+CFRunLoopSourceRef _CFFileDescriptorCreateRunLoopSource(CFAllocatorRef allocator,
+                                                        CFFileDescriptorRef f, CFIndex order);
+
+// ---------------------------------------------------------------------------
+// IOKit
+// ---------------------------------------------------------------------------
+
+typedef mach_port_t io_object_t;
+typedef io_object_t io_service_t;
+typedef io_object_t io_iterator_t;
+typedef io_object_t io_connect_t;
+
+kern_return_t _IOMasterPort(mach_port_t bootstrapPort, mach_port_t *masterPort);
+CFMutableDictionaryRef _IOServiceMatching(const char *name);
+kern_return_t _IOServiceGetMatchingServices(mach_port_t masterPort, CFDataRef matching,
+                                            io_iterator_t *existing);
+io_service_t _IOIteratorNext(io_iterator_t iterator);
+kern_return_t _IOObjectRelease(io_object_t object);
+kern_return_t _IOServiceOpen(io_service_t service, mach_port_t owningTask, uint32_t type,
+                             io_connect_t *connect);
+kern_return_t _IOConnectCallStructMethod(io_connect_t connect, uint32_t selector,
+                                         const void *inputStruct, size_t inputStructCnt,
+                                         void *outputStruct, size_t *outputStructCntPtr);
+
+// ---------------------------------------------------------------------------
+// libSystem: kqueue, pthread rwlocks, and the handful of libc calls that
+// differ from the android-ndk preset's set (see that file for malloc/free/
+// memcpy/gettimeofday's siblings, not repeated here).
+// ---------------------------------------------------------------------------
+
+struct kevent;
+
+int _kqueue(void);
+int _kevent(int kq, const struct kevent *changelist, int nchanges, struct kevent *eventlist,
+           int nevents, const struct timespec *timeout);
+
+typedef struct { int64_t opaque[8]; } pthread_rwlock_t;
+typedef struct { int32_t opaque[1]; } pthread_once_t;
+
+int _pthread_once(pthread_once_t *control, void (*init)(void));
+int _pthread_rwlock_init(pthread_rwlock_t *lock, const void *attr);
+int _pthread_rwlock_destroy(pthread_rwlock_t *lock);
+int _pthread_rwlock_rdlock(pthread_rwlock_t *lock);
+int _pthread_rwlock_wrlock(pthread_rwlock_t *lock);
+int _pthread_rwlock_unlock(pthread_rwlock_t *lock);
+
+struct timespec {
+  time_t tv_sec;
+  long tv_nsec;
+};
+struct timeval {
+  time_t tv_sec;
+  suseconds_t tv_usec;
+};
+
+void *_malloc(size_t size);
+void _free(void *ptr);
+void *___memcpy_chk(void *dst, const void *src, size_t len, size_t dstlen);
+int _sscanf(const char *str, const char *format, ...);
+int _gettimeofday(struct timeval *tv, void *tz);
+time_t _time(time_t *out);
+unsigned int _arc4random(void);
+void *_signal(int sig, void *handler);
+
+int _audit_token_to_au32(const void *atoken, uid_t *auidp, uid_t *euidp, gid_t *egidp,
+                         uid_t *ruidp, gid_t *rgidp, pid_t *pidp, int *asidp, void *tidp);
+
+void _xpc_transaction_begin(void);
+void _xpc_transaction_end(void);

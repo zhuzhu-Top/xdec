@@ -1241,3 +1241,508 @@ manifest 阈值收紧/放宽只在用户确认后用 `-UpdateBaseline` 落地，
 typed 38/38，vs baseline 均无 fixed/regressed。`samples/run.ps1`：4/5——
 仅 `sample_libscplugin` 因上述 `max_lines` 阈值未随 J2f 更新而报"NO"，
 其余 4 个样本与其余所有指标均无回归。
+
+## 2026-08-13：J2g unique goto expansion
+
+对应用户直接指出的具体案例：`sample_libscplugin.c` 里 `case 0x1ab: /* handler
+@0x11f500 */ goto L_0x11f500;` 紧接着 `L_0x11f500:` 只被这一处引用，却仍要单独
+占一个顶层分组和一行 label——J2f 落地后遗留的、更细粒度的一类 goto。
+
+**根因**：`Structurizer::claimCaseBody` 在这个形状上失败（多数情况是
+`regionClosed` 因为 handler 自己吸收的后续 block 撞上了别的 case 共享的
+merge，而不是"handler 本身有第二个前驱"）之后，`switchFor` 只留下
+`caseBodies[i] == nullptr` + `cases[i] == H` 这一对裸值——`c_stmt.cpp` 打印
+`printSwitch` 遇到空 `caseBodies[i]` 时直接吐 `goto label(cases[i]);`，从不经过
+`Stmt::Goto` 节点。与此同时 `run()` 里两轮无检查的 RPO 补扫会把 `H` 单独收成一个
+从 `Block(H)` 开始、可能吸收好几个 block 的顶层分组——如果这条链路只被这一个
+`case` 引用，它的 label 和分组就纯属多余。
+
+**实现**（`structure.cpp`/`structurizer.h`，`collapseLabeledNaturalLoops`
+之后、`stable_sort` 之前跑）：
+
+1. `countReferences`（`collectReferences` 的计数版）：不满足于"引用过"，要分清
+   "恰好一次"和"不止一次"——一个自然循环回边落到 `continue` 而非 `Goto`/裸
+   case 槽，是这版计数天然看不到的，所以还要叠加下一条硬约束。
+2. `Structurizer::expandUniqueCaseGotos`：Phase 1 建 orphan 索引（一个顶层分组
+   够"干净"——`items[0]` 恰是 `Block(自己的 head)`，且不是入口块——才算候选）；
+   Phase 2 跑 `countReferences` 拿到整棵树（含每个分组自身内容）的引用计数；
+   Phase 3 用新的 `Structurizer::expandGotoTargets` 递归遍历每个分组，对每个
+   `Switch` 的每个裸 case/`default` 槽尝试折叠：目标必须 `refCount==1`、IL 级
+   `predecessors.size()==1`（防止一个树扫描看不见的第二引用，如上面的回边
+   `continue`）、orphan body `alwaysLeaves`、且不含嵌套 `Switch`
+   （`containsSwitch`，避免把整棵子 dispatch 树错塞进一个 case）——四条全满足
+   才 `cloneStmt` 整个 orphan 分组填进 `caseBodies[i]`，并把该分组标记
+   consumed、跑完后统一从 `groups` 里删除。
+3. 递归天然处理链式 orphan（一个 orphan 的唯一引用又指向另一个只被它引用的
+   orphan）：`expandGotoTargets` 在遇到非空 `caseBodies[i]` 时照样递归进去找
+   更深的裸槽——真实样本里外层 `Switch` 早已通过 `claimCaseBody` 内联，裸槽都在
+   被内联的子树深处，不下钻就找不到。
+
+**为什么不是简单地"goto 恰好一次就展开"**：`refCount==1` 只是这棵已经打印出的
+树 **看得见** 的引用数；`continueAtBackEdges`（J2f）已经把回边改写成
+`Continue`，不会被 `countReferences` 数进去，所以一个自然循环 header 若恰好
+只被树内一处 `Goto`/裸槽引用，会在树扫描这一关误判为"唯一引用"。IL 级
+`predecessors.size()==1` 是独立于树形状的真相来源，堵住了这个洞——回归用
+`tests/emit/test_structure_unique_goto_expand.cpp` 的第二个用例专门验证。
+
+**验收**（`sample_libscplugin` @ `0x1164f8`，J2f 完成时 → J2g 后）：
+
+| 指标 | J2f 后 | J2g 后 | 说明 |
+|------|-----:|-----:|------|
+| goto | 388 | **326** | −62；用户举的 `L_0x11f500` 已确认消失，内容直接内联进 `case 0x1ab` |
+| labels | 317 | **231** | −86 |
+| 行数 | 6702 | **6572** | 折叠掉的重复 label/goto 行数超过内联展开的净增，`max_lines: 6600` 的既有阈值突破**不修自愈**，`samples/run.ps1` 由 4/5 回到 **5/5** |
+| switch | 234 | 234 | 不变——J2g 只填 `caseBodies`，不改 `cases`/`caseValues` |
+| while(true) | 49 | 49 | 不变——只在 `collapseLabeledNaturalLoops` 之后跑，不触碰循环结构 |
+
+比 J2g 方案自己估计的 120–140 goto 更保守：真实样本里不少裸 case 槽的目标
+恰好还是嵌套 dispatch 树的一部分（`containsSwitch` 正确拒绝），或者目标块
+被两条独立路径共享（IL 双前驱正确拒绝）——都是方案 §"风险与缓解"里预先列出、
+故意不碰的形状，不是实现遗漏。
+
+**回归**：新建 `tests/emit/test_structure_unique_goto_expand.cpp`，四个用例——
+一个正例（两条 case 因共享 `regionClosed` 冲突的下游 block 都失败 claim、
+各自成为只被引用一次的顶层分组，两个都被折叠回自己的 case）+ 三个负例
+（IL 双前驱不折叠；handler 自身没有 terminator、`alwaysLeaves` 判否不折叠；
+handler 自身是嵌套 dispatch、`containsSwitch` 判否不折叠，即使它经由自己的
+`epilogue` 确实"leaves"）。`xdec_tests.exe`：**640** test cases、133804
+assertions 全过。`eval/run.ps1`：baseline 98/98、typed 38/38，vs baseline
+均无 fixed/regressed。`samples/run.ps1`：**5/5**（`sample_libscplugin` 的
+`max_lines` 阈值突破随行数下降自愈，未改动 `manifest.json`）。
+
+## 2026-08-13：J2g × J2f 执行顺序 — 循环体内 remnant 补折叠
+
+对应用户直接指出的具体案例：`sample_libscplugin.c` 5705-5711 行的
+`case 0x97: goto L_0x1224c8;` / `case 0xd6: goto L_0x11efc0;` 在 J2g 落地后
+仍然没有被折叠，尽管形状看起来和已经修好的 `L_0x11f500` 一样。
+
+**根因**：先在 `expandGotoTargets` 的 `tryFold` 里加了针对这两个目标 VA 的
+`fprintf(stderr, ...)` 诊断（每条拒绝路径各打一行），重新跑
+`samples/run.ps1` 抓到的输出是两个目标都停在同一行——`"no clean orphan
+group (in orphanIndex=0)"`，也就是说 Phase 1 建 orphan 索引时压根没找到
+这两个目标对应的顶层分组，跟 `refCount`/IL 前驱数/`alwaysLeaves` 都没关系。
+
+顺着这条线看 `Structurizer::run()` 的调用顺序：`collapseLabeledNaturalLoops`
+（J2f）先跑，`expandUniqueCaseGotos`（J2g）在其后。J2f 对每个自然循环
+header 找"贡献者"（`loopPtr->blocks` 里除 header 外、`ownerOf` 映射到某个
+其它顶层分组的成员，按 `NaturalLoop::blocks` 的构造——从每条回边的 latch
+反向沿 predecessors 走到 header 为止——这个集合覆盖的不只是闭合回边的那
+一个 block，是"只要还在循环里、走不出去"的每一个 block），把这些贡献者
+分组的 `items` **原样拼接**进循环体的 `Sequence`。拼接之后，`0x1224c8`/
+`0x11efc0`（连同 `0x11ef70`/`0x11ef20`）各自原来的顶层 `groups[i]` 条目
+不复存在，只剩下拼进同一个 `Sequence` 里的匿名 `Block` 分段——它们仍然
+在树里（`collectReferences` 找得到，标签仍然打印），但 J2g 事后重建的
+`orphanIndex`（要求 `region->items.front()->block == head`）已经没有
+入口能索引到它们了，folding 从这一步起永久错过，跟 `refCount`/`alwaysLeaves`
+/`containsSwitch` 这些后续检查完全无关——诊断行印的正是 Phase 1 就拒绝了。
+
+**方案**（`structure.cpp`）：`Structurizer::run()` 里 `expandUniqueCaseGotos`
+改成跑两遍——
+
+1. 一遍在 `collapseLabeledNaturalLoops` **之前**：此时循环体的贡献者还是
+   各自独立的顶层分组，`orphanIndex` 能正常找到它们，按 `switch` case 的
+   唯一引用先把能折的都折进 case body（哪怕它们本身包含一条回到循环
+   header 的裸 `goto`——`alwaysLeaves` 只要求"离开"，不要求离开到哪）。
+2. `collapseLabeledNaturalLoops` 照常跑：折叠只挪动内容
+   （`cloneStmt`+`consumed` 剔除顶层分组），不影响 `ownerOf`/`ranks` 的
+   计算方式，只是这一轮里很多本该被它拼接的贡献者已经不在顶层
+   `groups` 里了（`contributing` 集合可能因此完全清空）——但它仍然
+   无条件把 header 自己的 `switch` 包进 `while (true)` 并对其递归跑
+   `continueAtBackEdges`（递归本就会下钻进已经内联的 `caseBodies`），
+   于是被第一遍 J2g 折叠进某个 case body 深处的裸 `goto header;` 照样
+   被就地改写成 `continue;`——循环结构不因为提前折叠而丢失。
+3. 一遍在其后：保留原有位置，专门补 J2f 完全没碰到（不属于任何自然
+   循环）的顶层 remnant，即 §6.8 最初解决的那类。
+
+两遍共用同一份 `expandUniqueCaseGotos`/`expandGotoTargets` 实现，没有新增
+状态、字段或 CLI 开关。
+
+**为什么两遍是安全的、不会互相踩**：第一遍折叠的判定完全依赖 IL 级
+`predecessors.size()==1` 和树扫描 `refCount==1`，两者都是"这一刻的 CFG/
+树形状"的真相，不依赖 J2f 是否已经跑过；folding 本身只是把内容从一个
+`StmtPtr` 挪到另一个（`cloneStmt` 深拷贝、原分组整体从 `groups` 剔除），
+不会遗留悬空引用——`xdec_tests.exe` 全量跑、`eval/run.ps1`、
+`samples/run.ps1` 三层回归均确认零回归；另外用同一颗二进制反复跑
+`sample_libscplugin`（102 round、664 extra entries 的真实大样本）观察到
+一个与本改动无关的、极低概率（约 2/24 次）driver SSA 校验阶段
+（`il::verify`，在 Structurizer 被调用之前）随机 `SIGSEGV`——改动前的
+基线同等复测 16 次里 0 次崩溃，样本量不足以排除这是本就存在的稀有
+flaky 项，但栈回溯确认崩溃帧在本次改动的调用路径之外，记录在此供后续
+单独复现。
+
+**验收**（`sample_libscplugin` @ `0x1164f8`，J2g 单遍 → J2g×J2f 双遍）：
+
+| 指标 | J2g 单遍 | J2g×J2f 双遍 | 说明 |
+|------|-----:|-----:|------|
+| goto | 326 | **289** | −37；用户举的 `L_0x1224c8`/`L_0x11efc0` 已确认消失，`L_0x11ef70`/`L_0x11ef20` 同一循环里的另外两个同形状 remnant 也一并折叠 |
+| 行数 | 6572 | **6498** | |
+| switch | 234 | 234 | 不变 |
+| while(true) | 49 | 49 | 不变——所有已识别的自然循环结构均完整保留 |
+
+**回归**：`test_structure_unique_goto_expand.cpp` 新增一例——两条 case 各自
+因共享 `merge` 的 `regionClosed` 冲突失败 claim（构造手法同 §"J2g unique
+goto expansion" 的正例），但 `merge` 自己再跳回 dispatcher 形成回边，使
+`loopByHeader_` 出现以 dispatcher 为 header、成员覆盖两个 handler 的自然
+循环；断言两个 case 都被折叠、循环仍以 `while (true)` 形式存在且包着
+同一个 `switch`、树里已没有任何裸 `goto dispatcher`（转成了 `continue`）。
+`xdec_tests.exe`：**641** test cases、133822 assertions 全过。`eval/run.ps1`：
+baseline 98/98，vs baseline 无 fixed/regressed。`samples/run.ps1`：**5/5**。
+
+## 2026-08-13：scatter dispatch 目标结构（`StructureOptions::collapseScatterRegionSites`）
+
+对应计划：`docs/19-scatter-dispatch-target-shape.md`（该文档不可编辑，本节
+记录实测）。此前所有 J1-J5 的改动都把 `libscplugin` 这一 234-site scatter
+region 当作"暂不处理，先保持可见"（J1 的 `minRegionSites` defer），本轮的
+问题是这个 defer 到底还要不要继续——从汇编重新核实了这个 region
+`sharedTail=false`（无 region 级共享 merge），J1 的 defer 本来就是为
+`sharedTail` 存在的"真实 flattened loop"形状保留的，对这种 scatter 形状
+它从一开始就没有对应的收益，只是"让 site 数量在打印里可见"这一个诊断目的。
+`analysis::buildDispatchNestGraph`（新增）把这个可见性移到
+`--emit-report` 的 `dispatch-nest:` 诊断行里之后，defer 本身就可以对
+`sharedTail=false` 的 region 关掉了。
+
+### 实现
+
+- `analysis::DispatchNestGraph`/`buildDispatchNestGraph`
+  （`dispatch_region.h`/`.cpp`）：纯分析，从每个 site 的目标出发做有界
+  BFS，找它是否直接落入 region 内另一个 site——`roots`/`maxDepth`/
+  `nestedSiteCount`，与此前 `tools/analyze_dispatch_nesting.py` 的规则
+  一致（`libscplugin` 上跑出 `roots=93 depth=28 nested=141`，与该脚本
+  当时的结论逐字吻合）。
+- `StructureOptions::collapseScatterRegionSites`（默认 `false`）：
+  `switchFor` 的 `deferCollapse` 从"region 够大就 defer"改成"region 够大
+  **且**投票出了 `sharedTail` 才 defer"——`sharedTail` 不存在时,2-way
+  site 照单站规则收敛成 `if`/`else`,`claimCaseBody` 的既有递归自动把
+  链式 site 收敛成一整棵嵌套 `if`/`else if`,不需要新的结构化 pass。
+  CLI：`--collapse-scatter-sites`。
+- 未新增代码但复用生效：`claimOrCloneSharedCaseBody`（J2d）此前只在
+  table-mode switch 分支里被验证过对 `libscplugin` 无可观测收益（见
+  §6.2 的诚实结论）——现在同一份代码在 `if`/`else` 收敛分支里对新收敛出
+  来的 site 生效，`tests/emit/test_structure_dispatch_region.cpp` 新增
+  一例直接断言两条链式 site 共享的 handler 只印一次、克隆进两个 `if`
+  分支，没有 goto。
+
+### 验收（`sample_libscplugin` @ `0x1164f8`，`--allow-unresolved --rounds 128`）
+
+```
+dispatch-regions: 1 region(s), 234 site(s) total
+  region[0]: table=0x1e70a0 stride=8 entryBits=64 clamp=0x2cc/0x213 sites=234 sharedTail=false
+    nest: roots=93 depth=28 nested=141
+```
+
+| 指标 | 关闭（现状基线） | 开启 `--collapse-scatter-sites` | 说明 |
+|------|-----:|-----:|------|
+| switch | 234 | **0** | 每个 2-way site 都收敛，§2 的目标 |
+| if（含 else if） | 140 | **533** | 吸收了被收敛的 site，形成嵌套链 |
+| goto | 289 | **332** | **上升**——见下方"诚实结论" |
+| while(true) | 49 | 49 | 不变，不是本次目标 |
+| unresolved_branches | 0 | 0 | 不变 |
+| 行数 | 6499 | 6865 | |
+
+**诚实结论（goto 为什么涨了）**：table-mode switch 能把一个多前驱 join hub
+（`analysis::DispatchJoin`，J2e）当作 `Stmt::epilogue` 只印一次，让每个
+落入它的 case 用 `Break` 收尾而不用 `goto`；`if`/`else` 收敛分支目前没有
+这个机制，每条落入同一个 hub 的 arm 各自独立走
+`claimCaseBody`/`claimOrCloneSharedCaseBody`/`goto` 兜底，一个多 site 共享
+的 hub 就要付出"一 site 一个 goto"而不是"一次共享内联"的代价。这正是
+`docs/19` §2.4 表格里明确允许的下限（"3+ 前驱 → 保留 label+goto（或一次
+shared epilogue）"，括号内的 shared epilogue 是可选项不是必须），把
+`epilogue` 机制扩展到 `If` 节点是后续工作,不是本次改动的必要条件。
+
+亲自检查了方案原文点名的 `0x117164` 区域：现在确实是嵌套
+`if (var_730 == 0x0) ... else if (var_8a8 == 0x1) ... else if (var_8a8
+== 0x2) ...`,不再是嵌套 `switch (state)`；链内没有跳回链头自身的 goto；
+唯一一条 `goto L_0x117164` 来自函数后段一个真实的自然循环回边（重新计算
+`var_730`/`var_734` 后回到同一棵决策树,不是收敛残留)。
+
+### 回归
+
+- `xdec_tests.exe`：**646** test cases、133851 assertions 全过（新增
+  `tests/analysis/test_dispatch_region.cpp` 的 `buildDispatchNestGraph`
+  两例，`tests/emit/test_structure_dispatch_region.cpp` 的
+  `collapseScatterRegionSites` 四例）。
+- `samples/run.ps1`：**5/5**（`manifest.json` 为 `sample_libscplugin`
+  加上 `--collapse-scatter-sites`，把 `min_switches: 220` 换成
+  `min_ifs: 500`，`max_gotos` 420→380、`max_lines` 6600→6900，均为
+  本节实测数字加轻量余量，不是预设目标）。
+- 默认行为（`collapseScatterRegionSites=false`）零改动：所有既有
+  J1 回归测试（`minRegionSites`/`deferRegionCollapse` 相关）原样通过。
+
+## 2026-08-13：结构化优化默认开启 + Goto 消除方案（Phase 0-6）
+
+对应计划：`goto_elimination_plan`（该文件不可编辑，本节记录实测）。上一节
+（`scatter dispatch 目标结构`）把 `collapseScatterRegionSites` 做成用户可选
+CLI 开关，本轮的第一步是把它和 `regionStructuring`（J2 的
+`collapseRegionDispatchTree`）一起收回：两者都不再是「用户可能没打开的优化」，
+而是反编译器自己的默认行为，不通过启动参数暴露。收回默认值之后，
+`sample_libscplugin` 的收敛形状（234 switch → 0 switch/533 if）成了唯一路径，
+goto 从 289 涨到 332 的老问题（上一节的"诚实结论"）才第一次成了非 opt-in 的真实
+回归，后续 Phase 1-5 就是按 §J2e/J2f/J2g/J3 的顺序把这个缺口逐步关掉。
+
+### Phase 0：所有结构化优化内建为默认行为
+
+- 删除 `StructureOptions::collapseScatterRegionSites`/`regionStructuring`
+  两个用户字段，`switchFor` 的 `deferCollapse` 判定和 `collapseRegionDispatchTree`
+  调用点都改成无条件走 always-on 分支；CLI 侧删掉
+  `--collapse-scatter-sites`/`--region-structuring`。
+- `deferRegionCollapse`、`minRegionSites` 仍保留在 `StructureOptions`，但只
+  作为单元测试注入点存在，`decompileToC()` 的默认路径永远不设置它们。
+
+### Phase 1（J2e-if）：`If` 也获得 join-hub epilogue
+
+`Stmt` 的 `epilogue`/`mergeBlock` 字段本来只服务 `Switch`：
+
+```162:164:d:\funtune\xdec\include\xdec\emit\structure.h
+  StmtPtr epilogue;          // Switch, If
+  /// The block `epilogue` was built from; invalid when `epilogue` is null.
+  il::BlockId mergeBlock{};  // Switch, If
+```
+
+`switchFor` 的 2-way 收敛分支现在先查 `joinHubByTail()`，命中且 hub 未被占用
+就把 hub 结构化一次挂成 `epilogue`，两条 arm 改用
+`claimDispatcherCaseBody(..., appendBreak=false)` 收尾到 merge 而不是各自
+`goto`；`printIf`/`collectDeadOpsInto`/`alwaysLeaves`/`continueAtBackEdges`/
+`collectReferences` 全部跟 `Switch` 一样递归进 `epilogue`。这就是上一节留的
+缺口本身：一个多 site 共享的 hub，`If` 路径现在也能"结构化一次、`Break` 收尾"，
+不必每个 site 各付一个 `goto`。
+
+### Phase 2：`if(cond) goto MERGE; else {WORK}` 补漏重组
+
+Phase 1 的 join-hub 只在两条 arm **都**指向已注册的 pooled hub 时才生效；
+`switchFor` 单条 2-way site（不是多 site 共享 hub）收敛出的
+`if (cond) goto M; else {WORK; ...M 的内容...}` 这个更常见的"跳过型" diamond
+仍然落不到 Phase 1。新增的 `restructureSkipGotos`/`trySplitSkipGoto`
+（匿名命名空间）在 `Structurizer::run()` 里、`elideFallthroughGotos` 之前
+跑一遍，把这个形状重写成 `if (!cond) {WORK}` 接着内联 `M` 的内容：
+
+```284:323:d:\funtune\xdec\src\emit\structure.cpp
+StmtPtr trySplitSkipGoto(Stmt& ifStmt) {
+  ...
+}
+
+void restructureSkipGotos(StmtPtr& node) {
+```
+
+只在 CFG 层能证明「goto 目标 = 另一臂末尾 fallthrough 到的首 block，且该
+label 只有这一个引用来源」时才动手，不与 `tryDiamond`/`tryOneSided` 的
+既有优先级冲突（这是它们之后的 tree-level 补丁，不是抢块）。
+
+### Phase 3（J3 扩展）：消除 `state=select(...)` 与重复 `if` 的双轨
+
+最初以为 Phase 1/2 收敛后残留的 `if (t26==0) {state=0x18;} else
+{state=0x21;}` 是 `Stmt::If` 节点，为此写了一整套
+`isDeadRoutingStateDiamond`/`dropDeadRoutingDiamonds`——调试后发现这其实是
+`c_stmt.cpp` 的 `printSelectAssign` 内联打印的 `Store`-of-`Select`，不在
+`Stmt` 树上，那一整块代码（连同 `singleArmBlock`/`singleConstStoreOp`/
+`mayReadBeforeRewrite`）已从 `structure.cpp` 撤回。真正要改的是既有的
+`deadRoutingStateStore`（`c_stmt.cpp`）：它原来要求配对的 `if` 两条 arm
+**都**是裸 `goto`/`continue` leaf 才信任"这个决策已经体现在控制流里"，
+Phase 1/2 把其中一条 arm 变成"内联的真实 work、不再是 leaf"之后这个条件就
+一直不满足，`state=...` 的冗余 store 反而更难删。放宽成"至少一条 arm 是
+裸 leaf 或整条 arm 缺失"即可信任：
+
+```912:914:d:\funtune\xdec\src\emit\c_stmt.cpp
+            const bool nextArmsLeaveDirectly = isGotoLeaf(next.thenArm.get()) ||
+                                               isGotoLeaf(next.elseArm.get()) || !next.thenArm ||
+                                               !next.elseArm;
+```
+
+`sub_b7000` 的 if 数从 ~40 掉到 31（去掉了 `if (t26==0)` 那一整块），
+`sample_libscplugin` 的 if 数从 500+ 掉到 386，goto 数不受影响（这一步删的
+是重复赋值，不是控制流本身）。
+
+### Phase 4（J2f 扩展）：if-tree 里的 `while(true)+guard` 恢复成 `while(cond)`
+
+`wrapAsLoop` 给一个 `CondBranch` 头的自然循环包一层 `while (true)`，本意是
+让循环体自己再判一次退出条件；Phase 0 的 scatter collapse 让很多这种头在
+`wrapAsLoop` 看到之前就已经被收敛成 `If` 了，于是留下
+`while (true) { if (cond) { continue; } else { WORK } }`——`continue` 那条
+arm 纯粹是"再跳回来重新判一次"，本该就是 `while (cond)` 的循环头。新增的
+`trySimplifyGuardedSpin`/`simplifyGuardedSpins`：
+
+```1608:1610:d:\funtune\xdec\src\emit\structure.cpp
+StmtPtr Structurizer::trySimplifyGuardedSpin(Stmt& whileStmt) {
+  if (whileStmt.cond.valid() || !whileStmt.body) {
+    return nullptr;
+```
+
+在 `restructureSkipGotos` 之后、`elideFallthroughGotos` 之前跑，把这个形状
+的 `while (true)` 直接改写成 `while (cond) {}`，`WORK` 原样接在循环后面。
+`sample_libscplugin` 的 `loops_while_true` 从 49 掉到 12，goto 303→273（Phase
+2 的 fallthrough 消除在 splice 后的新落点上又生效了一批），if 386→349；
+`sub_b7000` goto 20→19、if 31→30。
+
+### Phase 5（J2g 扩展）：`If` 子树里的孤儿 goto 折叠
+
+`expandUniqueCaseGotos`/`expandGotoTargets` 原来只在 `Switch` 的 case/default
+槛位上找"全局唯一引用 + IL 单前驱 + 干净离开 + 不含嵌套 switch"的孤儿组，
+折进去代替裸槛位；`switchFor` 2-way 收敛失败时的最终兜底
+（`ifStmt->thenArm = gotoStmt(...)`）落在 `If` 的 arm 上，从未被这条 pass
+扫到过。现在同一份 `tryFold` 判定逻辑也用在 `If` 的 `thenArm`/`elseArm`
+本身是裸 `Goto` 的情形：
+
+```1526:1544:d:\funtune\xdec\src\emit\structure.cpp
+  } else if (node->kind == StmtKind::If) {
+    // Phase 5 (goto-elimination plan §Phase5, J2g extension): switchFor's
+    // own 2-way collapse (its epilogue-building branch) falls back to a
+    // bare `Goto` arm whenever Phase 1's join-hub epilogue could not be
+    // built for that target -- most often because some other site already
+    // claimed the hub. ...
+    if (node->thenArm && node->thenArm->kind == StmtKind::Goto) {
+      tryFold(node->thenArm, node->thenArm->block);
+    }
+    if (node->elseArm && node->elseArm->kind == StmtKind::Goto) {
+      tryFold(node->elseArm, node->elseArm->block);
+    }
+  }
+```
+
+顺带把 `node->epilogue` 的递归从只在 `Switch` 分支内调用改成无条件调用
+（`If` 的 epilogue，Phase 1 加的，此前从未被这条 pass 递归过）。
+`tests/emit/test_structure_unique_goto_expand.cpp` 新增两例：一例复用第一个
+Switch 测试的"两臂共享 sink、regionClosed 两边都失败"技巧，只是 dispatcher
+换成 `twoWaySite`（收敛成 `If`），验证 arm 折叠生效；一例验证目标仍有真实
+第二引用时 arm 保持裸 `goto` 不动。在 `sub_b7000`/`sample_libscplugin` 两个
+现有语料上实测无变化——两者残留的 goto 全是货真价实的多引用 hub，不是
+遍历顺序偶然搁浅的孤儿，这条 pass 目前没有本地样本能触发，但机制本身由
+新增单测覆盖。
+
+### 累计效果
+
+| 函数 | 指标 | Phase0/1 后 | Phase2 后 | Phase3 后 | Phase4 后 | Phase5 后 |
+|------|------|-----:|-----:|-----:|-----:|-----:|
+| `sub_b7000 @ 0xb7000` | goto | 26 | 20 | 20 | 19 | 19 |
+| `sub_b7000 @ 0xb7000` | if | ~40 | ~40 | 31 | 30 | 30 |
+| `sample_libscplugin @ 0x1164f8` | goto | 332 | 303 | 303 | 273 | 273 |
+| `sample_libscplugin @ 0x1164f8` | if | 533 | 533 | 386 | 349 | 349 |
+| `sample_libscplugin @ 0x1164f8` | while(true) | 49 | 49 | 49 | 12 | 12 |
+
+对照计划开篇的验收目标（`sub_b7000` 26→~8，`sample_libscplugin`
+332→~150-180）：两个函数都还没到位，Phase 5 的机制在这两个具体样本上没找到
+可折的孤儿，主要缺口仍是 `docs/19` §4 记录的诚实下限——一个多前驱共享 hub，
+`If` 路径付出"每 site 一个 goto"而不是"一次共享内联"的代价，这是比 Phase
+1 的单-hub epilogue 更进一步的"多 hub 共享 epilogue"能力，未在本轮范围内。
+
+### 回归
+
+- `xdec_tests.exe`：**650** test cases、133860 assertions 全过（新增
+  `tests/emit/test_structure_skip_goto.cpp` 两例、
+  `tests/emit/test_structure_unique_goto_expand.cpp` 两例；
+  `tests/emit/test_c_dead_routing_store.cpp` 新增一例、既有一例改标题澄清
+  判定边界；`tests/emit/test_structure_dispatch_region.cpp`/
+  `tests/emit/test_structure_region_switch.cpp` 随 Phase 0 的默认值变化
+  改写）。
+- `samples/run.ps1`：**6/6**（新增 `sample_sub_b7000` @ `libscplugin
+  0xb7000`，`max_gotos: 22`/`min_ifs: 27`/`max_undef: 2`；
+  `sample_libscplugin` 的 `max_gotos` 380→300、`min_ifs` 500→340（Phase 3 的
+  `deadRoutingStateStore` 扩展先把它从 500 压到 386，Phase 4 的
+  `simplifyGuardedSpins` 再压到 349，均为实测数字加轻量余量，不是预设
+  目标——按 `samples/README.md` "increment slowly" 的规则，后续 Phase
+  继续关闭 §J2e/J2f/J2g 缺口时再收紧）。
+
+## 2026-08-13：absd `start()` 间接跳转 + t 变量传递（Tier A / Tier B）
+
+对应计划：`absd_start_反编译修复`（该文件不可编辑，本节记录实测）。目标函数是
+iOS Mach-O `absd` 的 `LC_MAIN` 入口 `0x100023290`，一个把状态机摊平到"每个
+dispatcher 自带 anchor、共读同一张偏移表"的混淆函数。计划分两层：Tier A 让
+`--rounds 1` 稳定产出可读的入口；Tier B 在 discovery 围栏下把状态机本体放进来
+而不爆炸。
+
+### Tier A（A1-A6）
+
+| 项 | 落点 | 实测 |
+|----|------|------|
+| A1 稀疏值集 | `preciseIndexSet`（`index_bound.cpp` 的 `exactValues`）+ `tableCandidates` 优先用它 | L0 候选 12 → 2 |
+| A2 `Add`/`Sub` + cinc | `localBound`/`armBound` 认常量偏移与 `select(cond, x, x+1)` | 单测覆盖；absd 的 L1 本身无 guard，候选数不变 |
+| A3 anchor 常量 | `macho.cpp` 把 `__DATA_CONST`/`__AUTH_CONST` 记为 fixups 后只读；`image.cpp` 的 `isImmutable` 放宽 `RelocKind::Relative` | anchor 折成常量，`g_1000a8140` 写入解析正确 |
+| A4 tableMode | `switchFor` 强制 table 模式 + `matchDispatchValues` 回落 `preciseIndexSet` | 入口 `BR` 输出 `switch (index)` / `case 0xa:` / `case 0xb:` |
+| A5 边拷贝裁剪 | `edgeCopies` 跳过恒等拷贝（`tN = tN`） | rounds=3 时 temp 94830 → 94484 |
+| A6 manifest | `sample_absd_start`（rounds=1） | 117 行 / 2 goto / 34 temp / 1 switch / 2 sealed |
+
+### Tier B（B1-B6）
+
+B1/B2 是"能不能有边界"：`FunctionFence::enforce` 让围栏外的 discovery 真的不
+进 entries（此前围栏只是 advisory），`DriverOptions::maxDiscoveryPerBranch` +
+CLI `--discovery-cap` 让单条分支一次提供的 missing 目标超过上限时整条分支被拒
+（留作 sealed），CLI 另加 `--max-span`。absd 的分支目标数分布是两级的——
+
+| `--rounds 4 --discovery-cap` | 行数 | goto | temp | switch | label | sealed |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 / 32 / 36 | 117 | 2 | 34 | 1 | 2 | 2 |
+| 40 / 48 / 64 / 128 | 10831 | 366 | 20879 | 10 | 269 | 24 |
+
+**没有中间尺寸**：这个函数唯一"大"的 dispatcher 提供约 40 个目标，放它进来就
+一次带进约 300 个 block，所以计划里 Tier B 的 500–2000 行目标对*这个函数*不可
+达。cap 32 的输出与 `--rounds 1` **逐字节相同**（`Compare-Object` 差异 0 行），
+因此没有必要为它再注册一个样本；注册的 `sample_absd_start_l2` 用的是 cap 64
+的"放进来"形态，按 `sample_libscplugin` 的先例作观测型（非目标型）阈值。
+
+B3 才是让那 10831 行变得能读的部分，两处都是"分析没认出表"而不是"结构化没折"：
+
+1. **表项指回自己的表读之后**。表 `0x100081cb0` 的第 37 项是 `0x1c`，加上
+   anchor `0x1000238b8` 正好落在 dispatcher 自己的 `add x11, x11, x12; br x11`
+   上——跳过去等于不重读表、拿着已经算完的地址再加一次 anchor，下一跳必然落到
+   映射外。留着它，这条边会以自环解析，而自环给表读前面插了一个 phi，
+   `matchJumpTable` 就再也认不出后面是表：整个 dispatcher 退化成 40 路
+   `if (t + 0x1000238b8) == 0x...` 比较链。修法是在候选阶段就把"落在本块表读
+   之后、分支之前"的候选丢掉（落在表读*之前*的保留——那是重读表的普通
+   dispatch 循环）：
+
+```157:164:d:\funtune\xdec\src\passes\resolve_indirect.cpp
+  /// Where in `block` this branch reads the table it dispatches through: the
+  /// address of the last memory read in `block` that `target` depends on,
+  /// following values transitively. Nullopt when the expression reads no
+  /// memory this block defines -- the read happened somewhere else, and
+  /// nothing about where a target lands inside this block can skip it.
+  [[nodiscard]] static std::optional<uint64_t> lastTableReadIn(const il::Function& function,
+                                                               il::BlockId block,
+                                                               il::ExprId target) {
+```
+
+2. **region 聚类不该用 anchor**。偏移表的 anchor 是"读它的那个 site 自己在哪
+   儿"，absd 的 6 个 site 各有各的 anchor，于是 `findDispatchRegions` 把它们分
+   成 6 个单 site region，`findDispatchJoins`/`matchRegionSharedTail` 的"跨 site
+   汇总证据"就无从谈起。`TableKey` 去掉 anchor 之后：7 region/7 site →
+   2 region/7 site，其中一个是 6 site 的 scatter region（nest depth 6）。
+
+这两条合起来把 5 个地址比较型 dispatcher 变回 `switch (index)`（10 switch 中
+现在只剩 1 个是地址判别式）。另外 `switchFor` 在表匹配失败时不再打印比较链，
+而是打印以目标地址为判别式的 `switch`（`Stmt::addressCases`）：同样的语义，
+判别式只写一次而不是每臂一次；`alwaysLeaves` 对它保持保守（和比较链一样没有
+default，可以落空）。
+
+### 两个测量后回退/无效的项
+
+- **B4（state 寄存器提升）**：计划假设 absd 的状态在某个寄存器里跨 block 存活，
+  只是没到 promotion 阈值。实测不成立。按"同一寄存器出现在 ≥4 个 site 的
+  index 里"命名，选出的寄存器有 **252** 个 phi；放宽成"index 读到的所有
+  register phi"是 **68** 个，其中还包含被后续指针推断定型成 `uint64_t*` 的基
+  址值和宽度为 0 的标志值——没有一个是"读者能跟着走的那个 state"。真实形状
+  是：absd 每个 site 都从新载入的标志位重算 index（`w9 + w10`、
+  `w14 + or(zext(!cmp)...)`），libscplugin 的 index 干脆是两个字面量的
+  `select`（`matchDispatchValues` 已经把它们打成 case 标签）。语料里没有
+  "一个寄存器承载 scatter 状态"的样本，因此这一项整体回退，`variables.cpp`
+  只留一条指回本节的注释。
+- **B5（scatter 边拷贝抑制）**：`matchLiveRegisterFrame` 原来只在
+  `shape->merge == mergeBlock`（单块投票出的 dispatcher shape）时才匹配，J2e
+  的 pooled join hub 因为"没有自己的 `hub` 可比对"而总是全量打印 case 保存。
+  新增 `Structurizer::frameThroughJoinHub`：hub 只有一个后继时，就用那个后继
+  充当 shape 的 `hub`，relay 的判定与投票出的 merge 完全一致。机制由
+  `tests/emit/test_structure_join_epilogue.cpp` 新增一例覆盖（hub 与其下方
+  block 都有 `reg:x5` phi → frame 有 1 个 slot），但在 8 个样本上实测 0 变化：
+  absd 的 scatter region 根本没有 join hub（label 最多 5 个前驱，
+  `sharedTail=false`），已有 hub 的样本走的是投票路径。
+- 顺带把 absd 剩下的 8102 条拷贝行做了分类，供后续参考：**7122** 条是纯
+  `tA = tB;`。这些是 phi 下降的必然产物，要真正消掉需要带干涉判定的 phi
+  coalescing（SSA destruction），不在本轮范围内——这是"t 变量传递"这条根因
+  剩下的主体。
+
+### 回归
+
+- `xdec_tests.exe`：**665** test cases 全过（新增
+  `tests/passes/test_resolve_indirect.cpp` 两例（表项指回表读之后 / 指回表读
+  本身）、`tests/analysis/test_dispatch_region.cpp` 两例（同表不同 anchor 归
+  一个 region / 不同表仍分开）、`tests/emit/test_structure_join_epilogue.cpp`
+  一例）。
+- `samples/run.ps1`：**8/8**（新增 `sample_absd_start_l2`；`baseline.json`
+  已更新）。

@@ -1,14 +1,14 @@
-// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): design
-// freeze ahead of collapseRegionDispatchTree's own landing. This file's
-// Fixture builds the plan's own reference shape -- 7 two-way table dispatch
-// sites, chained linearly, all reading through one physical table with
-// statically recoverable caseValues -- so Phase 3's own tests (a single
-// >=7-case mega-switch once the region pass exists; a mixed unrecoverable
-// site declining the whole plan; two different clamps staying two regions)
-// have one fixture to grow into rather than each re-deriving it. Only the
-// one assertion actually provable today lives here: `regionStructuring`
-// (see StructureOptions) is not yet read by Structurizer at all, so toggling
-// it must not change a single byte of what switchFor already prints.
+// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3):
+// Structurizer::collapseRegionDispatchTree runs unconditionally once
+// switchFor finishes building a table-mode switch belonging to some
+// analysis::DispatchRegion. This file's Fixture builds the plan's own
+// reference shape -- two-way table dispatch sites chained linearly, all
+// reading through one physical table -- to exercise that pass directly:
+// a chain of sites that each recompute their own, different discriminant
+// declines the fold (each site's own state read is a different ExprId), a
+// relay reading the identical already-evaluated discriminant as its own
+// dispatcher gets flattened into the outer switch's cases, and a relay that
+// recomputes a fresh discriminant stays nested.
 #include <catch2/catch_test_macros.hpp>
 
 #include <vector>
@@ -129,38 +129,34 @@ struct Walk {
 
 }  // namespace
 
-TEST_CASE("regionStructuring=false leaves a 7-site region byte-identical to "
-          "today's baseline",
+TEST_CASE("collapseRegionDispatchTree declines a chained region whose sites "
+          "each recompute their own, different discriminant",
           "[emit][structure][region-switch]") {
   // 7 sites organically crosses the default minRegionSites floor (8 is the
   // floor, but the diagnostic override below reaches the same deferred
   // shape without relying on that), so switchFor already keeps every site
-  // as its own table-mode switch instead of collapsing to if/else. Toggling
-  // StructureOptions::regionStructuring (not yet consulted anywhere) must
-  // not move a single one of those switches -- Structurizer::run() has no
-  // region pass yet to move them with.
+  // as its own table-mode switch instead of collapsing to if/else. Each
+  // site's own state read is a fresh `select()` -- a different ExprId, not
+  // a shared discriminant -- so collapseRegionDispatchTree's exact-`ExprId`
+  // soundness check declines every one of them: running it must not move a
+  // single one of those switches.
   Fixture f;
   const BlockId tail = f.block(0x9100);
   f.chainedTwoWaySites(f.entry, 7, 0x30b7f0, tail);
   f.function.appendReturn(tail, 0x9100);
   f.function.rebuildEdges();
 
-  StructureOptions baseline;
-  baseline.deferRegionCollapse = true;
-  Walk withoutFlag;
-  withoutFlag.visit(run(f.function, baseline).root);
+  StructureOptions options;
+  options.deferRegionCollapse = true;
+  Walk walk;
+  walk.visit(run(f.function, options).root);
 
-  StructureOptions withRegionStructuring = baseline;
-  withRegionStructuring.regionStructuring = true;
-  Walk withFlag;
-  withFlag.visit(run(f.function, withRegionStructuring).root);
-
-  CHECK(withoutFlag.kinds == withFlag.kinds);
-  REQUIRE(std::count(withoutFlag.kinds.begin(), withoutFlag.kinds.end(), StmtKind::Switch) == 7);
+  REQUIRE(std::count(walk.kinds.begin(), walk.kinds.end(), StmtKind::Switch) == 7);
 }
 
-TEST_CASE("regionStructuring=true flattens a private relay dispatch reading "
-          "the identical discriminant into the outer switch's own cases",
+TEST_CASE("collapseRegionDispatchTree flattens a private relay dispatch "
+          "reading the identical discriminant into the outer switch's own "
+          "cases",
           "[emit][structure][region-switch]") {
   // entry dispatches on `index` to {tail0, relay}; relay -- reached only
   // from entry's own second target -- reads that exact same `index` again
@@ -186,7 +182,6 @@ TEST_CASE("regionStructuring=true flattens a private relay dispatch reading "
 
   StructureOptions options;
   options.deferRegionCollapse = true;
-  options.regionStructuring = true;
   const StructuredFunction result = run(f.function, options);
   Walk walk;
   walk.visit(result.root);
@@ -218,8 +213,8 @@ TEST_CASE("regionStructuring=true flattens a private relay dispatch reading "
   CHECK(switchStmt->cases[2] == leafB);
 }
 
-TEST_CASE("regionStructuring=true does not flatten a relay dispatch that "
-          "recomputes its own, different discriminant",
+TEST_CASE("collapseRegionDispatchTree does not flatten a relay dispatch "
+          "that recomputes its own, different discriminant",
           "[emit][structure][region-switch]") {
   // Same shape as above, but `relay` reads a *fresh* select rather than
   // entry's own `index` -- the ordinary scatter-dispatcher shape, where a
@@ -244,7 +239,6 @@ TEST_CASE("regionStructuring=true does not flatten a relay dispatch that "
 
   StructureOptions options;
   options.deferRegionCollapse = true;
-  options.regionStructuring = true;
   const StructuredFunction result = run(f.function, options);
   Walk walk;
   walk.visit(result.root);

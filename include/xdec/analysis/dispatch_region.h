@@ -27,6 +27,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <vector>
@@ -93,7 +94,7 @@ struct DispatchRegionTail {
 };
 
 /// Every dispatch site sharing one physical jump table -- same base, stride,
-/// entry width and anchor/offset shape (see analysis::JumpTable) -- and, when
+/// entry width and offset signedness (see analysis::JumpTable) -- and, when
 /// they clamp their index, the same bound/replacement pair. A data identity,
 /// not a control-flow shape: two sites can belong to the same region while
 /// looking nothing alike in the CFG, because what makes them one region is
@@ -103,6 +104,10 @@ struct DispatchRegion {
   uint32_t tableStride = 0;
   uint32_t tableEntryBits = 0;
   bool tableRelative = false;
+  /// The anchor the region's *first* site adds its offsets to. Offset tables
+  /// are anchored per site (typically at the reading dispatcher's own
+  /// address), so this is a sample, not a property every site shares -- it is
+  /// not part of what makes these sites one region.
   uint64_t tableAnchor = 0;
   bool tableSignedOffsets = false;
   /// Absent when no site in this region clamps its index at all -- a table
@@ -179,5 +184,42 @@ struct DispatchJoin {
 [[nodiscard]] std::optional<DispatcherShape> confirmDispatcherShapeFromRegion(
     const il::Function& function, il::BlockId dispatch, std::span<const il::BlockId> targets,
     const DispatchRegion& region);
+
+/// The CFG shape a scatter-dispatcher's own sites take when `sharedTail` is
+/// absent (docs/19-scatter-dispatch-target-shape.md): one site's handler
+/// routinely does a couple of ops and then dispatches again through the
+/// exact same table, so the region is not a flat pool of unrelated
+/// decisions but a nested decision forest -- one binary decision per site,
+/// chained through whichever arm keeps dispatching. `children[site]` is
+/// every other site in the region that some target of `site` leads into
+/// (see `buildDispatchNestGraph`'s own search radius); a site absent from
+/// `children` is a leaf, its own handlers never re-entering the table.
+/// `roots` are the sites no other site's own targets ever lead into --
+/// where a reader walking the function from its entry would first meet
+/// this region's own decision tree, of which there can be several,
+/// independently reached, in one function. `maxDepth` is the longest chain
+/// from any root, and `nestedSiteCount` is how many distinct sites appear
+/// as *someone's* child -- how many of the region's sites are themselves
+/// reached this way rather than only from the function's ordinary control
+/// flow.
+struct DispatchNestGraph {
+  std::map<il::BlockId, std::vector<il::BlockId>> children;
+  std::vector<il::BlockId> roots;
+  std::size_t maxDepth = 0;
+  std::size_t nestedSiteCount = 0;
+};
+
+/// Builds `region`'s own nest graph by walking, from each of `region`'s
+/// sites' own targets, forward through the CFG for a bounded number of
+/// hops looking for the next block that is itself one of `region`'s own
+/// sites -- exactly what a chained scatter site's "keep dispatching" arm
+/// looks like once its handler runs a short straight-line span and re-enters
+/// the same table. A target that dead-ends (returns, or never reaches
+/// another site within the search radius) contributes no edge; nothing here
+/// is guessed when the walk comes up empty. Purely descriptive: never
+/// claims a block, never changes what `il::Function` reports, and answers
+/// only questions about `region`'s own sites, not the rest of the CFG.
+[[nodiscard]] DispatchNestGraph buildDispatchNestGraph(const il::Function& function,
+                                                        const DispatchRegion& region);
 
 }  // namespace xdec::analysis

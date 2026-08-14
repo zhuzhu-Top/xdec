@@ -2,6 +2,7 @@ xdec_add_library(xdec_binary
   SOURCES
     elf.cpp
     image.cpp
+    macho.cpp
     memory_map.cpp
     target_profile.cpp
   DEPS

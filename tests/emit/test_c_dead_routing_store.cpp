@@ -1,10 +1,13 @@
 // J3 (docs/architecture-optimization-eval-prompt.md §6.6): an obfuscator's
 // routing decision sometimes compiles twice -- a `state=A:B` store that only
 // ever feeds a `switch` on that same local elsewhere, and a genuine compare
-// on the exact same condition right after it whose own arms just goto
-// straight to the two targets that value would have dispatched to anyway
-// (`quantify_c.py`'s `duplicate-routing-if`). These tests exercise
-// `deadRoutingStateStore` end to end through the real printer.
+// on the exact same condition right after it whose own arms either goto
+// straight to the two targets that value would have dispatched to anyway, or
+// (goto-elimination plan Phase 3) inline one of those targets' own work in
+// place of its goto once Phase 1's epilogue absorption or Phase 2's
+// `restructureSkipGotos` (see structure.cpp) has already turned it into
+// exactly that (`quantify_c.py`'s `duplicate-routing-if`). These tests
+// exercise `deadRoutingStateStore` end to end through the real printer.
 #include <catch2/catch_test_macros.hpp>
 
 #include <string>
@@ -142,8 +145,38 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "a routing state store is kept when the paired branch's arms are not "
-    "both bare gotos",
+    "a routing state store duplicated by a real compare is dropped even when "
+    "one arm inlines real work of its own instead of leaving as a bare goto",
+    "[emit][dead-ops][routing-if]") {
+  Fixture f;
+  const ExprId cond = f.function.binary(ExprOp::CmpEq, f.entryReg("x0"), f.i64(0));
+  f.function.appendStore(f.entry, 0x1000, Type::integer(64), f.slot(-0x10),
+                         f.function.select(cond, f.i64(0xf), f.i64(0xd)));
+  const BlockId target0 = f.block(0x2000);
+  const BlockId target1 = f.block(0x3000);
+  f.function.appendCondBranch(f.entry, 0x1004, cond, target0, target1);
+  // Unrelated work of its own -- never touches the routing slot -- so
+  // `target0` inlines in place as a real arm rather than a bare `goto`. This
+  // is exactly the shape Phase 1's epilogue absorption and Phase 2's
+  // `restructureSkipGotos` (see structure.cpp) leave one side in once a
+  // resolved dispatch's decision is fully expressed by the `if` itself.
+  f.function.appendStore(target0, 0x2000, Type::integer(64), f.i64(0x9000), f.i64(0x7));
+  f.function.appendReturn(target0, 0x2004);
+  f.function.appendReturn(target1, 0x3000);
+  // Only `target1` gets a disqualifying second predecessor, forcing it to
+  // stay a bare `goto` leaf while `target0` inlines instead -- one arm a
+  // leaf, the other real work, neither empty.
+  f.function.appendBranch(f.block(0x9010), 0x9010, target1);
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(occurrences(text, "= 0xf;") == 0);
+  CHECK(occurrences(text, "= 0xd;") == 0);
+}
+
+TEST_CASE(
+    "a routing state store is kept when a one-sided if's own inlined arm "
+    "rereads the local before it would be dropped",
     "[emit][dead-ops][routing-if]") {
   Fixture f;
   const ExprId cond = f.function.binary(ExprOp::CmpEq, f.entryReg("x0"), f.i64(0));
@@ -155,7 +188,10 @@ TEST_CASE(
   // A downstream reread, forwarded to a global exactly as
   // test_c_expr_reuse.cpp's fixture does: keeps the whole store observable
   // to the unrelated whole-function findDeadStackStores pass, so this test
-  // exercises `deadRoutingStateStore`'s own decline, not that pass's.
+  // exercises `deadRoutingStateStore`'s own decline, not that pass's. The
+  // branch itself is a one-sided if (an inlined arm, not a bare goto on
+  // both sides, same shape the previous test's own second arm now takes) --
+  // it is this reread, not that shape, that must keep the store alive.
   const il::ValueId reread =
       f.function.appendLoad(target0, 0x2000, Type::integer(64), f.slot(-0x10));
   f.function.appendStore(target0, 0x2004, Type::integer(64), f.i64(0x9000),

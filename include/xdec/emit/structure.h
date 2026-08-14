@@ -70,10 +70,11 @@ inline constexpr std::array<PatternAttempt, 4> kCondBranchPatterns{{
 /// runs at a different point in `Structurizer::run()` (once per qualifying
 /// region, ahead of `emitRegion`'s per-block walk, not once per site inside
 /// it). Named and frozen here as its own table, the same doc-only,
-/// checked-by-a-test discipline `kCondBranchPatterns` already holds to,
-/// purely so the interface exists before the implementation does: nothing
-/// in `Structurizer` reads this yet, and `StructureOptions::regionStructuring`
-/// (default off) is what Phase 3's actual pass gates on once it exists.
+/// checked-by-a-test discipline `kCondBranchPatterns` already holds to.
+/// `Structurizer::collapseRegionDispatchTree` (see structure_dispatch_
+/// region.cpp) is that pass, run unconditionally once `switchFor` finishes
+/// building a table-mode switch that is a member of some
+/// analysis::DispatchRegion.
 struct RegionPatternAttempt {
   std::string_view name;
   int priority;
@@ -130,6 +131,19 @@ struct Stmt {
   /// Compare-chain switches carry their case constants; table switches use
   /// the case index instead and leave this empty.
   std::vector<uint64_t> caseValues;  // Switch, chain mode
+  /// Whether `caseValues` are the *addresses* the branch computes rather than
+  /// dispatch values: the form a resolved computed branch takes when nothing
+  /// recovers a table behind it, so all that can be said about each case is
+  /// which address reaches it.
+  ///
+  /// Printed as a switch anyway, because the alternative -- a chain of
+  /// `if (target == 0x...) else if (target == 0x...)` -- repeats the
+  /// discriminant once per arm, and these branches have dozens. What it does
+  /// *not* buy is exhaustiveness: an address switch has no default and no
+  /// proof that its cases cover the value, exactly as the compare chain it
+  /// replaces had none, which is why `alwaysLeaves` still treats it as able to
+  /// fall through.
+  bool addressCases = false;  // Switch, chain mode
   /// The dispatcher block each case edge leaves from (chain mode, parallel
   /// to cases): phi edge assignments print from there.
   std::vector<il::BlockId> casePreds;  // Switch, chain mode
@@ -146,9 +160,21 @@ struct Stmt {
   /// switch's closing brace instead of once per case. A case that reaches it
   /// ends with a `Break` rather than a `goto`/`return`. Null when no such
   /// shape was found for this switch.
-  StmtPtr epilogue;          // Switch
+  /// If (J2e-if, docs/architecture-optimization-eval-prompt.md §6.3): the
+  /// same shared-tail machinery, reached from `switchFor`'s 2-way collapse
+  /// instead of its table-mode path -- a scatter-dispatcher's typical
+  /// two-way site is below `analysis::matchDispatcherShape`'s own
+  /// three-target floor, but `Structurizer::joinHubByTail` pools evidence
+  /// across the whole region, so a hub two or more *arms* privately fall
+  /// into is just as buildable here. Printed right after the `if`/`else`'s
+  /// own closing brace; an arm that reaches it (via
+  /// `Structurizer::claimDispatcherCaseBody`) ends with neither a `goto` nor
+  /// a `break` -- unlike a Switch case, an `If` arm's own C block already
+  /// falls straight through to whatever follows once it stops adding
+  /// statements, so nothing needs to say so explicitly.
+  StmtPtr epilogue;          // Switch, If
   /// The block `epilogue` was built from; invalid when `epilogue` is null.
-  il::BlockId mergeBlock{};  // Switch
+  il::BlockId mergeBlock{};  // Switch, If
   /// The shadow/live register pairing the dispatcher's handlers save into and
   /// restore out of on their way to `epilogue` (see
   /// analysis::LiveRegisterFrame). Null whenever `epilogue` is, or the shape
@@ -206,15 +232,24 @@ struct StructureOptions {
   /// building a region large enough to cross `minRegionSites` on its own.
   /// Never set by decompileToC()'s own default path.
   bool deferRegionCollapse = false;
-  /// J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): gates the
-  /// not-yet-implemented region pass named at `kRegionPatterns` -- collapsing
-  /// a whole analysis::DispatchRegion's nested tree of two-way sites into one
-  /// mega-switch rather than leaving `switchFor` to structure each site on
-  /// its own. Frozen here, ahead of that pass's own landing, so
-  /// `StructureOptions`'s shape does not have to change again once it does;
-  /// `Structurizer` does not read this field yet, so setting it true today
-  /// changes nothing.
-  bool regionStructuring = false;
+  /// docs/19-scatter-dispatch-target-shape.md: a region with no
+  /// analysis::DispatchRegion::sharedTail is the *scatter* shape (hundreds
+  /// of otherwise-unrelated binary decisions, no single block most of them
+  /// converge on), not a flattened N-way state machine a table-mode
+  /// switch's own hub/epilogue machinery has anything to offer.
+  /// `switchFor`'s defer still holds for a region that *does* vote a
+  /// `sharedTail` (the real `tryDispatcherLoop`/hub shape, switch-mode
+  /// still the honest print for it), but a member of a sharedTail-less
+  /// region always collapses to `if`/`else` exactly as an isolated site
+  /// would -- and, since a chained scatter site's "keep dispatching" arm is
+  /// another such site, the ordinary recursion through `claimCaseBody`
+  /// rebuilds the whole chain as nested `if`/`else if` on its own, no
+  /// separate pass required. Always on: this used to be gated behind
+  /// `collapseScatterRegionSites` (default off, CLI `--collapse-scatter-
+  /// sites`) for an eval/samples run to opt into observing the recovery
+  /// without a unit test standing in; the recovery itself is unconditional
+  /// now, so that field is gone and `minRegionSites`'s defer only ever
+  /// protects a region that actually has a `sharedTail` to protect.
 };
 
 /// Structures the whole function. The analyses must be computed from the

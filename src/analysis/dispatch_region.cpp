@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <vector>
 
 #include "xdec/analysis/dispatch_values.h"
 #include "xdec/analysis/jump_table.h"
@@ -12,6 +13,72 @@
 namespace xdec::analysis {
 
 namespace {
+
+// How many CFG hops buildDispatchNestGraph's own search follows a target
+// before giving up on finding another site of the same region -- a scatter
+// site's handler is a short straight-line span (see
+// docs/19-scatter-dispatch-target-shape.md's own MBA-handler evidence), so
+// this only needs to be generous enough to cross one, not to search the
+// whole function.
+constexpr std::size_t kNestSearchLimit = 48;
+
+/// The first block reachable from `start` (not counting `start` itself)
+/// that is one of `dispatchBlocks` -- a breadth-first walk of
+/// `il::Block::successors`, bounded by `kNestSearchLimit` hops so a handler
+/// that never reaches another site does not walk the rest of the function.
+/// `std::nullopt` when `start` is itself a dispatch block (nothing to
+/// search for) or the walk exhausts its radius without finding one.
+std::optional<il::BlockId> firstDispatchReachable(const il::Function& function, il::BlockId start,
+                                                   const std::set<il::BlockId>& dispatchBlocks) {
+  if (dispatchBlocks.contains(start)) {
+    return std::nullopt;
+  }
+  std::set<il::BlockId> visited{start};
+  std::vector<il::BlockId> frontier{start};
+  for (std::size_t hop = 0; hop < kNestSearchLimit && !frontier.empty(); ++hop) {
+    std::vector<il::BlockId> next;
+    for (const il::BlockId node : frontier) {
+      for (const il::BlockId successor : function.block(node).successors) {
+        if (dispatchBlocks.contains(successor)) {
+          return successor;
+        }
+        if (visited.insert(successor).second) {
+          next.push_back(successor);
+        }
+      }
+    }
+    frontier = std::move(next);
+  }
+  return std::nullopt;
+}
+
+/// The longest chain reachable from `node` along `children` -- depth-first
+/// with memoisation, guarded against a cycle (a site whose own handler
+/// dispatches back to an ancestor, e.g. a self-retrying MBA spin site) by
+/// excluding whatever is already on the current walk's own stack rather
+/// than looping forever; a node reached that way contributes 0 from this
+/// walk; the earlier walk that reached it first still has its own memoised
+/// answer once its OnStack scope closes.
+std::size_t chainDepth(il::BlockId node, const std::map<il::BlockId, std::vector<il::BlockId>>& children,
+                       std::map<il::BlockId, std::size_t>& memo, std::set<il::BlockId>& onStack) {
+  if (onStack.contains(node)) {
+    return 0;
+  }
+  if (const auto cached = memo.find(node); cached != memo.end()) {
+    return cached->second;
+  }
+  std::size_t depth = 0;
+  const auto found = children.find(node);
+  if (found != children.end()) {
+    onStack.insert(node);
+    for (const il::BlockId child : found->second) {
+      depth = std::max(depth, 1 + chainDepth(child, children, memo, onStack));
+    }
+    onStack.erase(node);
+  }
+  memo.emplace(node, depth);
+  return depth;
+}
 
 // Same bar analysis::matchDispatcherShape holds its own single-block vote
 // to: a merge candidate has to carry most of the region's pooled targets,
@@ -29,16 +96,21 @@ struct TableKey {
   uint32_t stride = 0;
   uint32_t entryBits = 0;
   bool relative = false;
-  uint64_t anchor = 0;
   bool signedOffsets = false;
   std::optional<uint64_t> clampBound;
   std::optional<uint64_t> clampReplacement;
 
+  // The anchor is deliberately absent. An offset table's anchor is whatever
+  // address the site that reads it happens to sit at, so a scatter
+  // dispatcher's sites each carry their own -- keying on it would file every
+  // one of them as a region of its own and leave nothing for the pooled
+  // evidence findDispatchJoins and matchRegionSharedTail exist to gather.
+  // What makes them one region is still what it always was: the table memory
+  // they all read, at the same stride and width.
   [[nodiscard]] bool operator==(const TableKey& other) const noexcept {
     return base == other.base && stride == other.stride && entryBits == other.entryBits &&
-           relative == other.relative && anchor == other.anchor &&
-           signedOffsets == other.signedOffsets && clampBound == other.clampBound &&
-           clampReplacement == other.clampReplacement;
+           relative == other.relative && signedOffsets == other.signedOffsets &&
+           clampBound == other.clampBound && clampReplacement == other.clampReplacement;
   }
 };
 
@@ -219,7 +291,6 @@ std::vector<DispatchRegion> findDispatchRegions(const il::Function& function) {
                 table->stride,
                 table->entryBits,
                 table->relative,
-                table->anchor,
                 table->signedOffsets,
                 clamp ? std::optional<uint64_t>(clamp->bound) : std::nullopt,
                 clamp ? std::optional<uint64_t>(clamp->replacement) : std::nullopt};
@@ -256,6 +327,49 @@ std::vector<DispatchRegion> findDispatchRegions(const il::Function& function) {
     region.sharedTail = matchRegionSharedTail(function, region.sites);
   }
   return regions;
+}
+
+DispatchNestGraph buildDispatchNestGraph(const il::Function& function, const DispatchRegion& region) {
+  std::set<il::BlockId> dispatchBlocks;
+  for (const DispatchSite& site : region.sites) {
+    dispatchBlocks.insert(site.dispatchBlock);
+  }
+
+  DispatchNestGraph graph;
+  for (const DispatchSite& site : region.sites) {
+    std::vector<il::BlockId> children;
+    for (const il::BlockId target : site.targets) {
+      const std::optional<il::BlockId> child = firstDispatchReachable(function, target, dispatchBlocks);
+      // Excludes a direct self-loop (a spin site whose own retry arm reads
+      // through the same table again, e.g. libscplugin's own MBA-predicate
+      // spin blocks) -- that is evidence of a loop back edge, not a nested
+      // decision one level further in.
+      if (child.has_value() && *child != site.dispatchBlock) {
+        children.push_back(*child);
+      }
+    }
+    if (!children.empty()) {
+      graph.children.emplace(site.dispatchBlock, std::move(children));
+    }
+  }
+
+  std::set<il::BlockId> referencedAsChild;
+  for (const auto& [parent, children] : graph.children) {
+    referencedAsChild.insert(children.begin(), children.end());
+  }
+  graph.nestedSiteCount = referencedAsChild.size();
+  for (const DispatchSite& site : region.sites) {
+    if (!referencedAsChild.contains(site.dispatchBlock)) {
+      graph.roots.push_back(site.dispatchBlock);
+    }
+  }
+
+  std::map<il::BlockId, std::size_t> memo;
+  for (const il::BlockId root : graph.roots) {
+    std::set<il::BlockId> onStack;
+    graph.maxDepth = std::max(graph.maxDepth, chainDepth(root, graph.children, memo, onStack));
+  }
+  return graph;
 }
 
 }  // namespace xdec::analysis

@@ -204,3 +204,103 @@ TEST_CASE(
   CHECK(std::find(targets.begin(), targets.end(), case0) != targets.end());
   CHECK(std::find(targets.begin(), targets.end(), case2) != targets.end());
 }
+
+TEST_CASE("an entry pointing back past the branch's own table read is not a target",
+          "[passes][resolve-indirect]") {
+  // An offset table anchored at the dispatcher itself, with one entry naming
+  // the branch instruction. Taking it would jump straight past the load and
+  // add the anchor a second time -- to an address the first pass through
+  // already finished computing -- so the entry cannot be what it looks like.
+  // Left in, it would resolve as a self edge, and the phi that edge puts in
+  // front of the load is what stops matchJumpTable seeing a table here at all.
+  Function function(Arch::AArch64, xdec::test::arm64Registers(), 0x1000);
+  const BlockId entry = function.createBlock(0x1000);
+  function.setEntryBlock(entry);
+  const BlockId handler = function.createBlock(0x2000);
+
+  const ExprId cond = function.binary(
+      ExprOp::CmpEq, function.entryReg(function.registers().find("x0")),
+      function.constant(Type::integer(64), 0x1234));
+  const ExprId index =
+      function.select(cond, function.constant(Type::integer(64), 0),
+                      function.constant(Type::integer(64), 1));
+  const ExprId address = function.binary(
+      ExprOp::Add, function.constant(Type::integer(64), 0x30000),
+      function.binary(ExprOp::Shl, index, function.constant(Type::integer(64), 2)));
+  const ExprId offset =
+      function.valueRef(function.appendLoad(entry, 0x1000, Type::integer(32), address));
+  const ExprId target =
+      function.binary(ExprOp::Add, function.constant(Type::integer(64), 0x1000),
+                      function.cast(ExprOp::SExt, Type::integer(64), offset));
+  function.appendIndirectBranch(entry, 0x1004, target);
+  function.rebuildEdges();
+  function.setMaturity(Maturity::Ssa);
+
+  FakeTableImage image;
+  image.qwords[0x30000] = 0x1000;  // index 0 -> anchor + 0x1000 = handler
+  image.qwords[0x30004] = 0x0004;  // index 1 -> anchor + 4 = the branch itself
+  image.qwords[0x2000] = 0;
+
+  const auto pass = xdec::passes::makeResolveIndirectPass();
+  xdec::pass::Context context(function);
+  context.setImage(image.reader());
+  auto result = pass->run(context);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+  CHECK(*result);
+
+  const auto targets = function.targets(terminatorOf(function, entry));
+  REQUIRE(targets.size() == 1);
+  CHECK(targets[0] == handler);
+}
+
+TEST_CASE("an entry pointing back at the read itself stays a target",
+          "[passes][resolve-indirect]") {
+  // The same table, except the second entry names the dispatcher's own first
+  // instruction rather than the branch. That one re-reads the table with
+  // whatever index it computes next time round -- an ordinary dispatch loop,
+  // and a real edge, so nothing above may drop it.
+  Function function(Arch::AArch64, xdec::test::arm64Registers(), 0x1000);
+  const BlockId entry = function.createBlock(0x1000);
+  function.setEntryBlock(entry);
+  const BlockId handler = function.createBlock(0x2000);
+
+  const ExprId cond = function.binary(
+      ExprOp::CmpEq, function.entryReg(function.registers().find("x0")),
+      function.constant(Type::integer(64), 0x1234));
+  const ExprId index =
+      function.select(cond, function.constant(Type::integer(64), 0),
+                      function.constant(Type::integer(64), 1));
+  const ExprId address = function.binary(
+      ExprOp::Add, function.constant(Type::integer(64), 0x30000),
+      function.binary(ExprOp::Shl, index, function.constant(Type::integer(64), 2)));
+  const ExprId offset =
+      function.valueRef(function.appendLoad(entry, 0x1000, Type::integer(32), address));
+  const ExprId target =
+      function.binary(ExprOp::Add, function.constant(Type::integer(64), 0x1000),
+                      function.cast(ExprOp::SExt, Type::integer(64), offset));
+  function.appendIndirectBranch(entry, 0x1004, target);
+  function.rebuildEdges();
+  function.setMaturity(Maturity::Ssa);
+
+  FakeTableImage image;
+  image.qwords[0x30000] = 0x1000;  // index 0 -> handler
+  image.qwords[0x30004] = 0x0000;  // index 1 -> anchor + 0 = the read itself
+  image.qwords[0x2000] = 0;
+  image.qwords[0x1000] = 0;
+
+  const auto pass = xdec::passes::makeResolveIndirectPass();
+  xdec::pass::Context context(function);
+  context.setImage(image.reader());
+  auto result = pass->run(context);
+  const std::string error = result ? std::string{} : result.error().format();
+  INFO(error);
+  REQUIRE(result);
+  CHECK(*result);
+
+  const auto targets = function.targets(terminatorOf(function, entry));
+  REQUIRE(targets.size() == 2);
+  CHECK(std::find(targets.begin(), targets.end(), handler) != targets.end());
+  CHECK(std::find(targets.begin(), targets.end(), entry) != targets.end());
+}

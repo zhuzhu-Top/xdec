@@ -353,7 +353,20 @@ bool BinaryImage::isImmutable(uint64_t va, uint64_t size) const noexcept {
     }
     at = region->endVa();
   }
-  return relocationOverlapping(va, size) == nullptr;
+  const Relocation* relocation = relocationOverlapping(va, size);
+  if (relocation == nullptr) {
+    return true;
+  }
+  // A relative rebase is the one relocation whose result this file already
+  // knows. The clause exists because a symbol binding depends on which module
+  // wins the symbol, which one file cannot say -- but a rebase writes back the
+  // slot's own bytes plus the load bias, and the bias is the same one every
+  // address in this decompilation is expressed against. Reading `hasValue` as
+  // "the loader's write was reconstructed" keeps that narrow: an unresolved
+  // rebase, or a bind, still makes the range an observation of memory rather
+  // than a constant of the program.
+  return relocation->kind == RelocKind::Relative && relocation->hasValue &&
+         relocation->va >= va && relocation->va + relocation->width <= va + size;
 }
 
 Result<void> BinaryImage::read(uint64_t va, std::span<std::byte> out) const {
@@ -506,9 +519,14 @@ Result<std::unique_ptr<BinaryImage>> openBinary(const std::filesystem::path& pat
                                                     (static_cast<uint32_t>(magic(2)) << 16) |
                                                     (static_cast<uint32_t>(magic(3)) << 24))
                                                  : 0;
-  if (leadingWord == 0xFEEDFACFu || leadingWord == 0xFEEDFACEu || leadingWord == 0xBEBAFECAu) {
+  if (leadingWord == 0xFEEDFACFu) {
+    return loadMachO(std::move(file), path.string());
+  }
+  if (leadingWord == 0xFEEDFACEu || leadingWord == 0xBEBAFECAu) {
     return err(DiagCode::NotImplemented,
-               std::format("'{}' is a Mach-O image; only ELF is implemented", path.string()));
+               std::format("'{}' is a 32-bit or fat Mach-O image; only 64-bit little-endian "
+                           "Mach-O is implemented",
+                           path.string()));
   }
 
   return err(DiagCode::UnsupportedFormat,

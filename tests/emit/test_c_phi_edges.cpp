@@ -179,6 +179,39 @@ TEST_CASE("copies on one edge are parallel: a swap snapshots its source",
   CHECK(before(text, "__prev = t", "t0 = t"));
 }
 
+TEST_CASE("an edge that hands a phi back its own value carries nothing",
+          "[emit][phi]") {
+  Fixture f;
+  // A loop whose latch leaves one of the two phis alone. The unchanged one
+  // takes its own result back, and writing `t1 = t1` on the latch edge tells a
+  // reader that something happens there when nothing does -- which matters
+  // most on exactly the code that has most of these, a flattened dispatcher
+  // whose state registers stay put across the majority of its edges.
+  const BlockId head = f.function.createBlock(0x2000);
+  f.function.appendBranch(f.entry, 0x1000, head);
+  const il::OpId counter = f.function.appendPhi(head, 0x2000, Type::integer(64),
+                                                std::vector<ExprId>{f.i64(1)});
+  const il::OpId parked = f.function.appendPhi(head, 0x2004, Type::integer(64),
+                                               std::vector<ExprId>{f.i64(0x77)});
+  const ExprId counterRef = f.function.valueRef(f.function.op(counter).result);
+  const ExprId parkedRef = f.function.valueRef(f.function.op(parked).result);
+  const BlockId latch = f.function.createBlock(0x2008);
+  const ExprId cond = f.function.binary(ExprOp::CmpNe, parkedRef, f.i64(0));
+  f.function.appendCondBranch(head, 0x2008, cond, latch, f.entry);
+  f.function.appendBranch(latch, 0x2010, head);
+  f.function.setOperands(
+      counter, std::vector<ExprId>{f.i64(1), f.function.binary(ExprOp::Add, counterRef,
+                                                               f.i64(1))});
+  f.function.setOperands(parked, std::vector<ExprId>{f.i64(0x77), parkedRef});
+
+  const std::string text = f.emit();
+  INFO(text);
+  // The counter's own increment still crosses the edge; the parked value's
+  // self-copy is gone.
+  CHECK(contains(text, "+ 0x1)"));
+  CHECK_FALSE(contains(text, "t1 = t1;"));
+}
+
 TEST_CASE("a dispatcher chain's cases carry their own edges", "[emit][phi]") {
   Fixture f;
   // The switch replaces the compare blocks, so each case is the only place the

@@ -77,10 +77,9 @@ using il::collectValueLeaves;
 }
 
 /// Whether `arm` is exactly a `goto`/`continue` leaf and nothing else -- the
-/// shape `gotoChain`'s own arms always have (see structure.cpp), and the
-/// only shape `deadRoutingStateStore`'s paired `if` is allowed to take:
-/// anything else might carry its own edge copies, which dropping the store
-/// alone never touches.
+/// shape `gotoChain`'s own arms always have (see structure.cpp). One of the
+/// two shapes `deadRoutingStateStore`'s paired `if` is allowed to pair with
+/// an absent arm on the other side (see its caller in collectDeadOpsInto).
 [[nodiscard]] bool isGotoLeaf(const Stmt* arm) {
   return arm != nullptr && (arm->kind == StmtKind::Goto || arm->kind == StmtKind::Continue);
 }
@@ -289,6 +288,13 @@ void StmtPrinter::printIf(const Stmt& stmt, std::string& out) {
   line(out, "}");
   pending_ = il::BlockId{};
   last_ = head;
+  // J2e-if (see Structurizer::switchFor's 2-way collapse): the pooled join
+  // hub either arm's tail fell into (claimDispatcherCaseBody), structured
+  // once here instead of once per arm's own `goto`, same as printSwitch's
+  // own epilogue right after its closing brace.
+  if (stmt.epilogue) {
+    printStmt(stmt.epilogue, out);
+  }
 }
 
 /// `while (cond) { body }`: the header is the condition and prints no code, so
@@ -891,12 +897,21 @@ void collectDeadOpsInto(const il::Function& function, const analysis::StackFrame
             // J3 (docs/architecture-optimization-eval-prompt.md §6.6): the
             // same runtime decision compiled twice -- once into a
             // `state=select(cond,...)` store this block makes, again into
-            // the terminator `next` lowers to. Only tried when `next`'s own
-            // arms just leave (see structure.cpp's `gotoChain`); anything
-            // else might still need the store's value along a path this
-            // cannot see.
-            const bool nextArmsLeaveDirectly =
-                isGotoLeaf(next.thenArm.get()) && isGotoLeaf(next.elseArm.get());
+            // the terminator `next` lowers to. Trusted once at least one arm
+            // is a plain leaf or entirely absent (falls straight through):
+            // Phase 1's epilogue absorption and Phase 2's
+            // `restructureSkipGotos` (see structure.cpp) routinely turn what
+            // used to be the *other* arm's own `goto` into its real work
+            // inlined in place, leaving one side a leaf/empty and the other
+            // not -- either shape still leaves `deadRoutingStateStore`'s own
+            // downstream walk over the real CFG, not this one, to answer
+            // whether the store is actually still live. Only a diamond where
+            // *both* sides carry real inlined work of their own stays
+            // untried, the one shape this cannot yet tell apart from a
+            // second, unrelated decision happening to share the address.
+            const bool nextArmsLeaveDirectly = isGotoLeaf(next.thenArm.get()) ||
+                                               isGotoLeaf(next.elseArm.get()) || !next.thenArm ||
+                                               !next.elseArm;
             if (const il::OpId dead_store = deadRoutingStateStore(
                     function, frame, variables, item.block, next.cond, nextArmsLeaveDirectly);
                 dead_store.valid()) {
@@ -919,6 +934,11 @@ void collectDeadOpsInto(const il::Function& function, const analysis::StackFrame
       }
       if (stmt.elseArm) {
         collectDeadOpsInto(function, frame, variables, *stmt.elseArm, options, dead);
+      }
+      // J2e-if: an `If`'s own epilogue (see switchFor's 2-way collapse)
+      // carries the same dead-op questions a Switch's already does.
+      if (stmt.epilogue) {
+        collectDeadOpsInto(function, frame, variables, *stmt.epilogue, options, dead);
       }
       break;
     case StmtKind::While:
@@ -1644,6 +1664,20 @@ std::vector<StmtPrinter::EdgeCopy> StmtPrinter::edgeCopies(il::BlockId from,
     const analysis::Variable* temp = ctx_.variables.tempFor(op.result);
     const auto operands = ctx_.function.operands(op);
     if (temp == nullptr || index >= operands.size()) {
+      continue;
+    }
+    // A phi taking its own result back on this edge is `t26 = t26`, which is
+    // not a transfer at all. These come from a block that both defines a value
+    // and is re-entered without changing it -- the shape a flattened
+    // dispatcher's state registers have on every edge that leaves them alone
+    // -- and printing them buries the edges that do carry something among the
+    // ones that carry nothing. Dropped here rather than at the print, so that
+    // an edge whose copies are *all* identities counts as having none: callers
+    // ask `edgeCopies(...).empty()` to decide whether an edge needs a
+    // statement at all.
+    const il::Expr& source = ctx_.function.expr(operands[index]);
+    if (source.op == il::ExprOp::Value &&
+        il::ValueId{static_cast<uint32_t>(source.immediate)} == op.result) {
       continue;
     }
     copies.push_back(

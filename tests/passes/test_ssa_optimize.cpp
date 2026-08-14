@@ -379,4 +379,57 @@ TEST_CASE("a flags merge from two different comparisons distributes the test acr
   CHECK(b.function.expr(arms[1]).op == ExprOp::CmpEq);
 }
 
+//   entry:  nzcv = flagdef.sub(x1, x2); br header
+//   header: cond = flagcond(nzcv, eq); brc cond, body, exit
+//   body:   x3 = x3 + 1 (nzcv untouched); br header      (back edge)
+//   exit:   store(x3); ret
+//
+// The header's flags phi merges [entry's FlagDef, the value nzcv already
+// had reaching it from body] -- and since body never writes nzcv, that
+// second arm *is* the header's own phi value: a loop-carried back edge, not
+// a second FlagDef to distribute. distributeFlagCondThroughPhi (fold.cpp)
+// can only ever leave that one arm as the same FlagCond it started from, and
+// before FlagPhiDistributor::resolveRec refused this shape outright, doing
+// so still built a fresh wrapper phi around it every call -- one more than
+// the previous ssa-optimize iteration's, forever, since nothing carried the
+// previous one's identity to the next fresh FlagPhiDistributor. This is the
+// regression for that: absd's own start() (eval/FINDINGS.md's iOS Mach-O
+// entry) has exactly this shape once resolve-indirect resolves far enough to
+// reach it, and a pre-fix build never reaches Ssa for it at all.
+TEST_CASE("a loop-carried flags phi's back edge reaches ssa without growing forever",
+          "[passes][ssaopt][flags]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId header = b.block(0x2000);
+  const BlockId body = b.block(0x3000);
+  const BlockId exit = b.block(0x4000);
+
+  const il::ExprId entryOperands[2] = {b.read(entry, b.reg("x1"), 0x1000),
+                                       b.read(entry, b.reg("x2"), 0x1004)};
+  b.function.appendWriteReg(entry, 0x1008, b.reg("nzcv"),
+                            b.function.flagDef(il::FlagOp::Sub, 64, entryOperands));
+  b.function.appendBranch(entry, 0x100c, header);
+
+  const ExprId headerCond = b.function.flagCondition(b.read(header, b.reg("nzcv"), 0x2000),
+                                                      il::ConditionCode::Equal);
+  b.function.appendCondBranch(header, 0x2004, headerCond, body, exit);
+
+  b.function.appendWriteReg(
+      body, 0x3000, b.reg("x3"),
+      b.function.binary(ExprOp::Add, b.read(body, b.reg("x3"), 0x3000), b.i64(1)));
+  b.function.appendBranch(body, 0x3004, header);
+
+  b.function.appendStore(exit, 0x4000, Type::integer(64), b.i64(0x9000),
+                         b.read(exit, b.reg("x3"), 0x4004));
+  b.function.appendReturn(exit, 0x4008);
+
+  b.atCfg();
+  // The whole point: this has to reach Ssa at all. A pre-fix build fails
+  // here with "fixpoint pass 'ssa-optimize' did not converge" instead of
+  // ever getting to the checks below.
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+  CHECK(b.function.blockCount() == 4);
+}
+
 }  // namespace

@@ -18,9 +18,18 @@ TargetProfile inferTargetProfile(const BinaryImage& image) {
     // analysis::calleeThroughImportSlot and docs/10-import-resolution.md).
     profile.symbolAliases.emplace("__errno", "__errno_location");
   }
-  // Mach-O + AArch64 (iOS) is the next platform this project targets; it
-  // gets its own branch here, with its own preset and alias table, once a
-  // Mach-O loader exists. Nothing else needs to change to add it.
+  if (image.format() == BinaryFormat::MachO && image.arch() == Arch::AArch64) {
+    profile.typePresets = {"ios-sdk"};
+    // Mach-O nlist entries spell every C symbol with a leading underscore
+    // (`_malloc`, `_CFRelease`, ...), unlike ELF's dynamic symbol table.
+    // types/presets/ios-sdk.hdecl declares its prototypes under that exact
+    // spelling, so no alias table is needed here -- there is no known
+    // iOS equivalent of Bionic's `__errno` vs `__errno_location` mismatch.
+    // `syscallTable` is left empty: iOS user code does not reach the kernel
+    // through the Linux aarch64 `svc` ABI the default table describes, and
+    // a Mach-O binary's own `start()` has no `svc` instructions for a
+    // syscall table to name in the first place.
+  }
   return profile;
 }
 

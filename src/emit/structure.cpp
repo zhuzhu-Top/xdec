@@ -194,9 +194,17 @@ void elideFallthroughGotos(StmtPtr& node, il::BlockId next) {
     }
     case StmtKind::If: {
       // Either arm, once it finishes, reaches whatever follows the whole
-      // `if` — the same `next` passed in here.
-      elideFallthroughGotos(node->thenArm, next);
-      elideFallthroughGotos(node->elseArm, next);
+      // `if` — the same `next` passed in here, unless this `if` has its own
+      // J2e-if epilogue (see switchFor's 2-way collapse): an arm that falls
+      // into `mergeBlock` reaches the epilogue printed right after the
+      // closing brace, not whatever follows the `if` as a whole, so a
+      // trailing `goto mergeBlock;` an arm's own fallback path left behind
+      // (claimDispatcherCaseBody itself never emits one, but claimCaseBody's
+      // ordinary fallback can) is exactly as redundant as a Switch case's
+      // own `goto` into its epilogue would be.
+      const il::BlockId armNext = node->epilogue ? node->mergeBlock : next;
+      elideFallthroughGotos(node->thenArm, armNext);
+      elideFallthroughGotos(node->elseArm, armNext);
       // An arm left as an empty Sequence (its one goto just got elided, and
       // it had nothing else in it) means exactly what an already-absent arm
       // means: fall through to whichever edge nothing else claimed. printIf
@@ -222,6 +230,9 @@ void elideFallthroughGotos(StmtPtr& node, il::BlockId next) {
         std::swap(node->thenArm, node->elseArm);
         node->invertCond = !node->invertCond;
       }
+      // The epilogue is what runs right after the `if`/`else` as a whole,
+      // so it inherits this node's own `next` -- same as a Switch's.
+      elideFallthroughGotos(node->epilogue, next);
       return;
     }
     case StmtKind::While:
@@ -249,6 +260,107 @@ void elideFallthroughGotos(StmtPtr& node, il::BlockId next) {
     case StmtKind::Break:
       // Neither names a block anything falls into, so there is no
       // fallthrough here to elide it against.
+      return;
+  }
+}
+
+/// J2e-if's own gap (docs/architecture-optimization-eval-prompt.md §6.3):
+/// `switchFor`'s 2-way collapse fallback hands each arm to `claimCaseBody`,
+/// an unbounded walk with no stop block of its own -- so whichever arm's
+/// target happens to fall straight through into the *other* arm's target
+/// keeps walking right past it, silently claiming it as its own trailing
+/// content instead of stopping there. The result prints as `if (cond) goto
+/// M; else { WORK; /* M's own content, unlabelled from here */ }` even
+/// though `M` is exactly the block the `if` as a whole reconverges on --
+/// the diamond `tryDiamond` would have built, had this `if` come from an
+/// ordinary `CondBranch` instead of a resolved two-way table dispatch.
+/// Finds that shape after the fact and splits `bodyArm` at `M`: everything
+/// from `M` on is cut out and handed back to the caller to splice in as the
+/// `if`'s own successor, and the goto arm -- now nothing to jump to -- is
+/// cleared so it falls through there too. `M`'s own content is not touched,
+/// only where in the tree it sits, so this is safe regardless of how many
+/// other edges elsewhere in the function also reach it; whatever still
+/// needs a label there finds the exact same `Block` node either way.
+StmtPtr trySplitSkipGoto(Stmt& ifStmt) {
+  for (const bool gotoIsThen : {true, false}) {
+    StmtPtr& gotoArm = gotoIsThen ? ifStmt.thenArm : ifStmt.elseArm;
+    StmtPtr& bodyArm = gotoIsThen ? ifStmt.elseArm : ifStmt.thenArm;
+    if (!gotoArm || gotoArm->kind != StmtKind::Goto || !bodyArm ||
+        bodyArm->kind != StmtKind::Sequence) {
+      continue;
+    }
+    const il::BlockId target = gotoArm->block;
+    std::vector<StmtPtr>& bodyItems = bodyArm->items;
+    for (std::size_t index = 0; index < bodyItems.size(); ++index) {
+      if (bodyItems[index] && bodyItems[index]->kind == StmtKind::Block &&
+          bodyItems[index]->block == target) {
+        auto merge = Stmt::make(StmtKind::Sequence);
+        merge->items.assign(
+            std::make_move_iterator(bodyItems.begin() + static_cast<std::ptrdiff_t>(index)),
+            std::make_move_iterator(bodyItems.end()));
+        bodyItems.resize(index);
+        gotoArm.reset();
+        if (gotoIsThen) {
+          // The surviving arm (the work) has to end up in `thenArm` for
+          // printIf's own shape -- same swap-and-negate elideFallthroughGotos
+          // already does for a one-sided arm that emptied out.
+          std::swap(ifStmt.thenArm, ifStmt.elseArm);
+          ifStmt.invertCond = !ifStmt.invertCond;
+        }
+        return merge;
+      }
+    }
+  }
+  return nullptr;
+}
+
+/// Applies `trySplitSkipGoto` everywhere in the tree, splicing each split's
+/// returned tail in right after the `if` it came from. Walked the same way
+/// `elideFallthroughGotos` is: a promoted tail can itself start with another
+/// `if` matching the same shape (a chain of scatter sites each skip-goto-ing
+/// past the next), so the splice loop below keeps re-checking `items` at its
+/// own new size rather than only visiting each position once.
+void restructureSkipGotos(StmtPtr& node) {
+  if (!node) {
+    return;
+  }
+  switch (node->kind) {
+    case StmtKind::Sequence: {
+      std::vector<StmtPtr>& items = node->items;
+      for (std::size_t index = 0; index < items.size(); ++index) {
+        if (items[index] && items[index]->kind == StmtKind::If) {
+          if (StmtPtr merge = trySplitSkipGoto(*items[index])) {
+            items.insert(items.begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                        std::make_move_iterator(merge->items.begin()),
+                        std::make_move_iterator(merge->items.end()));
+          }
+        }
+      }
+      for (StmtPtr& item : items) {
+        restructureSkipGotos(item);
+      }
+      return;
+    }
+    case StmtKind::If:
+      restructureSkipGotos(node->thenArm);
+      restructureSkipGotos(node->elseArm);
+      restructureSkipGotos(node->epilogue);
+      return;
+    case StmtKind::While:
+    case StmtKind::DoWhile:
+      restructureSkipGotos(node->body);
+      return;
+    case StmtKind::Switch:
+      for (StmtPtr& body : node->caseBodies) {
+        restructureSkipGotos(body);
+      }
+      restructureSkipGotos(node->defaultBody);
+      restructureSkipGotos(node->epilogue);
+      return;
+    case StmtKind::Block:
+    case StmtKind::Goto:
+    case StmtKind::Continue:
+    case StmtKind::Break:
       return;
   }
 }
@@ -321,7 +433,6 @@ void collectReferences(const Stmt* node, std::set<il::BlockId>& out) {
     } else if (node->defaultCase.valid()) {
       out.insert(node->defaultCase);
     }
-    collectReferences(node->epilogue.get(), out);
   }
   for (const StmtPtr& item : node->items) {
     collectReferences(item.get(), out);
@@ -329,6 +440,47 @@ void collectReferences(const Stmt* node, std::set<il::BlockId>& out) {
   collectReferences(node->thenArm.get(), out);
   collectReferences(node->elseArm.get(), out);
   collectReferences(node->body.get(), out);
+  // J2e-if: an `If`'s own epilogue (see switchFor's 2-way collapse) is just
+  // as capable of holding a `Goto`/case that needs a label as a Switch's
+  // ever was -- traversed unconditionally rather than only under the
+  // `Switch` check above, since both kinds carry one now.
+  collectReferences(node->epilogue.get(), out);
+}
+
+/// `collectReferences`'s own tally rather than membership -- J2g's
+/// `Structurizer::expandUniqueCaseGotos` needs to tell "the whole tree names
+/// this block in exactly one place" apart from "more than one", which a
+/// `std::set` alone cannot answer.
+void countReferences(const Stmt* node, std::map<il::BlockId, std::size_t>& counts) {
+  if (node == nullptr) {
+    return;
+  }
+  if (node->kind == StmtKind::Goto) {
+    ++counts[node->block];
+  }
+  if (node->kind == StmtKind::Switch) {
+    for (std::size_t index = 0; index < node->cases.size(); ++index) {
+      if (index < node->caseBodies.size() && node->caseBodies[index]) {
+        countReferences(node->caseBodies[index].get(), counts);
+        continue;
+      }
+      ++counts[node->cases[index]];
+    }
+    if (node->defaultBody) {
+      countReferences(node->defaultBody.get(), counts);
+    } else if (node->defaultCase.valid()) {
+      ++counts[node->defaultCase];
+    }
+  }
+  for (const StmtPtr& item : node->items) {
+    countReferences(item.get(), counts);
+  }
+  countReferences(node->thenArm.get(), counts);
+  countReferences(node->elseArm.get(), counts);
+  countReferences(node->body.get(), counts);
+  // Same reasoning as collectReferences above: unconditional, since an
+  // `If`'s own epilogue carries references just as a Switch's does.
+  countReferences(node->epilogue.get(), counts);
 }
 
 /// Whether `node` holds a `While`/`DoWhile` anywhere in its own tree.
@@ -446,11 +598,27 @@ StructuredFunction Structurizer::run() {
     groups.emplace_back(blockId, emitRegion(blockId, il::BlockId{}, 0));
   }
 
+  // J2g (docs/architecture-optimization-eval-prompt.md §6.6, "Unique Goto
+  // Expansion"), first pass: run before J2f gets a chance to fold a
+  // remnant into some *other* remnant's natural loop. A remnant folded here,
+  // straight into the one switch case that names it, never becomes a loop
+  // body's problem to begin with -- J2f would otherwise flatten it in as an
+  // anonymous span of a merged loop body, at which point its own label is
+  // gone and nothing downstream can single it back out to fold it (see the
+  // second pass below for what J2f *does* leave standalone).
+  expandUniqueCaseGotos(groups);
+
   // J2f (docs/architecture-optimization-eval-prompt.md §6.5): both sweeps
   // above are done leaving behind whatever labelled remnants no pattern
   // wanted, so this is the last chance to notice a natural loop hiding among
   // them before the sort below fixes their final order.
   collapseLabeledNaturalLoops(groups);
+
+  // J2g, second pass: catches whatever the first pass could not -- a
+  // remnant that only became unique-referenced once its own sibling
+  // remnants were folded away above, or one J2f skipped because it was
+  // never part of any natural loop to begin with.
+  expandUniqueCaseGotos(groups);
 
   std::map<il::BlockId, std::size_t> rank;
   for (const il::BlockId blockId : dominators_.rpo()) {
@@ -473,6 +641,25 @@ StructuredFunction Structurizer::run() {
       result.root->items.push_back(std::move(item));
     }
   }
+
+  // Phase 2 (docs/architecture-optimization-eval-prompt.md §6.3's own J2e-if
+  // gap): before the fallthrough elision below, unwind whatever `if (cond)
+  // goto M; else { WORK; ...M's own content }` shape switchFor's unbounded
+  // arm walk left behind into a plain `if (!cond) { WORK; } ` followed by
+  // `M`'s content run inline -- that reshaping can itself expose a fresh
+  // fallthrough goto (the merge's own tail landing on whatever runs next),
+  // which is exactly what elideFallthroughGotos is for.
+  restructureSkipGotos(result.root);
+
+  // Phase 4 (goto-elimination plan §"J2f 扩展"): a `while (true)` whose own
+  // body turned out to be nothing but `if (cond) { continue; } else { WORK
+  // }` -- exactly the shape Phase 0's scatter collapse leaves a resolved
+  // loop guard in when tryLoop's own `CondBranch` match never had the
+  // chance to fire on it -- already says the same thing a genuine
+  // `while (cond)` does directly; run after Phase 2 so a guard restructured
+  // out of a skip-goto is just as eligible as one that was already this
+  // shape from the start.
+  simplifyGuardedSpins(result.root);
 
   // A goto-chain fallback (or a guard arm) always prints its target
   // explicitly because it is built before the region walk knows what ends
@@ -1280,6 +1467,235 @@ void Structurizer::collapseLabeledNaturalLoops(
   groups = std::move(kept);
 }
 
+void Structurizer::expandGotoTargets(
+    Stmt* node, std::size_t owner, const std::map<il::BlockId, std::size_t>& orphanIndex,
+    const std::map<il::BlockId, std::size_t>& refCount, std::set<std::size_t>& consumed,
+    std::vector<std::pair<il::BlockId, StmtPtr>>& groups) {
+  if (node == nullptr) {
+    return;
+  }
+  // Folds `slot` into a clone of `target`'s own orphaned group, when nothing
+  // about `target` disqualifies it: `owner` itself (a back edge, not a
+  // handler this switch/if alone reaches), a second reference this pass's
+  // own tree scan cannot see (a natural loop's `continue`, chiefly -- hence
+  // the IL-level predecessor count on top of `refCount`), or a body that
+  // does not leave cleanly on its own or hides a further dispatch
+  // (`containsSwitch` -- see its own comment for why that would misdescribe
+  // the shape rather than merely inline it). Every call site guards `slot`
+  // itself before calling: a switch case/default only ever passes one still
+  // null, an `If` arm (Phase 5, J2g extension) only ever passes one that is
+  // still exactly the bare `Goto` leaf `target` was read from.
+  const auto tryFold = [&](StmtPtr& slot, il::BlockId target) {
+    if (!target.valid()) {
+      return;
+    }
+    const auto orphan = orphanIndex.find(target);
+    if (orphan == orphanIndex.end() || orphan->second == owner || consumed.contains(orphan->second)) {
+      return;
+    }
+    const auto count = refCount.find(target);
+    if (count == refCount.end() || count->second != 1) {
+      return;
+    }
+    if (function_.block(target).predecessors.size() != 1) {
+      return;
+    }
+    const Stmt* orphanBody = groups[orphan->second].second.get();
+    if (!alwaysLeaves(orphanBody) || containsSwitch(orphanBody)) {
+      return;
+    }
+    slot = cloneStmt(orphanBody);
+    consumed.insert(orphan->second);
+  };
+  if (node->kind == StmtKind::Switch) {
+    for (std::size_t index = 0; index < node->cases.size(); ++index) {
+      if (index < node->caseBodies.size() && node->caseBodies[index]) {
+        expandGotoTargets(node->caseBodies[index].get(), owner, orphanIndex, refCount, consumed, groups);
+        continue;
+      }
+      if (index >= node->caseBodies.size()) {
+        node->caseBodies.resize(node->cases.size());
+      }
+      tryFold(node->caseBodies[index], node->cases[index]);
+    }
+    if (node->defaultBody) {
+      expandGotoTargets(node->defaultBody.get(), owner, orphanIndex, refCount, consumed, groups);
+    } else {
+      tryFold(node->defaultBody, node->defaultCase);
+    }
+  } else if (node->kind == StmtKind::If) {
+    // Phase 5 (goto-elimination plan §Phase5, J2g extension): switchFor's
+    // own 2-way collapse (its epilogue-building branch) falls back to a
+    // bare `Goto` arm whenever Phase 1's join-hub epilogue could not be
+    // built for that target -- most often because some other site already
+    // claimed the hub. That target can still turn out to be this pass' own
+    // orphan (single remaining reference, real IL-level single predecessor)
+    // once every other site has had its own chance to fold first; when it
+    // does, inline it exactly as a switch case's bare slot would be, rather
+    // than leaving a labelled remnant behind purely to hold that one goto's
+    // destination (a late-placed handler reached this way folds back in
+    // just the same as one reached straight from its case).
+    if (node->thenArm && node->thenArm->kind == StmtKind::Goto) {
+      tryFold(node->thenArm, node->thenArm->block);
+    }
+    if (node->elseArm && node->elseArm->kind == StmtKind::Goto) {
+      tryFold(node->elseArm, node->elseArm->block);
+    }
+  }
+  for (StmtPtr& item : node->items) {
+    expandGotoTargets(item.get(), owner, orphanIndex, refCount, consumed, groups);
+  }
+  expandGotoTargets(node->thenArm.get(), owner, orphanIndex, refCount, consumed, groups);
+  expandGotoTargets(node->elseArm.get(), owner, orphanIndex, refCount, consumed, groups);
+  expandGotoTargets(node->body.get(), owner, orphanIndex, refCount, consumed, groups);
+  expandGotoTargets(node->epilogue.get(), owner, orphanIndex, refCount, consumed, groups);
+}
+
+void Structurizer::expandUniqueCaseGotos(std::vector<std::pair<il::BlockId, StmtPtr>>& groups) {
+  // Phase 1: every group clean enough to fold whole into a case -- its own
+  // top-level entry, starting exactly at the block a case slot would name
+  // rather than one it merely absorbed by fallthrough from an earlier entry
+  // (see collectReferencedBlocks' own comment on that distinction) -- keyed
+  // by that block so a switch slot can look its handler's group up
+  // directly. The entry block is never a candidate: nothing but the
+  // function's own start ever "jumps" there.
+  std::map<il::BlockId, std::size_t> orphanIndex;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    const auto& [head, region] = groups[index];
+    if (head == function_.entryBlock() || !region || region->kind != StmtKind::Sequence ||
+        region->items.empty() || region->items.front()->kind != StmtKind::Block ||
+        region->items.front()->block != head) {
+      continue;
+    }
+    orphanIndex.emplace(head, index);
+  }
+  if (orphanIndex.empty()) {
+    return;
+  }
+
+  // Phase 2: how many places the *whole* finished tree still names each
+  // block, tallied rather than merely noted present -- expandGotoTargets
+  // needs "exactly one" told apart from "more than one".
+  std::map<il::BlockId, std::size_t> refCount;
+  for (const auto& [head, region] : groups) {
+    countReferences(region.get(), refCount);
+  }
+
+  // Phase 3: walk every group's own finished subtree folding what qualifies.
+  // A group already consumed by an earlier one's fold is skipped outright —
+  // its own tree is about to be discarded, so nothing at or under it can
+  // fold anywhere else either (its single reference, if it had one, was
+  // exactly the fold that just consumed it).
+  std::set<std::size_t> consumed;
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    if (!consumed.contains(index)) {
+      expandGotoTargets(groups[index].second.get(), index, orphanIndex, refCount, consumed, groups);
+    }
+  }
+  if (consumed.empty()) {
+    return;
+  }
+  std::vector<std::pair<il::BlockId, StmtPtr>> kept;
+  kept.reserve(groups.size() - consumed.size());
+  for (std::size_t index = 0; index < groups.size(); ++index) {
+    if (!consumed.contains(index)) {
+      kept.push_back(std::move(groups[index]));
+    }
+  }
+  groups = std::move(kept);
+}
+
+StmtPtr Structurizer::trySimplifyGuardedSpin(Stmt& whileStmt) {
+  if (whileStmt.cond.valid() || !whileStmt.body) {
+    return nullptr;
+  }
+  // The `if` itself may be `body` bare -- `wrapAsLoop` (structure_dispatch.cpp)
+  // hands it the collapsed 2-way `If` directly, with no `Sequence` wrapper of
+  // its own -- or the lone item of an otherwise-empty `Sequence`, `tryLoop`'s
+  // own shape for a genuine `CondBranch` header. Either way, this check's
+  // real load-bearing requirement is that `body` holds nothing *else*: a
+  // `While(true)` re-enters this exact `if`, with nothing in between, only
+  // when there is nothing beside it for the back edge to have skipped over.
+  // Any register that edge would need a fresh copy of on the "keep spinning"
+  // path has to live *somewhere* between re-entry and the check that reads
+  // it -- which, with no other content in `body` for it to sit in, it
+  // cannot. That is what makes dropping this exact `Continue` (and the
+  // `consumePending` its own printing would have triggered) safe: there is
+  // nothing left for that call to have flushed.
+  Stmt* ifNode = whileStmt.body->kind == StmtKind::If ? whileStmt.body.get() : nullptr;
+  if (ifNode == nullptr && whileStmt.body->kind == StmtKind::Sequence &&
+      whileStmt.body->items.size() == 1 && whileStmt.body->items.front() &&
+      whileStmt.body->items.front()->kind == StmtKind::If) {
+    ifNode = whileStmt.body->items.front().get();
+  }
+  if (ifNode == nullptr) {
+    return nullptr;
+  }
+  Stmt& ifStmt = *ifNode;
+  for (const bool continueIsThen : {true, false}) {
+    StmtPtr& continueArm = continueIsThen ? ifStmt.thenArm : ifStmt.elseArm;
+    StmtPtr& workArm = continueIsThen ? ifStmt.elseArm : ifStmt.thenArm;
+    // The work side has to leave for good -- a fallthrough off its own end
+    // would mean "loop again" exactly as much as the `Continue` itself
+    // does, which is not what an ordinary `while (cond) { ... }`'s closing
+    // brace says once `WORK` moves outside it.
+    if (!continueArm || continueArm->kind != StmtKind::Continue || !workArm ||
+        !alwaysLeaves(workArm.get())) {
+      continue;
+    }
+    whileStmt.cond = ifStmt.cond;
+    whileStmt.invertCond = continueIsThen ? ifStmt.invertCond : !ifStmt.invertCond;
+    StmtPtr work = std::move(workArm);
+    whileStmt.body = Stmt::make(StmtKind::Sequence);
+    return work;
+  }
+  return nullptr;
+}
+
+void Structurizer::simplifyGuardedSpins(StmtPtr& node) {
+  if (!node) {
+    return;
+  }
+  switch (node->kind) {
+    case StmtKind::Sequence: {
+      std::vector<StmtPtr>& items = node->items;
+      for (std::size_t index = 0; index < items.size(); ++index) {
+        if (items[index] && items[index]->kind == StmtKind::While) {
+          if (StmtPtr work = trySimplifyGuardedSpin(*items[index])) {
+            items.insert(items.begin() + static_cast<std::ptrdiff_t>(index) + 1,
+                        std::move(work));
+          }
+        }
+      }
+      for (StmtPtr& item : items) {
+        simplifyGuardedSpins(item);
+      }
+      return;
+    }
+    case StmtKind::If:
+      simplifyGuardedSpins(node->thenArm);
+      simplifyGuardedSpins(node->elseArm);
+      simplifyGuardedSpins(node->epilogue);
+      return;
+    case StmtKind::While:
+    case StmtKind::DoWhile:
+      simplifyGuardedSpins(node->body);
+      return;
+    case StmtKind::Switch:
+      for (StmtPtr& body : node->caseBodies) {
+        simplifyGuardedSpins(body);
+      }
+      simplifyGuardedSpins(node->defaultBody);
+      simplifyGuardedSpins(node->epilogue);
+      return;
+    case StmtKind::Block:
+    case StmtKind::Goto:
+    case StmtKind::Continue:
+    case StmtKind::Break:
+      return;
+  }
+}
+
 const std::vector<analysis::DispatchRegion>& Structurizer::dispatchRegions() {
   if (!dispatchRegions_) {
     dispatchRegions_ = analysis::findDispatchRegions(function_);
@@ -1302,9 +1718,34 @@ const std::map<il::BlockId, il::BlockId>& Structurizer::joinHubByTail() {
   return *joinHubByTail_;
 }
 
+std::optional<analysis::LiveRegisterFrame> Structurizer::frameThroughJoinHub(
+    il::BlockId dispatch, il::BlockId hub) const {
+  const std::vector<il::BlockId>& successors = function_.block(hub).successors;
+  if (successors.size() != 1) {
+    return std::nullopt;
+  }
+  return analysis::matchLiveRegisterFrame(
+      function_, analysis::DispatcherShape{dispatch, hub, successors.front()});
+}
+
 bool Structurizer::isMemberOfLargeDispatchRegion(il::BlockId block) {
   for (const analysis::DispatchRegion& region : dispatchRegions()) {
     if (region.sites.size() < options_.minRegionSites) {
+      continue;
+    }
+    const bool memberOfRegion =
+        std::any_of(region.sites.begin(), region.sites.end(),
+                    [&](const analysis::DispatchSite& site) { return site.dispatchBlock == block; });
+    if (memberOfRegion) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Structurizer::isMemberOfSharedTailRegion(il::BlockId block) {
+  for (const analysis::DispatchRegion& region : dispatchRegions()) {
+    if (region.sites.size() < options_.minRegionSites || !region.sharedTail.has_value()) {
       continue;
     }
     const bool memberOfRegion =
@@ -1388,7 +1829,15 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
   // small, or absent) any region around it is, so a fixture can exercise
   // "what a deferred site prints like" without first building one big
   // enough to cross `minRegionSites` on its own.
-  const bool deferCollapse = options_.deferRegionCollapse || isMemberOfLargeDispatchRegion(block);
+  // docs/19-scatter-dispatch-target-shape.md: the region-membership half of
+  // that defer only ever protects a region that actually voted a
+  // sharedTail -- a scatter region (no sharedTail, e.g. libscplugin's own
+  // ~700 chained two-way sites) never defers, so it collapses to `if`/`else`
+  // the same as an isolated site would, and the recursion through
+  // `claimCaseBody` below rebuilds a whole chain of these as nested
+  // `if`/`else if` on its own.
+  const bool deferCollapse = options_.deferRegionCollapse ||
+                             (isMemberOfLargeDispatchRegion(block) && isMemberOfSharedTailRegion(block));
   if (targets.size() == 2 && !operands.empty() && !deferCollapse) {
     if (const auto table = analysis::matchJumpTable(function_, operands[0]);
         table.has_value() && table->index.valid()) {
@@ -1400,11 +1849,45 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
         auto ifStmt = Stmt::make(StmtKind::If);
         ifStmt->block = block;
         ifStmt->cond = values->condition;
-        ifStmt->thenArm = claimCaseBody(block, targets[firstIndex], depth);
+
+        // J2e-if (docs/architecture-optimization-eval-prompt.md §6.3): the
+        // same pooled-hub evidence the table-mode switch above claims as
+        // its own epilogue (`joinHubByTail`) applies just as well to a
+        // 2-way collapse's own two arms -- a scatter-dispatcher's typical
+        // two-way site is below matchDispatcherShape's own three-target
+        // floor, but joinHubByTail pools evidence across the whole region
+        // regardless of how many targets any one site has. Tried once,
+        // ahead of either arm, so a "do some work, then land on the hub"
+        // arm and a "skip straight to the hub" arm can both end without a
+        // goto once the hub is this ifStmt's own epilogue instead of a
+        // label somewhere else.
+        for (const il::BlockId target : {targets[firstIndex], targets[secondIndex]}) {
+          const auto found = joinHubByTail().find(target);
+          if (found == joinHubByTail().end() || emitted_.contains(found->second) ||
+              inProgressHeaders_.contains(found->second)) {
+            continue;
+          }
+          ifStmt->epilogue = emitRegion(found->second, il::BlockId{}, depth + 1);
+          if (ifStmt->epilogue) {
+            ifStmt->mergeBlock = found->second;
+            break;
+          }
+        }
+        if (ifStmt->epilogue) {
+          ifStmt->thenArm = claimDispatcherCaseBody(block, targets[firstIndex], ifStmt->mergeBlock,
+                                                    depth, /*appendBreak=*/false);
+          ifStmt->elseArm = claimDispatcherCaseBody(block, targets[secondIndex], ifStmt->mergeBlock,
+                                                    depth, /*appendBreak=*/false);
+        }
+        if (!ifStmt->thenArm) {
+          ifStmt->thenArm = claimCaseBody(block, targets[firstIndex], depth);
+        }
         if (!ifStmt->thenArm) {
           ifStmt->thenArm = claimOrCloneSharedCaseBody(block, targets[firstIndex], depth);
         }
-        ifStmt->elseArm = claimCaseBody(block, targets[secondIndex], depth);
+        if (!ifStmt->elseArm) {
+          ifStmt->elseArm = claimCaseBody(block, targets[secondIndex], depth);
+        }
         if (!ifStmt->elseArm) {
           ifStmt->elseArm = claimOrCloneSharedCaseBody(block, targets[secondIndex], depth);
         }
@@ -1501,13 +1984,17 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
     // Whether the handlers this switch just claimed carry their live
     // registers to `epilogue` through the shadow-register protocol (see
     // analysis::LiveRegisterFrame): when they do, emission can skip printing
-    // a case's save into a slot it never actually changes. Only `shape`'s
-    // own merge (voted from `block`'s own targets) has a `hub` to check
-    // that protocol against -- a J2e join hub is pooled from other sites
-    // entirely and carries no such further successor to test, so it always
-    // prints its case saves in full instead.
+    // a case's save into a slot it never actually changes.
     if (shape.has_value() && shape->merge == mergeBlock) {
       stmt->frame = analysis::matchLiveRegisterFrame(function_, *shape);
+    } else {
+      // A J2e join hub is pooled from other sites entirely, so it comes with
+      // no `hub` of its own to check the protocol against -- but the block it
+      // falls through to is one, when there is exactly one, and the relay
+      // reads the same there as it does at a voted merge: same registers with
+      // a phi on both sides, same per-edge saves to leave unprinted where the
+      // handler never touched the slot.
+      stmt->frame = frameThroughJoinHub(block, mergeBlock);
     }
   }
   // A table match at two targets is still a real index dispatch -- an
@@ -1534,27 +2021,46 @@ StmtPtr Structurizer::switchFor(il::BlockId block, const il::Op& op, unsigned de
           values.has_value()) {
         stmt->caseValues = values->values;
       }
-      // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): not
-      // yet the default -- see StructureOptions::regionStructuring's own
-      // comment. Only tried once `stmt` is fully built (every case already
+      // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): run
+      // unconditionally once `stmt` is fully built (every case already
       // claimed, tableMode/cond/caseValues already set), since that is
       // exactly the shape collapseRegionDispatchTree pattern-matches against
       // in each candidate case body.
-      if (options_.regionStructuring) {
-        for (const analysis::DispatchRegion& region : dispatchRegions()) {
-          const bool memberOfRegion =
-              std::any_of(region.sites.begin(), region.sites.end(),
-                          [&](const analysis::DispatchSite& site) { return site.dispatchBlock == block; });
-          if (memberOfRegion) {
-            collapseRegionDispatchTree(*stmt, region);
-            break;
-          }
+      for (const analysis::DispatchRegion& region : dispatchRegions()) {
+        const bool memberOfRegion =
+            std::any_of(region.sites.begin(), region.sites.end(),
+                        [&](const analysis::DispatchSite& site) { return site.dispatchBlock == block; });
+        if (memberOfRegion) {
+          collapseRegionDispatchTree(*stmt, region);
+          break;
         }
       }
       return stmt;
     }
   }
   stmt->cond = operands[0];
+  // Nothing recovered a table, so what this branch computes is the target
+  // address itself and each case is the address of the block it reaches. That
+  // is the same statement the compare chain makes -- and the chain makes it
+  // once per arm, re-printing a discriminant that on these branches is a
+  // forty-line expression's result forty times over. Above two arms only:
+  // at two, an if/else already reads better than a switch, and the chain is
+  // exactly that.
+  if (targets.size() > 2) {
+    std::vector<uint64_t> addresses;
+    addresses.reserve(targets.size());
+    for (const il::BlockId target : targets) {
+      addresses.push_back(function_.block(target).va);
+    }
+    // Two targets sharing an address -- a block and a clone of it -- have
+    // nothing to tell them apart as case labels, so those stay a chain.
+    std::vector<uint64_t> distinct = addresses;
+    std::ranges::sort(distinct);
+    if (std::ranges::adjacent_find(distinct) == distinct.end()) {
+      stmt->addressCases = true;
+      stmt->caseValues = std::move(addresses);
+    }
+  }
   return stmt;
 }
 
@@ -1720,6 +2226,15 @@ bool Structurizer::alwaysLeaves(const Stmt* node) const {
     case StmtKind::Sequence:
       return !node->items.empty() && alwaysLeaves(node->items.back().get());
     case StmtKind::If:
+      // J2e-if (see switchFor's 2-way collapse): same reasoning as a
+      // Switch's own epilogue below -- an arm that falls into `mergeBlock`
+      // via claimDispatcherCaseBody never itself ends in a `Goto`/`Break`/
+      // `Return` (that arrival is exactly what stopping the walk at `merge`
+      // already proved), so whether the whole `if`/`else`+epilogue unit
+      // leaves is the epilogue's own question to answer, not either arm's.
+      if (node->epilogue) {
+        return alwaysLeaves(node->epilogue.get());
+      }
       return alwaysLeaves(node->thenArm.get()) && alwaysLeaves(node->elseArm.get());
     case StmtKind::Switch:
       // A dispatcher shape's epilogue is what every `Break` case actually
@@ -1732,8 +2247,9 @@ bool Structurizer::alwaysLeaves(const Stmt* node) const {
       // to leave before accepting it) or prints as a `goto` to its handler,
       // which also leaves -- so the only way control falls past a Switch is an
       // unresolved compare chain, which has no default arm to catch a target
-      // matching none of its tests (see printSwitch's `enumerated` check).
-      return node->tableMode || !node->caseValues.empty();
+      // matching none of its tests (see printSwitch's `enumerated` check) --
+      // and an address-case switch is that same chain in switch clothing.
+      return node->tableMode || (!node->caseValues.empty() && !node->addressCases);
     default:
       return false;
   }

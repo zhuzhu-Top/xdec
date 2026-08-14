@@ -171,6 +171,24 @@ int commandObserve(std::string_view path, uint64_t address, std::span<const std:
       kPrologueShapes, [&](std::string_view shape) { return text.find(shape) != std::string::npos; });
 }
 
+/// The lowest symbol address strictly above `address`, when the image has
+/// one. Whatever the function at `address` is, it stops before the next thing
+/// with a name -- which is a weaker statement than a symbol's recorded size,
+/// and the only one available for an entry that has no symbol of its own.
+[[nodiscard]] std::optional<uint64_t> nextSymbolAfter(const BinaryImage& image,
+                                                      uint64_t address) {
+  std::optional<uint64_t> best;
+  for (const xdec::binary::Symbol& symbol : image.symbols()) {
+    if (!symbol.defined || symbol.va <= address) {
+      continue;
+    }
+    if (!best.has_value() || symbol.va < *best) {
+      best = symbol.va;
+    }
+  }
+  return best;
+}
+
 /// The full pipeline: discover and lift, resolve, recover variables,
 /// structure, emit C. This is the deliverable every other command builds
 /// towards.
@@ -199,11 +217,14 @@ int commandDecompile(std::string_view path, uint64_t address,
   // of what a header happened to name.
   bool indexedArgumentNames = true;
   bool securityHintsAsComments = true;
-  // J2 (docs/architecture-optimization-eval-prompt.md §3 Phase 3): off by
-  // default, same as StructureOptions::regionStructuring's own default --
-  // this flag exists only so an `eval`/`samples` run can opt in for L2
-  // observation without a unit test standing in for the CLI.
-  bool regionStructuring = false;
+  // How many bytes past the entry discovery may reach, when the caller wants
+  // that bounded rather than left to the entry's symbol size (see
+  // FunctionFence::enforce). Zero means "no such request", which is the
+  // default and leaves the fence advisory as before.
+  uint64_t maxSpan = 0;
+  // How many unlifted targets one branch may contribute per round (see
+  // DriverOptions::maxDiscoveryPerBranch). Zero means no limit.
+  uint64_t discoveryCap = 0;
   for (std::size_t i = 0; i < options.size(); ++i) {
     const std::string_view option = options[i];
     const auto value = [&]() -> std::string_view {
@@ -229,8 +250,18 @@ int commandDecompile(std::string_view path, uint64_t address,
       emitReport = true;
     } else if (option == "--dump-il") {
       dumpIl = true;
-    } else if (option == "--region-structuring") {
-      regionStructuring = true;
+    } else if (option == "--max-span") {
+      const std::string_view text = value();
+      if (!parseNumber(text, maxSpan) || maxSpan == 0) {
+        print("error: '--max-span' takes a byte count above zero, not '{}'", text);
+        return 1;
+      }
+    } else if (option == "--discovery-cap") {
+      const std::string_view text = value();
+      if (!parseNumber(text, discoveryCap) || discoveryCap == 0) {
+        print("error: '--discovery-cap' takes a target count above zero, not '{}'", text);
+        return 1;
+      }
     } else if (option == "--types") {
       typeSources.emplace_back(value());
     } else if (option == "--syscall-table") {
@@ -287,16 +318,33 @@ int commandDecompile(std::string_view path, uint64_t address,
   driverOptions.maxRounds = roundCap.value;
   driverOptions.extendWhileProving = !roundCap.pinned;
   driverOptions.sealUnresolvedBranches = allowUnresolved;
-  if (const xdec::binary::Symbol* symbol = image.symbolAt(address);
-      symbol != nullptr && symbol->size != 0) {
-    driverOptions.fence = {address, address + symbol->size};
-  } else if (!looksLikePrologue(engine, image, address)) {
-    // No symbol to fence discovery with, and the entry itself does not look
-    // like a function start either: exactly the shape that let sub_627ac
-    // silently balloon into 1349 discovered addresses and 44k lines. Warn,
-    // rather than fail -- an unusual but real entry (a hand-written
-    // trampoline, a prologue-less leaf) is still worth decompiling, just not
-    // silently mistaken for one when it might not be.
+  driverOptions.maxDiscoveryPerBranch = static_cast<std::size_t>(discoveryCap);
+  const xdec::binary::Symbol* entrySymbol = image.symbolAt(address);
+  const bool sized = entrySymbol != nullptr && entrySymbol->size != 0;
+  if (maxSpan != 0) {
+    // An explicit bound outranks whatever the symbol table says, and is the
+    // only thing that makes a fence binding: the caller is describing the work
+    // it wants done, not the function's real extent.
+    driverOptions.fence = {address, address + maxSpan, /*enforce=*/true};
+  } else if (sized) {
+    driverOptions.fence = {address, address + entrySymbol->size};
+  } else if (const std::optional<uint64_t> next = nextSymbolAfter(image, address)) {
+    // No sized symbol here, but the next one along is still a fact about the
+    // image: whatever this function is, it stops before the next thing with a
+    // name. Advisory like any other inferred fence -- it only feeds the
+    // bleed-through diagnostics below -- but it is the difference between
+    // those diagnostics having something to compare against and having
+    // nothing, which is the state absd's LC_MAIN entry (which carries no
+    // symbol of its own) was in.
+    driverOptions.fence = {address, *next};
+  }
+  if (maxSpan == 0 && !sized && !looksLikePrologue(engine, image, address)) {
+    // No symbol of its own, and the entry does not look like a function start
+    // either: exactly the shape that let sub_627ac silently balloon into 1349
+    // discovered addresses and 44k lines. Warn, rather than fail -- an unusual
+    // but real entry (a hand-written trampoline, a prologue-less leaf) is
+    // still worth decompiling, just not silently mistaken for one when it
+    // might not be.
     print("warning: {:#x} has no symbol and its first instruction does not look like a "
           "function prologue; if this address is inside another function's body (a "
           "jump-table target, say) rather than a real entry, discovery has no function "
@@ -313,7 +361,6 @@ int commandDecompile(std::string_view path, uint64_t address,
   toCOptions.emit.helpersHeader = helpersHeader;
   toCOptions.emit.indexedArgumentNames = indexedArgumentNames;
   toCOptions.emit.securityHintsAsComments = securityHintsAsComments;
-  toCOptions.structure.regionStructuring = regionStructuring;
   // `--emit-report` now asks decompileToC() itself for the scan (see
   // DecompileToCOptions::computeEmitRedundancy) instead of the CLI repeating
   // it over the result -- the same report, the same one function-sized scan.
@@ -360,6 +407,14 @@ int commandDecompile(std::string_view path, uint64_t address,
             region.clampBound ? std::format("0x{:x}/0x{:x}", *region.clampBound, *region.clampReplacement)
                               : std::string("none"),
             region.sites.size(), region.sharedTail.has_value());
+      // docs/19-scatter-dispatch-target-shape.md: the region's own decision-
+      // forest shape -- how many independent roots a reader meets walking
+      // the function, how deep the longest chained-2-way arm goes, and how
+      // many sites are only reached that way rather than from the rest of
+      // the function's own ordinary control flow.
+      const auto nest = xdec::analysis::buildDispatchNestGraph(function, region);
+      print("    nest: roots={} depth={} nested={}", nest.roots.size(), nest.maxDepth,
+            nest.nestedSiteCount);
     }
   }
 

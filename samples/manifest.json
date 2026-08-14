@@ -75,13 +75,83 @@
       "binary": "libscplugin",
       "address": "0x1164f8",
       "decompile_args": ["--allow-unresolved"],
-      "comment": "L2: a real app's large OLLVM-flattened function, registered per docs/18-architecture-optimization-plan.md as an observational, non-blocking regression guard. Before the resolved-binary-dispatch collapse (see structure.cpp's switchFor and analysis::matchDispatchValues), every one of this function's 244 table-mode switches turned out to be exactly two-way -- an obfuscator's original `if` reaching its two arms through a shared jump table once value-set analysis narrows the table to the two live entries a preceding select's own two constants produce. Recognising that shape and printing `if (cond) A else B` instead of a numbered two-case switch took switches from 244 to 0 and loops (while(true)) from 5 to 43. J1 (docs/18's §5.2, structure.cpp's StructureOptions::minRegionSites) then deferred that collapse specifically for this function's one 234-site analysis::DispatchRegion (sharedTail=false, so nothing else consumes it yet) -- switches went back to 234 (matching this table's original shape almost exactly) and, as a direct consequence, the if-chain-driven loop recognition that had produced 43 while(true) wrappers no longer fires on these now-uncollapsed sites, dropping loops_while_true to 2. That is the plan's own §11.2 stated direction for this metric (39 trending toward <15 as Track B lands, not a floor to hold), so min_loops_while_true is not tracked here any more -- min_switches guards the actual J1 win instead. The thresholds below are the post-J1 shape with light slack, not a target for J2-J5 -- tighten them (and samples/baseline.json via -UpdateBaseline) as those land, per samples/README.md's 'increment slowly' rule.",
+      "comment": "L2: a real app's large OLLVM-flattened function, registered per docs/18-architecture-optimization-plan.md as an observational, non-blocking regression guard. Before the resolved-binary-dispatch collapse (see structure.cpp's switchFor and analysis::matchDispatchValues), every one of this function's 244 table-mode switches turned out to be exactly two-way -- an obfuscator's original `if` reaching its two arms through a shared jump table once value-set analysis narrows the table to the two live entries a preceding select's own two constants produce. Recognising that shape and printing `if (cond) A else B` instead of a numbered two-case switch took switches from 244 to 0 and loops (while(true)) from 5 to 43. J1 (docs/18's §5.2, structure.cpp's StructureOptions::minRegionSites) then deferred that collapse specifically for this function's one 234-site analysis::DispatchRegion (sharedTail=false, so nothing else consumes it yet) -- switches went back to 234 (matching this table's original shape almost exactly) and, as a direct consequence, the if-chain-driven loop recognition that had produced 43 while(true) wrappers no longer fires on these now-uncollapsed sites, dropping loops_while_true to 2. docs/19-scatter-dispatch-target-shape.md then verified, from the assembly rather than assumed, that this region's own sharedTail=false is exactly the scatter shape J1's defer was never meant to protect (that machinery is for the shared-tail flattened-loop shape instead) -- the region-membership half of J1's defer now only ever protects a region that actually votes a sharedTail, so a sharedTail-less region like this one always collapses, and switches go from 234 to 0 again, this time as 533 nested if/else-if (a 93-root, 28-deep decision forest, see the CLI's own `--emit-report` dispatch-nest diagnostic), not the flat if/else the pre-J1 shape had before this region was even recognised as one. gotos rose 289 -> 332 -- the if/else-if collapse does not (yet) build the table-mode switch's own shared-epilogue-for-a-multi-tail-hub shape, so a hub several sites share costs one goto per site instead of one shared inline; docs/19 §4 records this as an accepted, not-yet-closed gap, not a defect. The goto-elimination plan (docs/19's own follow-up) then closed part of that gap: Phase 1 gave `If` the same join-hub epilogue Switch already had, Phase 2's `restructureSkipGotos` unwound the `if (cond) goto M; else {WORK}` shape switchFor's unbounded arm walk otherwise leaves behind, taking gotos 332 -> 303; Phase 3 then widened `deadRoutingStateStore`'s own paired-if shape (c_stmt.cpp) to trust an arm Phase 1/2 inlined in place of a bare goto, not only a bare goto itself, dropping the `state=select(cond,...)` duplicate stores those inlined arms had been keeping alive and taking ifs from above 500 down to 386. Phase 4's `simplifyGuardedSpins` then caught `wrapAsLoop`'s own `while (true) { if (cond) { continue; } else { WORK } }` remnants -- exactly the shape `tryLoop`'s `CondBranch` match never gets a chance to see once Phase 0's collapse has already turned the header into a 2-way `If` -- and rewrote each into the plain `while (cond) { }` it already meant, splicing `WORK` in right after: loops_while_true 49 -> 12, gotos 303 -> 273 (Phase 2's own elision catches a fresh fallthrough the splice exposes at several of those sites), ifs 386 -> 349. The thresholds below are this shape with light slack -- tighten them (and samples/baseline.json via -UpdateBaseline) as the epilogue gap closes further, per samples/README.md's 'increment slowly' rule.",
       "rounds": 128,
       "expect": {
         "max_unresolved_branches": 0,
+        "max_gotos": 300,
+        "min_ifs": 340,
+        "max_lines": 6900
+      }
+    },
+    {
+      "name": "sample_sub_b7000",
+      "category": "ollvm-mega",
+      "binary": "libscplugin",
+      "address": "0xb7000",
+      "comment": "L2: a small scatter-dispatcher function from the same OLLVM-flattened binary as sample_libscplugin above, registered per the goto-elimination plan (docs/architecture-optimization-eval-prompt.md) as its own fast-to-decompile regression guard -- small enough to eyeball the whole emitted C by hand after every phase, unlike its mega-function sibling. It is exactly the null-check-chain + property-loop shape the plan's own worked examples (sub_b7000_collapse.c) are drawn from: Phase 0's always-on scatter collapse first turns its ~93-root dispatch forest from table-mode switches into nested if/else-if, landing at 26 gotos; Phase 1's join-hub epilogue for `If` (mirroring the one `Switch` already had) and Phase 2's `restructureSkipGotos` (unwinding the `if (cond) goto M; else {WORK}` shape switchFor's own arm walk otherwise leaves behind) together take that to 20; Phase 3's widened `deadRoutingStateStore` (c_stmt.cpp) drops the redundant `state=select(cond,...)` stores those inlined arms leave duplicated behind, taking ifs from ~40 to 31 without moving gotos; Phase 4's `simplifyGuardedSpins` then catches the `while (true) { if (cond) { continue; } else { WORK } }` remnant `wrapAsLoop` leaves once Phase 0 has already turned a loop's own header into a 2-way `If`, rewriting it into the plain `while (cond) {}` it always meant and taking gotos 20 -> 19, ifs 31 -> 30. Phase 5's own `If`-arm orphan fold (expandGotoTargets, structure.cpp) found nothing left to claim here -- this function's residual gotos all turn out to be genuine multi-reference hubs, not orphans a traversal order merely stranded -- so the shape stayed exactly there. The thresholds below are that shape with light slack, not a target -- tighten them (and samples/baseline.json via -UpdateBaseline) as later phases close more of the gap, per samples/README.md's 'increment slowly' rule.",
+      "expect": {
+        "max_unresolved_branches": 0,
+        "max_gotos": 22,
+        "min_ifs": 27,
+        "max_undef": 2
+      }
+    },
+    {
+      "name": "sample_absd_start",
+      "category": "mach-o",
+      "binary": "absd",
+      "address": "0x100023290",
+      "rounds": 1,
+      "decompile_args": ["--allow-unresolved"],
+      "comment": "L2: the first Mach-O/iOS case, registered per the iOS Mach-O support plan -- a real, unmodified iOS binary's LC_MAIN entry point, `start()`. Bounded to one round on purpose: this function's first dispatch lands in a flattened state machine that reaches thousands of blocks, and what this case is here to hold is the *entry*, decompiled correctly, not the machine behind it (see eval/FINDINGS.md's Tier A entry for the numbers at higher round counts). It stacks three obfuscation layers the pseudocode this case was designed against shows directly: a stack-canary-derived index (`__stack_chk_guard` XORed/multiplied with a value derived from the stack pointer) into `off_1000A2A10`, a mixed table of rebase-resolved internal function pointers and bind-resolved named imports (`_mach_msg`, `_malloc`, `_sscanf`, ...) that macho.cpp's dyld rebase/bind opcode interpreter (Phase 2 of that plan) makes concrete; a global write through a pointer stored in `__DATA_CONST` rather than a fixed address (resolves to exactly `g_1000a8140`, matching the pseudocode's `dword_1000A8140`, which needs that segment recorded read-only -- dyld write-protects it once its fixups are applied, whatever initprot says); and a final `BR X9` computed jump whose target is the *return value* of the first indirect call -- a call whose own callee is only known at runtime (it is selected by the stack canary, which dyld/the kernel randomises per process), so the jump is genuinely, not just budget-limited, unresolvable by static analysis alone. The `switch` pattern below is the other thing this case pins: the entry's own `BR` reaches exactly two handlers, and it is written `switch (index)` over the two values `(~x >> 31) | 0xa` can take (0xa and 0xb), not a chain of compares against raw target addresses -- see analysis/index_bound.h's preciseIndexSet for why an index nothing can evaluate still names its own values.",
+      "expect": {
+        "max_unresolved_branches": 2,
+        "max_gotos": 2,
+        "max_lines": 100,
+        "min_switches": 1,
+        "max_ternaries": 1,
+        "max_undef": 0,
+        "patterns": ["0x1000a2a10", "g_1000a8140", "sub_10002067c", "switch", "case 0xa:",
+                     "case 0xb:"]
+      }
+    },
+    {
+      "name": "sample_absd_start_chain",
+      "category": "mach-o",
+      "binary": "absd",
+      "address": "0x100023290",
+      "rounds": 4,
+      "decompile_args": ["--allow-unresolved", "--discovery-cap", "36"],
+      "comment": "L2, one step further than sample_absd_start: discovery-cap 36 is still below the real ~40-target dispatcher's cliff (raising it to 40 still reproduces sample_absd_start_l2's ~11500-line explosion, confirmed 2026-08-14), so everything this case admits is the chain of small dispatchers *leading up to* that one real fan-out, not the fan-out itself. Before this fix that chain did not resolve either, for a reason with nothing to do with the cap: 0x1000234b0 and 0x1000234f8 each compute their index from two arithmetic terms that are individually a single bit read twice, not two -- `shr.u(x,31)` next to `shr.u(not(x),31)` at the first site, `!(a==b)` next to `!(a!=b)` at the second. preciseIndexSet (analysis/index_bound.h) used to resolve each term on its own, which invents the two combinations where both bits agree (impossible -- they are the same bit) alongside the two where they legitimately disagree, so a 1-bit question came out as 2 bits' worth of candidates: 308 and 295 respectively, both hopeless under any cap that keeps the rest of this function finite. Recognising the pair as one shared bit (see index_bound.cpp's BitFactor) collapses them to their true 2 and 4, small enough for resolve_indirect's discovery cap to admit and its `switch (index)` emission (sample_absd_start's case) to render structurally -- four real dispatch sites, not one opaque region. The forbidden pattern is that failure's shape: an address-relative switch discriminant is what a dispatcher falls back to the moment its table stops being recognisable behind a phi resolve_indirect could not resolve at all.",
+      "expect": {
+        "max_lines": 260,
+        "max_gotos": 14,
+        "max_unresolved_branches": 6,
+        "min_switches": 3,
+        "max_ternaries": 10,
+        "max_undef": 0,
+        "patterns": ["switch (", "case 0x"],
+        "forbid_patterns": ["switch \\(\\(t\\d+ \\+ 0x[0-9a-f]+\\)\\)"]
+      }
+    },
+    {
+      "name": "sample_absd_start_l2",
+      "category": "mach-o",
+      "binary": "absd",
+      "address": "0x100023290",
+      "rounds": 4,
+      "decompile_args": ["--allow-unresolved", "--discovery-cap", "64"],
+      "comment": "L2: the same iOS entry as sample_absd_start, with the flattened state machine behind its first dispatch actually let in -- four rounds and a per-branch discovery cap of 64 (see driver.h's DriverOptions::maxDiscoveryPerBranch). Observational, like sample_libscplugin: the thresholds are the measured 2026-08-13 shape with slack, not a target. Two things make this case worth its runtime. First, the cap is what keeps it finite at all: this function's dispatchers offer between 2 and 40 targets each, and admitting the 40-target one is what takes the output from ~117 lines to ~10800 -- there is no middle size, because that one branch opens ~300 blocks at once (which is also why the multi-round Tier B target of 500-2000 lines in the plan this case comes from is not reachable for *this* function, and the honest guard is the shape at the size it actually has). Second, every dispatcher here now prints as `switch (index)` with `/* handler @0x... */` per case, not as a chain of compares against raw target addresses: that took the resolver learning to reject a table entry pointing back between its own table read and its branch (see resolve_indirect.cpp's lastTableReadIn -- such an entry resolves as a self edge, and the phi that edge puts in front of the load is what stopped matchJumpTable recognising the table), plus dropping the per-site anchor from analysis::DispatchRegion's clustering key so the six sites reading table 0x100081cb0 through six different anchors cluster as the one scatter region they are. The forbidden pattern below is that first fix stated as a shape: `switch ((t + 0x1000238b8))` is the address-discriminant form this dispatcher falls back to the moment the table stops being recognisable behind it.",
+      "expect": {
+        "max_lines": 11500,
         "max_gotos": 420,
-        "min_switches": 220,
-        "max_lines": 6600
+        "max_unresolved_branches": 30,
+        "min_switches": 8,
+        "max_ternaries": 40,
+        "max_undef": 10,
+        "patterns": ["switch (", "/* handler @0x1000238e4 */"],
+        "forbid_patterns": ["switch \\(\\(t\\d+ \\+ 0x1000238b8\\)\\)"]
       }
     }
   ]

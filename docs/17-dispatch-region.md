@@ -189,12 +189,15 @@ It only flattens a nested `Switch`-inside-a-`Switch` case body when both
 switches are `tableMode`, share the *exact same* `il::ExprId` discriminant,
 and the inner switch carries no `epilogue` of its own — i.e. it proves two
 adjacent dispatch levels are reading the same index, rather than inferring a
-shared index across sites that never provably shared one. Gated behind
-`StructureOptions::regionStructuring` (default `false`); on
-`sample_libscplugin` it fires zero times, because that function's 234 sites
-each dispatch on their own state expression, never the same `ExprId` a
-sibling site already tested — a sound "nothing to merge" result, not a
-missed one. See `tests/emit/test_structure_region_switch.cpp`.
+shared index across sites that never provably shared one. Runs
+unconditionally (the `StructureOptions::regionStructuring` gate this
+paragraph originally described has since been removed — see docs/19-
+scatter-dispatch-target-shape.md and eval/FINDINGS.md for the "structuring
+optimizations default on" change); on `sample_libscplugin` it fires zero
+times, because that function's 234 sites each dispatch on their own state
+expression, never the same `ExprId` a sibling site already tested — a sound
+"nothing to merge" result, not a missed one. See `tests/emit/
+test_structure_region_switch.cpp`.
 
 **`Structurizer::collapseLabeledNaturalLoops`** (`structure.cpp`, J2f) is not
 a `DispatchRegion` consumer directly, but closes the gap this document's

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "xdec/analysis/image_eval.h"
+#include "xdec/analysis/index_bound.h"
 #include "xdec/support/reader.h"
 #include "xdec/support/result.h"
 
@@ -32,13 +33,25 @@ std::optional<DispatchValues> matchDispatchValues(const il::Function& function, 
   }
   ImageEval eval(function, neverMapped);
   const ValueSet indexSet = eval.eval(index);
-  if (indexSet.isTop() || indexSet.values().size() != targetCount) {
-    return std::nullopt;
-  }
 
   DispatchValues result;
-  result.values.assign(indexSet.values().begin(), indexSet.values().end());
-  std::sort(result.values.begin(), result.values.end());
+  if (!indexSet.isTop() && indexSet.values().size() == targetCount) {
+    result.values.assign(indexSet.values().begin(), indexSet.values().end());
+    std::sort(result.values.begin(), result.values.end());
+  } else if (const std::optional<std::vector<uint64_t>> shaped =
+                 preciseIndexSet(function, index);
+             shaped.has_value() && shaped->size() == targetCount) {
+    // The index's shape, where its values are out of reach (analysis/
+    // index_bound.h). An obfuscated dispatch computes its index from a call's
+    // return value, so the evaluator above is top on it and the switch would
+    // otherwise label its cases `case 0:`, `case 1:` -- position in
+    // resolve_indirect's target list, presented as though it were the state
+    // the program branches on. preciseIndexSet returns its values ascending,
+    // which is the order this contract already promises.
+    result.values = *shaped;
+  } else {
+    return std::nullopt;
+  }
 
   if (targetCount == 2) {
     // Search the whole expression DAG -- not just the arm the top-level
