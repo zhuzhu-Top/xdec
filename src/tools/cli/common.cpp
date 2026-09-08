@@ -35,6 +35,8 @@ int usage() {
   printLine("");
   printLine("commands:");
   printLine("  info <binary>                    summarise an image");
+  printLine("  images <cache> [count]           list a dyld shared cache's indexed images (dylibs)");
+  printLine("  cache-locate <cache> <address>   which image/symbol a dyld shared cache address belongs to");
   printLine("  sections <binary>                list sections");
   printLine("  symbols <binary> [count]         list defined symbols by address");
   printLine("  relocs <binary> [count]          list relocations");
@@ -48,6 +50,9 @@ int usage() {
   printLine("      options: -o <file.c> --rounds <n> --no-annotate --allow-unresolved");
   printLine("               --max-span <bytes> (drop discoveries past entry+bytes)");
   printLine("               --discovery-cap <n> (skip branches offering more targets)");
+  printLine("               --no-path-explore (disable the path-sensitive resolve-indirect fallback)");
+  printLine("               --path-explore-max-paths <n> (default 64; see docs/23-path-eval.md)");
+  printLine("               --path-explore-canary-fail (also explore a stack-canary mismatch arm)");
   printLine("               --types <header|preset> (repeatable)");
   printLine("               --syscall-table <file|name|none> (default aarch64-linux)");
   printLine("               --reuse-report (count same-block subexpression duplication)");

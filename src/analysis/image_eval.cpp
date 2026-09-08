@@ -157,7 +157,8 @@ ValueSet ImageEval::evalValue(il::ValueId id) {
     result = unionEntryRegAware(function_.operands(definition));
   } else if (definition.code == il::OpCode::Load) {
     const auto operands = function_.operands(definition);
-    result = loadFrom(eval(operands[0]), function_.value(id).type);
+    const il::Type loadType = function_.value(id).type;
+    result = loadFrom(eval(operands[0]), loadType);
   }
   // Call results, register reads, and anything else: top.
   valueMemo_.emplace(id, result);
@@ -171,17 +172,6 @@ ValueSet ImageEval::loadFrom(const ValueSet& addresses, il::Type type) {
   const std::size_t width = type.bits() / 8;
   ValueSet out = ValueSet::empty();
   for (const uint64_t address : addresses.values()) {
-    if (entryRegs_ != nullptr) {
-      // A captured fact about memory the image itself does not contain (an
-      // argument pointer's pointee, say -- see MemorySeed) always wins over
-      // the image's own bytes at that address, the same priority an
-      // EntryReg literal has over a platform formula.
-      if (const std::optional<uint64_t> seeded =
-              entryRegs_->memoryValueAt(address, static_cast<unsigned>(width))) {
-        out.insert(maskTo(type.bits(), *seeded));
-        continue;
-      }
-    }
     std::array<std::byte, 8> bytes{};
     if (!reader_(address, std::span<std::byte>(bytes).subspan(0, width))) {
       return ValueSet::top();  // unmapped memory is not zero

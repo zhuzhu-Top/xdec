@@ -36,8 +36,8 @@ class BinaryImage;
 /// states the formula.
 struct EntryRegOffset {
   std::string reg;        // e.g. "x22"
-  std::string companion;  // e.g. "dyld"; matched against a sidecar/discovered
-                          // EntryCompanion of the same name
+  std::string companion;  // e.g. "dyld"; matched against a companion image
+                          // discovered by convention (see SessionContext::open)
   uint64_t offset = 0;
 };
 

@@ -1,6 +1,7 @@
 // registerBuiltinPasses: the stock pipeline every front-end gets.
 #include "xdec/passes/builtin.h"
 
+#include "xdec/passes/annotate_stack_canary.h"
 #include "xdec/passes/apply_types.h"
 #include "xdec/passes/cfg_finalize.h"
 #include "xdec/passes/const_fold_memory.h"
@@ -62,6 +63,10 @@ void registerBuiltinPasses(pass::Registry& registry) {
   // Then the calling convention, over resolved control flow: Optimized has no
   // pass of its own yet, so this one bridges Resolved straight to Vars.
   (void)registry.add(makeVarsPass());
+  // Last: a pure presentation note over the settled Vars-level IL (stack
+  // deltas and Global addresses both final), so no later pass has to keep it
+  // in step with a rewrite.
+  (void)registry.add(makeAnnotateStackCanaryPass());
 }
 
 }  // namespace xdec::passes

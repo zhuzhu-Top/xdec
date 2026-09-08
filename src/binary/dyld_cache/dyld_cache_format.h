@@ -147,8 +147,10 @@ inline constexpr uint64_t kNlistType = 4;
 inline constexpr uint64_t kNlistSect = 5;
 inline constexpr uint64_t kNlistValue = 8;
 inline constexpr uint64_t kNlistRecordSize = 16;
+inline constexpr uint8_t kNStab = 0xe0;
 inline constexpr uint8_t kNTypeMask = 0x0e;
 inline constexpr uint8_t kNSect = 0xe;
+inline constexpr uint8_t kNAbs = 0x2;
 inline constexpr uint8_t kNExt = 0x01;
 
 }  // namespace xdec::binary::dyldcache

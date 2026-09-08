@@ -36,6 +36,7 @@ void configure(pass::Manager& manager, const ByteReader& reader,
   manager.setSyscallTable(options.syscalls);
   manager.setNames(options.names);
   manager.setEntryRegFacts(options.entryRegs);
+  manager.setPathExploreOptions(&options.pathExplore);
   // Inert below Resolved, which is as far as every round but the last goes, so
   // it belongs here with the rest rather than only on the finishing Manager.
   manager.setSealUnresolvedBranches(options.sealUnresolvedBranches);
@@ -164,6 +165,7 @@ struct Probe {
     // remaining rounds exist to resolve.
     context.setMemoryFacts(options.memory);
     context.setEntryRegFacts(options.entryRegs);
+    context.setPathExploreOptions(&options.pathExplore);
     context.setDiscoverySink([this, &options](const pass::Discovery& found) {
       if (options.maxDiscoveryPerBranch != 0 &&
           found.missing.size() > options.maxDiscoveryPerBranch) {

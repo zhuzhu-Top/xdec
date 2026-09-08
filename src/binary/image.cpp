@@ -196,6 +196,16 @@ const Symbol* BinaryImage::symbolAt(uint64_t va) const noexcept {
   return symbol.va == va ? &symbol : nullptr;
 }
 
+const Symbol* BinaryImage::symbolNearestBefore(uint64_t va) const noexcept {
+  const auto it = std::upper_bound(
+      symbolsByAddress_.begin(), symbolsByAddress_.end(), va,
+      [this](uint64_t address, uint32_t index) { return address < contents_.symbols[index].va; });
+  if (it == symbolsByAddress_.begin()) {
+    return nullptr;
+  }
+  return &contents_.symbols[*std::prev(it)];
+}
+
 const Symbol* BinaryImage::symbolContaining(uint64_t va) const noexcept {
   // Walk back from the first symbol past `va`, keeping the narrowest cover so
   // that a symbol nested inside a larger one wins. The walk is bounded by the

@@ -38,6 +38,7 @@ class TypeDatabase;
 
 namespace xdec::analysis {
 class EntryRegFacts;
+struct PathExploreOptions;
 }  // namespace xdec::analysis
 
 namespace xdec::pass {
@@ -160,6 +161,22 @@ class Context {
     return entryRegs_;
   }
 
+  /// What resolve-indirect's path-sensitive fallback (analysis::PathExplorer,
+  /// wired through in src/passes/resolve_indirect.cpp) is allowed to spend --
+  /// see analysis/path_explorer.h. A pointer, not a value, for the same
+  /// reason entryRegs_ above is: this header stays independent of
+  /// xdec_analysis, and the caller-owned options only need to outlive the
+  /// pass run, exactly like EntryRegFacts. Null means "use
+  /// PathExploreOptions{}'s defaults", not "disabled" -- an unwired pipeline
+  /// (a test constructing Context directly) still gets the fallback rather
+  /// than silently losing it.
+  void setPathExploreOptions(const analysis::PathExploreOptions* options) noexcept {
+    pathExplore_ = options;
+  }
+  [[nodiscard]] const analysis::PathExploreOptions* pathExploreOptions() const noexcept {
+    return pathExplore_;
+  }
+
   /// The image's symbol table, for the one thing a pass can do with a name that
   /// it cannot do with an address: look up what a header declared under it.
   /// Unset resolves nothing, which is what a pipeline with no image gets.
@@ -207,6 +224,7 @@ class Context {
   bool seal_ = false;
   std::function<void(const Discovery&)> discoverySink_;
   const analysis::EntryRegFacts* entryRegs_ = nullptr;
+  const analysis::PathExploreOptions* pathExplore_ = nullptr;
 };
 
 class Pass {

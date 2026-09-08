@@ -10,6 +10,8 @@ namespace xdec::cli {
 // Forward declarations for the command handlers, defined across the
 // cmd_*.cpp files (grouped by domain).
 int commandInfo(std::string_view path);
+int commandImages(std::string_view path, uint64_t limit);
+int commandCacheLocate(std::string_view path, uint64_t address);
 int commandSections(std::string_view path);
 int commandSymbols(std::string_view path, uint64_t limit);
 int commandRelocs(std::string_view path, uint64_t limit);
@@ -62,6 +64,26 @@ int dispatch(std::span<const std::string_view> args) {
   }
   if (command == "sections") {
     return commandSections(args[1]);
+  }
+  if (command == "images") {
+    uint64_t limit = 200;
+    if (args.size() > 2 && !parseNumber(args[2], limit)) {
+      print("error: '{}' is not a number", args[2]);
+      return 1;
+    }
+    return commandImages(args[1], limit);
+  }
+  if (command == "cache-locate") {
+    if (!requireArgs(2)) {
+      printLine("error: cache-locate needs a cache path and an address");
+      return usage();
+    }
+    uint64_t address = 0;
+    if (!parseNumber(args[2], address)) {
+      print("error: '{}' is not a number", args[2]);
+      return 1;
+    }
+    return commandCacheLocate(args[1], address);
   }
   if (command == "coverage") {
     uint64_t limit = 20;

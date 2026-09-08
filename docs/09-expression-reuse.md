@@ -372,6 +372,58 @@ type being pointer-shaped — never guessed from the address alone, so an
 integer constant that happens to double as a readable offset is never
 misprinted as a string.
 
+## M. A short string literal's inlined byte stores printed one at a time
+
+A compiler that inlines `strcpy(dst, "short literal")` as a handful of
+immediate stores (`var_6b = 0x6c7070612e6d6f63; var_63 = 0x62612e65; ...`)
+leaves no `strcpy` *call* in the machine code at all — but the reader still
+wants to see `strcpy(&var_6b, "com.apple.absd")`, the source-level idiom the
+compiler compiled away, not four unrelated-looking assignments. IDA's
+Hex-Rays resynthesizes exactly this shape; left unhandled, xdec instead
+printed the literal semantics, which is correct but hides the one fact that
+actually matters (docs/22-dyld-shared-cache.md §7, `sub_192464d44`, is where
+this was first noticed: `strcpy(v5, "com.apple.absd")` in IDA's own output
+against four bare assignments in xdec's).
+
+**Fixed** by `analysis::findFoldableStringStores` (`string_store_fold.h`),
+consumed by `CContext`/`StmtPrinter::printFoldedStringStore`
+(`emit/c_stmt.cpp`) the same way `findConfirmedVtableCalls` is: a standalone
+idiom-recognition fact, not one of the redundant-*temporary* shapes above,
+so it stays out of `prepareEmitRedundancy`'s own load-bearing fold order.
+Every Store in a matched run stays a real memory write — none are deleted,
+only the run's continuations are folded into `deadOps` the same "printed
+elsewhere" way shape F/G already are — so a run whose base address later
+escapes into a call (as `sub_192464d44`'s own does) keeps working exactly
+as before, just spelled as the idiom it is.
+
+## N. A stack-protector save/reload round trip printed as bare pointer arithmetic
+
+`-fstack-protector`'s classic shape — a value read from some fixed address
+into a local near a function's start, then re-read from that same address
+and compared against the local right before a return — arrives at Vars as
+two ordinary `Load`s and a `Cmp`, with nothing to say they are related. On a
+Mach-O or ELF image the guard address is usually a named import
+(`ptr____stack_chk_guard`), which already reads as a pointer worth noticing;
+on a `dyld_shared_cache` image the address left behind after
+`const-fold-memory` collapses the `ADRP`/`LDR` pair is frequently a private
+data slot with no exact symbol in the subset of tables xdec has loaded (see
+docs/22-dyld-shared-cache.md §7's `sub_192464d44`), so the same round trip
+prints as two bare `(*(uint64_t*)(0x201f5363070))` dereferences, sixty lines
+apart, with nothing to connect them — exactly the raw-pointer noise this
+document's other idioms exist to cut through.
+
+**Fixed** by `analysis::findStackCanarySaves` (`stack_canary.h`), run as the
+pipeline's own last pass (`annotate-stack-canary`, `builtin.cpp`) purely to
+drop a note on the save — the one thing about this shape that is provable
+from the IL alone on every platform alike, and, unlike shape M, all this
+does. It deliberately never claims *which* runtime symbol the address is:
+that would be exactly the kind of guess docs/22 §7's own account of this
+same function declines to make when the dyld cache's symbol tables come up
+short. What the note says instead is the structural fact — this local holds
+a value saved here and compared again at a specific later address before the
+function returns — which is enough for a reader to recognise the pattern
+without xdec asserting a name it cannot back with a symbol.
+
 ## Using the report
 
 ```

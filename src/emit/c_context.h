@@ -20,6 +20,7 @@
 
 #include "xdec/analysis/image_literals.h"
 #include "xdec/analysis/stack_frame.h"
+#include "xdec/analysis/string_store_fold.h"
 #include "xdec/analysis/variables.h"
 #include "xdec/analysis/vtable_call.h"
 #include "xdec/emit/c_printer.h"
@@ -82,6 +83,16 @@ struct InlinedStackLoad {
 struct InlinedMemoryLoad {
   il::ExprId address;
   uint32_t width = 0;  // bits
+};
+
+/// What printFoldedStringStore needs to print an
+/// analysis::findFoldableStringStores run as one synthesized `strcpy` line:
+/// the destination pointer, already rendered the way `CContext::
+/// addressOfLocal` would ("&var_6b"), and the decoded string, not yet
+/// C-escaped (see analysis::quoteCString).
+struct StringStoreText {
+  std::string address;
+  std::string text;
 };
 
 class CContext {
@@ -196,6 +207,16 @@ class CContext {
   /// (StmtPrinter::printCall), never changes what the call itself casts to,
   /// since neither the object's struct layout nor its class name is known.
   std::map<uint32_t, analysis::VtableCallSite> vtableCalls;
+
+  /// First Store's op index -> the synthesized `strcpy` text for a
+  /// analysis::findFoldableStringStores run this context accepted (see the
+  /// constructor: a candidate is only accepted once `addressOfLocal` finds
+  /// real text for its destination, the same filter
+  /// `foldableStackLoads`/`stackLoadFilter` already applies). Every
+  /// continuation Store the accepted run covers is folded into `deadOps`
+  /// at the same time; StmtPrinter::printFoldedStringStore is the only
+  /// reader.
+  std::map<uint32_t, StringStoreText> foldableStringStores;
 
   /// The temporary standing for a value, or nullptr when the value has none.
   [[nodiscard]] const std::string* tempFor(il::ValueId value) const;

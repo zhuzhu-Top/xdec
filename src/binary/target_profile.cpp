@@ -53,9 +53,9 @@ TargetProfile inferTargetProfile(const BinaryImage& image) {
     // several files instead of one. No syscallTable/entryRegOffsets: code
     // living in the cache never runs as a process's own `start()`, so
     // dyld's x21/x22/x28 handoff (the Mach-O branch above) does not apply to
-    // it; whatever a specific function needs from its caller is a per-call
-    // fact for a sidecar (see analysis/entry_reg.h's MemorySeed), not a
-    // platform-wide one.
+    // it -- whatever a specific function needs from its caller is a per-call
+    // fact about that argument, not a platform-wide one (see
+    // docs/22-dyld-shared-cache.md §6 for why that is out of scope here).
     profile.typePresets = {"ios-sdk"};
   }
   return profile;

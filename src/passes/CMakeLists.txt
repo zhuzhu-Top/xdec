@@ -1,6 +1,7 @@
 xdec_add_library(xdec_passes
   SOURCES
     algebra.cpp
+    annotate_stack_canary.cpp
     apply_types.cpp
     algebra_idioms.cpp
     builtin.cpp

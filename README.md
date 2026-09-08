@@ -29,7 +29,7 @@
 | **架构** | AArch64（主要支持） |
 | **二进制格式** | ELF64（`.so`、可执行文件）、Mach-O（iOS/macOS 可执行文件与 dylib）、dyld shared cache（只读元数据 + 按需加载） |
 | **平台配置** | Android NDK / AArch64 Linux / iOS Mach-O — 由 `TargetProfile` 从镜像自动推断，无需手动指定 |
-| **EntryReg** | iOS 平台 loader 泄漏的入口寄存器（x21/x22 dyld 基址、x28 内核残留）通过 sidecar / companion 镜像解析（见 [docs/21-entry-reg-platform.md](docs/21-entry-reg-platform.md)） |
+| **EntryReg** | iOS 平台 loader 泄漏的入口寄存器（x21/x22 dyld 基址、x28 内核残留）通过 `TargetProfile` 公式 + 同目录 companion 镜像解析（见 [docs/21-entry-reg-platform.md](docs/21-entry-reg-platform.md)） |
 | **混淆类型** | OLLVM 控制流扁平化、scatter-dispatcher、MBA、不透明谓词 |
 
 x86 及其他架构暂不支持；IL 与 spec 框架可通过新增 `.xspec` 与 target profile 扩展。
@@ -61,11 +61,20 @@ CLI 位于 `build/dev/bin/xdec.exe`。构建时会将 `xdec_helpers.h` 复制到
 .\build\dev\bin\xdec.exe decompile libsdk_bc_lib.so 0x2a2428 -o sub_2a2428.c
 ```
 
-**iOS Mach-O** — 可选 companion 镜像（dyld）与 entry sidecar 改善 EntryReg 解析：
+**iOS Mach-O** — 可选 companion 镜像（dyld）改善 EntryReg 解析：
 
 ```powershell
-# 将 dyld 文件放在 absd 同目录，或提供 absd.entry.json sidecar
+# 将 dyld 文件放在 absd 同目录（按约定自动发现）
 .\build\dev\bin\xdec.exe decompile absd 0x100023290 -o start.c --rounds 4 --allow-unresolved
+```
+
+**dyld shared cache** — 多文件 split cache 作为一个统一地址空间打开（见 [docs/22](docs/22-dyld-shared-cache.md)）：
+
+```powershell
+.\build\dev\bin\xdec.exe info   dyld_shared_cache_arm64
+.\build\dev\bin\xdec.exe images dyld_shared_cache_arm64
+.\build\dev\bin\xdec.exe cache-locate dyld_shared_cache_arm64 0x192464d44
+.\build\dev\bin\xdec.exe decompile dyld_shared_cache_arm64 0x192464D44 -o sub_192464d44.c --rounds 4 --discovery-cap 36 --allow-unresolved
 ```
 
 常用选项：
@@ -93,7 +102,6 @@ CLI 位于 `build/dev/bin/xdec.exe`。构建时会将 `xdec_helpers.h` 复制到
 |------|------|
 | `XDEC_LOG=pass=debug,local=debug` | pass 级诊断日志 |
 | `XDEC_SPEC=<file.xspec>` | 覆盖架构 spec |
-| `XDEC_ENTRY_SIDECAR=<path>` | 指定 EntryReg sidecar JSON |
 | `XDEC_SAMPLE_<KEY>=<path>` | L1 样本二进制路径（见 [samples/README.md](samples/README.md)） |
 
 ---
@@ -200,10 +208,10 @@ xdec/
 │   └── tools/          xdec CLI
 ├── types/              类型数据库、syscall 表、NDK 预设
 ├── eval/               L0 回归：98 个有 ground-truth 的函数
-├── samples/            L1 回归：9 个真实混淆二进制（ELF + Mach-O）
-├── tests/              695 个 Catch2 单元测试
+├── samples/            L1 回归：9 个真实混淆二进制（ELF + Mach-O + dyld shared cache）
+├── tests/              704 个 Catch2 单元测试
 ├── tools/              iOS 调试辅助脚本等
-└── docs/               设计文档（00–21）
+└── docs/               设计文档（00–22）
 ```
 
 CMake 库目标（由细到粗）：`xdec_support` → `xdec_binary` → `xdec_il` → `xdec_spec` → `xdec_types` → `xdec_analysis` → `xdec_pass` → `xdec_passes` → `xdec_emit` → `xdec_decompile` → `xdec`（CLI）。
@@ -238,7 +246,7 @@ cd eval
 
 ```powershell
 # 复制 samples/local.example.json → samples/local.json 并填写二进制路径
-# iOS Mach-O 可选：samples/fixtures/absd.entry.json.example → absd.entry.json
+# iOS Mach-O 可选：将 dyld 文件放在二进制同目录（按约定自动发现）
 .\samples\run.ps1     # 9/9
 ```
 
@@ -265,7 +273,10 @@ cd eval
 | [17-dispatch-region.md](docs/17-dispatch-region.md) | DispatchRegion 分析 |
 | [19-scatter-dispatch-target-shape.md](docs/19-scatter-dispatch-target-shape.md) | Scatter-dispatcher 目标形状 |
 | [20-absd-entry-registers.md](docs/20-absd-entry-registers.md) | iOS absd EntryReg 分析 |
-| [21-entry-reg-platform.md](docs/21-entry-reg-platform.md) | EntryReg 平台锚点与 sidecar 机制 |
+| [21-entry-reg-platform.md](docs/21-entry-reg-platform.md) | EntryReg 平台锚点：`TargetProfile` 公式 + companion 镜像自动发现 |
+| [22-dyld-shared-cache.md](docs/22-dyld-shared-cache.md) | dyld shared cache 完整支持：多文件 backing、subcache 发现、指针 tag 解码、本地符号 |
+| [23-path-eval.md](docs/23-path-eval.md) | PathEval：路径敏感的间接跳转回退 |
+| [24-apple-indirect-dispatch.md](docs/24-apple-indirect-dispatch.md) | absd / AuthKit 间接跳转怎么算（偏移表、指针表减常数、字段加起点）以及 xdec 为何解不完 |
 | [eval/FINDINGS.md](eval/FINDINGS.md) | 回归历史、性能记录、OLLVM 优化日志 |
 
 架构 spec DSL 参考：[docs/02-dsl-ref.md](docs/02-dsl-ref.md)、[docs/03-spec-compiler.md](docs/03-spec-compiler.md)。

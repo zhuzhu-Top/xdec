@@ -394,7 +394,15 @@ class Assembler {
   [[nodiscard]] std::string preamble() {
     std::string out =
         "#include <stdint.h>\n"
-        "#include <stdbool.h>\n"
+        "#include <stdbool.h>\n";
+    // `<string.h>` only when an analysis::findFoldableStringStores run
+    // actually printed as a synthesized `strcpy` (see
+    // StmtPrinter::printFoldedStringStore) -- an ordinary decompile that
+    // never used the idiom gets no new include at all.
+    if (!ctx_.foldableStringStores.empty()) {
+      out += "#include <string.h>\n";
+    }
+    out +=
         "// 128-bit machine values: vector registers and wide arithmetic.\n"
         "typedef unsigned __int128 uint128_t;\n"
         "typedef __int128 int128_t;\n";

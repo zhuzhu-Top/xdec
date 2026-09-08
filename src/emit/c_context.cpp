@@ -92,6 +92,30 @@ CContext::CContext(const il::Function& theFunction, const analysis::VariableTabl
   for (const analysis::VtableCallSite& site : analysis::findConfirmedVtableCalls(function)) {
     vtableCalls.emplace(site.call.index(), site);
   }
+  // String-store-fold (see analysis/string_store_fold.h): kept out of the
+  // prepareEmitRedundancy aggregator above on purpose. That aggregator's own
+  // scope is redundant-*temporary* shapes threaded through `deadOps` in a
+  // load-bearing order; this is an idiom resynthesis (an inlined `strcpy`,
+  // not a spilled value), the same kind of standalone fact
+  // findConfirmedVtableCalls just above already is. `addressOfLocal` is the
+  // filter: a run with no local recovered at its own delta is left with its
+  // ordinary per-Store printing, exactly the policy the stack-load-fold
+  // filter above applies for the same reason.
+  for (auto& [opIndex, candidate] : analysis::findFoldableStringStores(function, frame)) {
+    if (deadOps.contains(opIndex)) {
+      continue;  // the run's first Store is already dead for some other reason
+    }
+    const il::Op& firstStore = function.op(il::OpId{opIndex});
+    std::string address = addressOfLocal(function.operands(firstStore)[0]);
+    if (address.empty()) {
+      continue;
+    }
+    for (const uint32_t continuation : candidate.continuationOps) {
+      deadOps.insert(continuation);
+    }
+    foldableStringStores.emplace(opIndex,
+                                 StringStoreText{std::move(address), std::move(candidate.text)});
+  }
 }
 
 const std::string* CContext::tempFor(il::ValueId value) const {

@@ -90,6 +90,12 @@ class Manager {
     entryRegs_ = facts;
   }
 
+  /// See Context::setPathExploreOptions. Must outlive the pipeline, same as
+  /// entryRegs above.
+  void setPathExploreOptions(const analysis::PathExploreOptions* options) noexcept {
+    pathExplore_ = options;
+  }
+
   /// The image's symbol table, as passes ask about it (see Context::setNames).
   void setNames(NameAt names) { names_ = std::move(names); }
 
@@ -129,6 +135,7 @@ class Manager {
   bool seal_ = false;
   std::function<void(const Discovery&)> discoverySink_;
   const analysis::EntryRegFacts* entryRegs_ = nullptr;
+  const analysis::PathExploreOptions* pathExplore_ = nullptr;
 };
 
 }  // namespace xdec::pass

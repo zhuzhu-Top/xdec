@@ -423,7 +423,7 @@ TEST_CASE("algebra tier: a shared subtrahend cancels out of an equality",
   // value never matters.
   for (const unsigned width : {32u, 64u}) {
     const Type t = Type::integer(width);
-    for (const auto [k1, k2] :
+    for (const auto& [k1, k2] :
         {std::pair{uint64_t{0x898048e0df683786}, uint64_t{0x898048e0df6837a1}},
          std::pair{uint64_t{0}, uint64_t{5}}, std::pair{uint64_t{5}, uint64_t{0}}}) {
       INFO(std::format("width = {} k1 = 0x{:x} k2 = 0x{:x}", width, k1, k2));
@@ -485,7 +485,6 @@ TEST_CASE("the constant evaluator compares whole operands, not result widths",
           "[il][ceval]") {
   Fixture f;
   for (const unsigned width : {8u, 32u, 64u}) {
-    const Type t = Type::integer(width);
     const auto fold = [&](ExprOp op, uint64_t a, uint64_t b) {
       il::ConcreteValue out;
       const ExprId id = f.function.binary(op, f.constant(a, width), f.constant(b, width));

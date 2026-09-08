@@ -117,7 +117,7 @@ boot session.
 | `preciseIndexSet` + table sparse enum | Done — L1 candidates 308→2 |
 | `kSetCap` 64, self-table filter | Done — most dispatch chain resolved |
 | Remaining sealed | `0x100023688`, `0x1000239a4` (x22/x28); `0x1000238dc` (heap, cap-limited) |
-| Entry-reg anchors in `image_eval` | **Done** — see docs/21-entry-reg-platform.md (zero new CLI flags: `TargetProfile` formulas + auto-discovered `<binary>.entry.json` sidecar) |
+| Entry-reg anchors in `image_eval` | **Done** — see docs/21-entry-reg-platform.md (zero new CLI flags: `TargetProfile` formulas + auto-discovered companion image) |
 | Manifest threshold refresh | Still stale (pre-existing, unrelated to entry-reg — see §7.6) |
 
 ## 7. Dynamic validation (iOS device — 192.168.110.36)
@@ -255,7 +255,6 @@ Low 32 bits for table indexing: `(uint32_t)x22 == 0x04fe0310` on this boot.
 
 | Script | Purpose |
 |--------|---------|
-| `xdec/tools/ios_lldb_absd_entry.py` | Fast probe + HW BP (exits if no hit; **no waitfor**) |
 | `xdec/tools/ios_attach_test.py` | Attach to running daemon; module bases |
 | `xdec/tools/ios_lldb_quick.py` | Minimal one-shot lldb |
 
@@ -263,16 +262,17 @@ Low 32 bits for table indexing: `(uint32_t)x22 == 0x04fe0310` on this boot.
 
 With the entry-reg facts wired in (`EntryRegFacts`, `CompositeByteReader`,
 zero new `decompile` flags — full design in docs/21), re-running
-`sample_absd_start_chain`'s exact command against a local `absd` copy with a
-sidecar supplying `x22 = 0x104fe0310` / `x28 = 0x0` as direct literals (no
-`dyld` companion file was available in this environment):
+`sample_absd_start_chain`'s exact command against a local `absd` copy —
+`x22 = 0x104fe0310` / `x28 = 0x0` resolved from the platform profile's own
+formula (dyld base + fixed offset, x28's literal `0`; no `dyld` companion
+file was available in this environment):
 
 - The anchoring mechanism itself works: the emitted C now has
   `#define __entry_x22 0x104fe0310ULL` / `#define __entry_x28 0x0ULL`
   instead of `extern`.
 - The same **four** `__xdec_unimplemented` sites remain sealed either way
   (`0x100023688`, `0x100023938`, `0x1000239a4`, `0x1000238dc`) — identical
-  with or without the sidecar present. `0x100023688`'s load reads
+  with or without a `dyld` companion present. `0x100023688`'s load reads
   `absd`'s own `0x100080ec0` table at `idx*4` where `idx` is x22's raw low
   32 bits (or `+1`) with no further mask visible in the IL — for the
   captured value (`0x04fe0310`) that address is far outside anything absd
@@ -286,7 +286,7 @@ sidecar supplying `x22 = 0x104fe0310` / `x28 = 0x0` as direct literals (no
   `tests/passes/test_resolve_indirect.cpp` for the mechanism proved in
   isolation).
 - No regression: `samples/manifest.json`'s existing cases score identically
-  with the sidecar present or absent.
+  with a `dyld` companion present or absent.
 
 `sample_absd_start_chain`'s and `sample_absd_start_l2`'s thresholds already
 fail independently of any of this (`gotos`/`lines`/`undef` overshoot,
@@ -318,8 +318,9 @@ per-site account, summarized here:
   `dyld` image's rebase/bind slots read as real pointers instead of raw chain
   words — the missing piece §8 step 1 called for, needed by `0x100023938`.
 
-With a real `dyld` companion in place (`tmp/dyld` + `tmp/absd.entry.json`'s
-`companions[]` entry, per §7.6), `0x100023938` and `0x1000239a4` are resolved.
+With a real `dyld` companion in place (`tmp/dyld`, discovered next to the
+local `absd` copy by convention, per §7.6), `0x100023938` and `0x1000239a4`
+are resolved.
 `0x100023688` and `0x1000238dc` remain sealed, for reasons neither phase
 addresses and that Phase 2/8-step-3's original framing ("find where the real
 dispatcher narrows x22") turned out not to fit:
@@ -377,7 +378,22 @@ the converged shape and `samples/baseline.json` updated; see
    EntryReg analysis — out of scope for this plan, which targeted analysis
    precision specifically.
 
-## 9. Reference paths
+## 9. Related: the same obfuscator inside the dyld shared cache
+
+`absd`'s obfuscator (the `-2` thunk table shape §5/§7.7 traces through
+`off_1000A2A10`) is not confined to the standalone `absd` binary. The dyld
+shared cache's own `AuthKit.framework` carries a structurally identical
+dispatcher at `0x192464d44`, reached from `-[AKAbsintheSigner
+_generateSignatureForRequest:completionHandler:]` — same tagged jump-table
+pointers, same stack-canary-guarded dispatch, same self-cancelling XOR chain
+across trampolines. See docs/22-dyld-shared-cache.md §6-7 for that
+function's own full trace and result; the two investigations share
+technique (`CachePointerDecoder`'s tag-masking is the direct descendant of
+this doc's `-2` thunk finding) but not code — `absd` and the cache are
+different `BinaryImage` formats loaded through entirely separate loaders,
+and nothing about resolving one required touching the other's loader.
+
+## 10. Reference paths
 
 | Asset | Path |
 |-------|------|
@@ -385,8 +401,9 @@ the converged shape and `samples/baseline.json` updated; see
 | dyld IDA DB | `C:\Users\28264\Desktop\fsdownload\dyld.i64` |
 | xdec chain output | `xdec/samples/build/out/sample_absd_start_chain.c` |
 | Tier A/B notes | `xdec/eval/FINDINGS.md` § absd 2026-08-13 |
-| Host lldb scripts | `xdec/tools/ios_lldb_absd_entry.py`, `ios_attach_test.py` |
+| Host lldb scripts | `xdec/tools/ios_attach_test.py`, `ios_lldb_quick.py` |
+| dyld shared cache | `C:\Users\28264\Documents\tmp\appid\binaries\dyld_cache\dyld_shared_cache_arm64` (+ 5 numbered subcaches, `.symbols`); see docs/22-dyld-shared-cache.md |
 
 ---
 
-*Last updated: 2026-08-14 — x21/x22 dynamically confirmed at dyld BLR; x28=0 on test device.*
+*Last updated: 2026-08-14 — x21/x22 dynamically confirmed at dyld BLR; x28=0 on test device; §9 added linking the dyld shared cache's own instance of this obfuscator (docs/22).*

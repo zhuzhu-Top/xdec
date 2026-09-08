@@ -59,6 +59,7 @@ Result<std::vector<RunStats>> Manager::run(
     context.setTypeDatabase(types_);
     context.setSyscallTable(syscalls_);
     context.setEntryRegFacts(entryRegs_);
+    context.setPathExploreOptions(pathExplore_);
     if (names_) {
       context.setNames(names_);
     }

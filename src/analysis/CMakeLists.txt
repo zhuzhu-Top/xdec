@@ -20,15 +20,21 @@ xdec_add_library(xdec_analysis
     load_inline.cpp
     loops.cpp
     noreturn.cpp
+    path_explorer.cpp
+    path_interpreter.cpp
+    path_state.cpp
     plt_stub.cpp
     profile.cpp
     reachability.cpp
     scc.cpp
     emit_redundancy.cpp
+    stack_canary.cpp
     stack_escape.cpp
     stack_frame.cpp
     stack_load_fold.cpp
     stack_store_fold.cpp
+    string_store_fold.cpp
+    sym_value.cpp
     typed_variables.cpp
     value_uses.cpp
     variables.cpp

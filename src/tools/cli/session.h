@@ -193,8 +193,7 @@ struct SessionContext : ToolSession {
   /// CompositeByteReader). A pipeline with no companion still reads exactly
   /// as before this existed: composing zero extra regions changes nothing.
   xdec::ByteReader reader_;
-  /// What binary::TargetProfile::entryRegOffsets/entryRegLiterals and an
-  /// optional sidecar (see analysis::discoverEntrySidecar) together resolve
+  /// What binary::TargetProfile::entryRegOffsets/entryRegLiterals resolve
   /// this binary's leaked entry registers to. Never set by a CLI flag --
   /// see docs/21-entry-reg-platform.md for why this is inferred instead.
   xdec::analysis::EntryRegFacts entryRegs_;

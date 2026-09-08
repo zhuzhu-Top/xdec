@@ -11,9 +11,44 @@
 
 #include "common.h"
 #include "session.h"
+#include "xdec/binary/dyld_cache_metadata.h"
 #include "xdec/binary/image.h"
 
 namespace xdec::cli {
+
+namespace {
+
+std::string hexUuid(const xdec::binary::CacheUuid& uuid) {
+  std::string text;
+  text.reserve(uuid.size() * 2);
+  for (const uint8_t byte : uuid) {
+    text += std::format("{:02x}", byte);
+  }
+  return text;
+}
+
+/// Cache-specific summary lines shared by `info` and (implicitly) documented
+/// for `images`/`cache-locate`: identity, physical parts, and how many
+/// images/local symbols the loader found. Silent (prints nothing) for any
+/// non-DyldCache image, so callers can call this unconditionally.
+void printDyldCacheSummary(const xdec::binary::BinaryImage& image) {
+  const xdec::binary::DyldCacheMetadata* cache = xdec::binary::asDyldCacheMetadata(image);
+  if (cache == nullptr) {
+    return;
+  }
+  print("cache uuid  : {}", hexUuid(cache->uuid));
+  print("cache type  : {}", xdec::binary::toString(cache->cacheType));
+  print("platform    : {}", cache->platform);
+  print("shared rgn  : [0x{:x}, 0x{:x})", cache->sharedRegionStart,
+        cache->sharedRegionStart + cache->sharedRegionSize);
+  print("cache parts : {}", cache->parts.size());
+  for (const auto& part : cache->parts) {
+    print("  {} {}", part.fileName, part.isSymbolsFile ? "(symbols, unmapped)" : "");
+  }
+  print("cache images: {}", cache->images.size());
+}
+
+}  // namespace
 
 int commandInfo(std::string_view path) {
   auto opened = open(path);
@@ -45,6 +80,7 @@ int commandInfo(std::string_view path) {
     }
     print("needed      : {}", needed);
   }
+  printDyldCacheSummary(image);
 
   const auto& memory = image.memory();
   print("memory      : [0x{:x}, 0x{:x}) in {} regions", memory.lowestAddress(),
@@ -90,6 +126,72 @@ int commandInfo(std::string_view path) {
     executableBytes += region->size;
   }
   print("executable  : {} regions, 0x{:x} bytes", executable.size(), executableBytes);
+  return 0;
+}
+
+int commandImages(std::string_view path, uint64_t limit) {
+  auto opened = open(path);
+  if (!opened) {
+    return reportError(opened.error());
+  }
+  const BinaryImage& image = *opened.value();
+  const xdec::binary::DyldCacheMetadata* cache = xdec::binary::asDyldCacheMetadata(image);
+  if (cache == nullptr) {
+    print("error: '{}' is not a dyld shared cache", path);
+    return 1;
+  }
+
+  print("{} image(s)", cache->images.size());
+  uint64_t shown = 0;
+  for (const auto& record : cache->images) {
+    if (shown++ >= limit) {
+      print("... {} more", cache->images.size() - limit);
+      break;
+    }
+    print("  0x{:012x} size=0x{:<8x} {}", record.loadAddress, record.textSegmentSize, record.path);
+  }
+  return 0;
+}
+
+int commandCacheLocate(std::string_view path, uint64_t address) {
+  auto opened = open(path);
+  if (!opened) {
+    return reportError(opened.error());
+  }
+  const BinaryImage& image = *opened.value();
+  const xdec::binary::DyldCacheMetadata* cache = xdec::binary::asDyldCacheMetadata(image);
+  if (cache == nullptr) {
+    print("error: '{}' is not a dyld shared cache", path);
+    return 1;
+  }
+
+  if (const auto* region = image.memory().regionAt(address); region != nullptr) {
+    print("region      : {} {} [0x{:x}, 0x{:x})", region->name, toString(region->permissions),
+          region->va, region->endVa());
+  } else {
+    print("region      : none (not mapped by this cache)");
+  }
+
+  if (const auto* record = cache->imageContaining(address); record != nullptr) {
+    print("image       : {} (loaded at 0x{:x}, +0x{:x})", record->path, record->loadAddress,
+          address - record->loadAddress);
+  } else {
+    print("image       : none of the {} indexed image(s) claims this address", cache->images.size());
+  }
+
+  // Local symbols in a dyld cache carry no size (nlist has none), so a sized
+  // containment check never matches one; fall back to the nearest symbol at
+  // or before the address and say so plainly, since without a size that
+  // symbol's real extent is not actually known to cover `address`.
+  if (const auto* symbol = image.symbolContaining(address); symbol != nullptr) {
+    const uint64_t offset = address - symbol->va;
+    print("symbol      : {}", offset == 0 ? symbol->name : std::format("{}+0x{:x}", symbol->name, offset));
+  } else if (const auto* nearest = image.symbolNearestBefore(address); nearest != nullptr) {
+    const uint64_t offset = address - nearest->va;
+    print("symbol      : {} (nearest preceding symbol, size unknown, +0x{:x})", nearest->name, offset);
+  } else {
+    print("symbol      : none");
+  }
   return 0;
 }
 

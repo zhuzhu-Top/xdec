@@ -18,6 +18,7 @@
 #include "xdec/analysis/dispatch_region.h"
 #include "xdec/analysis/emit_redundancy.h"
 #include "xdec/analysis/expr_reuse.h"
+#include "xdec/analysis/path_explorer.h"
 #include "xdec/analysis/profile.h"
 #include "xdec/decompile/driver.h"
 #include "xdec/decompile/emit.h"
@@ -225,6 +226,7 @@ int commandDecompile(std::string_view path, uint64_t address,
   // How many unlifted targets one branch may contribute per round (see
   // DriverOptions::maxDiscoveryPerBranch). Zero means no limit.
   uint64_t discoveryCap = 0;
+  xdec::analysis::PathExploreOptions pathExplore;
   for (std::size_t i = 0; i < options.size(); ++i) {
     const std::string_view option = options[i];
     const auto value = [&]() -> std::string_view {
@@ -262,6 +264,18 @@ int commandDecompile(std::string_view path, uint64_t address,
         print("error: '--discovery-cap' takes a target count above zero, not '{}'", text);
         return 1;
       }
+    } else if (option == "--no-path-explore") {
+      pathExplore.enabled = false;
+    } else if (option == "--path-explore-max-paths") {
+      const std::string_view text = value();
+      uint64_t maxPaths = 0;
+      if (!parseNumber(text, maxPaths) || maxPaths == 0) {
+        print("error: '--path-explore-max-paths' takes a count above zero, not '{}'", text);
+        return 1;
+      }
+      pathExplore.maxPaths = static_cast<unsigned>(maxPaths);
+    } else if (option == "--path-explore-canary-fail") {
+      pathExplore.exploreCanaryFailPaths = true;
     } else if (option == "--types") {
       typeSources.emplace_back(value());
     } else if (option == "--syscall-table") {
@@ -319,6 +333,7 @@ int commandDecompile(std::string_view path, uint64_t address,
   driverOptions.extendWhileProving = !roundCap.pinned;
   driverOptions.sealUnresolvedBranches = allowUnresolved;
   driverOptions.maxDiscoveryPerBranch = static_cast<std::size_t>(discoveryCap);
+  driverOptions.pathExplore = pathExplore;
   const xdec::binary::Symbol* entrySymbol = image.symbolAt(address);
   const bool sized = entrySymbol != nullptr && entrySymbol->size != 0;
   if (maxSpan != 0) {

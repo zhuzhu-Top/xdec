@@ -37,12 +37,17 @@ add_executable(xdec_tests
   analysis/test_jump_table.cpp
   analysis/test_live_register_frame.cpp
   analysis/test_load_inline.cpp
+  analysis/test_path_explorer.cpp
+  analysis/test_path_interpreter.cpp
   analysis/test_plt_stub.cpp
   analysis/test_profile.cpp
   analysis/test_stack_escape.cpp
+  analysis/test_stack_canary.cpp
   analysis/test_stack_frame.cpp
   analysis/test_stack_load_fold.cpp
   analysis/test_stack_store_fold.cpp
+  analysis/test_string_store_fold.cpp
+  analysis/test_sym_value.cpp
   analysis/test_typed_variables.cpp
   analysis/test_variables.cpp
   analysis/test_vtable_call.cpp
@@ -65,6 +70,7 @@ add_executable(xdec_tests
   emit/test_c_helpers_header.cpp
   emit/test_c_load_inline.cpp
   emit/test_c_stack_load_inline.cpp
+  emit/test_c_string_store_fold.cpp
     emit/test_c_address_form.cpp
     emit/test_c_import_call.cpp
     emit/test_c_vtable_call.cpp
@@ -85,6 +91,7 @@ add_executable(xdec_tests
   corpus/test_corpus.cpp
   pass/test_pass.cpp
   pass/test_observe.cpp
+    passes/test_annotate_stack_canary.cpp
     passes/test_cfg_finalize.cpp
     passes/test_const_fold_memory.cpp
     passes/test_fold_resolved_branch.cpp
@@ -94,6 +101,7 @@ add_executable(xdec_tests
     passes/test_recover_tailcall.cpp
     passes/test_resolve_call.cpp
     passes/test_resolve_indirect.cpp
+    passes/test_resolve_indirect_path_eval.cpp
     passes/test_algebra.cpp
     passes/test_ssa_construct.cpp
     passes/test_ssa_optimize.cpp

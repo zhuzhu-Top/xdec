@@ -14,6 +14,7 @@
 #include "xdec/analysis/image_eval.h"
 #include "xdec/analysis/index_bound.h"
 #include "xdec/analysis/jump_table.h"
+#include "xdec/analysis/path_explorer.h"
 #include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 #include "xdec/il/printer.h"
@@ -64,6 +65,17 @@ class ResolveIndirect final : public pass::FunctionPass {
     // consistent with what every query below sees. Targets set during this run
     // are accounted for on the driver's next round, which recomputes everything.
     const analysis::Dominators dominators = analysis::Dominators::compute(function);
+    // Same "one snapshot for the whole pass" reasoning as the two above: a
+    // fresh walk per branch would both re-pay the traversal cost and see a
+    // function that shifted under it as earlier branches in this same loop
+    // resolved. explore() itself is lazy (see the header), so a function
+    // where the first two candidate sources never come up empty pays nothing
+    // for this at all.
+    const analysis::PathExploreOptions* pathExploreOptions = context.pathExploreOptions();
+    static constexpr analysis::PathExploreOptions kDefaultPathExplore;
+    analysis::PathExplorer pathExplorer(
+        function, *image, context.entryRegFacts(),
+        pathExploreOptions != nullptr ? *pathExploreOptions : kDefaultPathExplore);
 
     bool changed = false;
     for (const il::BlockId blockId : function.blockHandles()) {
@@ -77,7 +89,7 @@ class ResolveIndirect final : public pass::FunctionPass {
           !function.targets(terminator).empty()) {
         continue;
       }
-      changed |= resolveOne(context, eval, dominators, blockId, terminatorId);
+      changed |= resolveOne(context, eval, dominators, pathExplorer, blockId, terminatorId);
     }
     if (changed) {
       function.rebuildEdges();
@@ -199,8 +211,8 @@ class ResolveIndirect final : public pass::FunctionPass {
   /// candidate must land on an existing block, or the branch keeps its
   /// unresolved state and every missing address is reported for the driver.
   bool resolveOne(pass::Context& context, analysis::ImageEval& eval,
-                  const analysis::Dominators& dominators, il::BlockId blockId,
-                  il::OpId terminatorId) {
+                  const analysis::Dominators& dominators, analysis::PathExplorer& pathExplorer,
+                  il::BlockId blockId, il::OpId terminatorId) {
     il::Function& function = context.function();
     const auto operands = function.operands(function.op(terminatorId));
     if (operands.empty()) {
@@ -243,6 +255,16 @@ class ResolveIndirect final : public pass::FunctionPass {
     const std::size_t fromTable = candidates.size();
     if (candidates.empty()) {
       candidates = valueSetCandidates(eval, operands[0]);
+      std::erase_if(candidates, skipsOwnTableRead);
+    }
+    if (candidates.empty()) {
+      // Last resort: what a bounded, path-sensitive walk from the entry
+      // proved about this exact branch (see analysis/path_explorer.h and
+      // docs/23-path-eval.md). Only reached once the two whole-function
+      // sources above have nothing to say -- table/value-set candidates read
+      // the same underlying computation more cheaply whenever they can, and
+      // agree with this source when both apply.
+      candidates = pathEvalCandidates(pathExplorer, branchVa);
       std::erase_if(candidates, skipsOwnTableRead);
     }
     if (candidates.empty()) {
@@ -331,6 +353,22 @@ class ResolveIndirect final : public pass::FunctionPass {
       }
     }
     return out;
+  }
+
+  /// Path three: a bounded, path-sensitive walk from the entry (see
+  /// analysis/path_explorer.h), for the class of branch a whole-function
+  /// value set gets wrong not because the arithmetic is unbounded but because
+  /// it depends on *which* edge reached this block -- a phi merging a stack
+  /// canary's two arms, or an index spilled to a stack slot on one arm and
+  /// read back on another. Explored once per pass, not per branch (see
+  /// run()'s single PathExplorer instance); this only pays the walk's cost on
+  /// the first branch that actually needs it.
+  std::vector<uint64_t> pathEvalCandidates(analysis::PathExplorer& explorer, uint64_t branchVa) {
+    explorer.explore();
+    if (const std::vector<uint64_t>* found = explorer.targetsFor(branchVa)) {
+      return *found;
+    }
+    return {};
   }
 
   /// Resolves a table's base or anchor when it is one value that is not written

@@ -10,6 +10,7 @@
 
 #include "xdec/analysis/call_target.h"
 #include "xdec/analysis/image_eval.h"
+#include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 
 namespace xdec::passes {
@@ -41,6 +42,25 @@ namespace {
   };
 }
 
+/// If `va` is not executable but its shared-cache-decoded form is, rewrites
+/// `va` to the decoded address and reports true. `va` is left untouched
+/// (returns false) when it is already executable, or when decoding does not
+/// help -- see resolve_indirect.cpp's own table-entry version of this same
+/// fallback for the full rationale (a slot's raw bytes may carry a tag no
+/// table-index arithmetic was involved to strip).
+[[nodiscard]] bool decodeIfNeeded(const MemoryFacts& facts, uint64_t& va) {
+  if (facts.isExecutable(va)) {
+    return true;
+  }
+  static constexpr binary::CachePointerDecoder kCachePointer;
+  const uint64_t decoded = kCachePointer.decode(va);
+  if (decoded == va || !facts.isExecutable(decoded)) {
+    return false;
+  }
+  va = decoded;
+  return true;
+}
+
 class ResolveCall final : public pass::FunctionPass {
  public:
   ResolveCall()
@@ -67,7 +87,12 @@ class ResolveCall final : public pass::FunctionPass {
     // per call.
     std::optional<analysis::ImageEval> eval;
     if (image != nullptr) {
-      eval.emplace(function, immutableOnly(*image, facts));
+      // entryRegFacts, not just the image: a platform-leaked EntryReg
+      // matters here exactly as much as it does to resolve-indirect -- a
+      // call through a pointer derived from one is the same shape as an
+      // indirect branch through it, just spelled as a call at the source
+      // level.
+      eval.emplace(function, immutableOnly(*image, facts), context.entryRegFacts());
     }
 
     bool changed = false;
@@ -83,7 +108,21 @@ class ResolveCall final : public pass::FunctionPass {
         }
         uint64_t direct = 0;
         if (function.asConstant(operands[0], direct)) {
-          continue;  // already a direct call; nothing to prove or describe
+          // Already a constant -- but not necessarily one this pass (or
+          // whichever upstream fold produced it, e.g. const-fold-memory
+          // reading a pointer slot verbatim) ever checked is a sane branch
+          // target: a dyld shared cache pointer slot's raw bytes may still
+          // carry a tag (see decodeIfNeeded). Untagged and executable is the
+          // overwhelmingly common case and costs one cheap check; a target
+          // that needs decoding is rewritten in place so every later pass
+          // (and the emitted C) sees the real address, not the tag.
+          if (uint64_t decoded = direct; decodeIfNeeded(facts, decoded) && decoded != direct) {
+            std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
+            rewritten[0] = function.constant(function.expr(operands[0]).type, decoded);
+            function.setOperands(opId, rewritten);
+            changed = true;
+          }
+          continue;  // already a direct call; nothing further to prove
         }
         changed |= handle(function, eval, facts, opId);
       }
@@ -166,8 +205,8 @@ class ResolveCall final : public pass::FunctionPass {
     if (set.isTop() || set.values().size() != 1) {
       return false;
     }
-    const uint64_t va = set.values()[0];
-    if (!facts.isExecutable(va)) {
+    uint64_t va = set.values()[0];
+    if (!decodeIfNeeded(facts, va)) {
       return false;
     }
     out = va;

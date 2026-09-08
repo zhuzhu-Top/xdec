@@ -13,6 +13,7 @@ resolution makes new code visible, new code gets simplified.
 | image evaluation | which values can this expression take, given memory | `analysis/image_eval.h` |
 | jump tables | is this branch really a switch | `analysis/jump_table.h` |
 | resolve-indirect | turn computed branches into edges | `passes/resolve_indirect.h` |
+| path-sensitive fallback | resolve-indirect's third candidate source, for branches the two whole-function sources above cannot answer | `analysis/path_explorer.h`, docs/23-path-eval.md |
 | driver | lift → simplify → resolve → lift what was found | `decompile/driver.h` |
 
 ## Rules before reasoning
@@ -66,12 +67,18 @@ the obfuscator's problem, not ours.
 
 ## resolve-indirect: all-or-nothing per branch
 
-`passes/resolve_indirect.h` (Ssa → Resolved) collects candidates from both
-paths — the bounded value set first, whole-table enumeration (≤512 entries,
-stopping at the first unreadable entry or implausible target) when the set is
-`top`. A branch resolves only when **every** candidate lands on an existing
-block; partial CFGs are worse than unresolved ones. Candidates without blocks
-are not failures, they are *discoveries*, reported through
+`passes/resolve_indirect.h` (Ssa → Resolved) collects candidates from three
+sources, in increasing order of cost, stopping at the first that answers:
+whole-table enumeration (≤512 entries, stopping at the first unreadable
+entry or implausible target) when the index is provably finite, the bounded
+value set when the target expression itself is not `top`, and — only when
+both of those come back empty — a bounded, path-sensitive walk from the
+entry (`analysis::PathExplorer`, docs/23-path-eval.md) for the shape neither
+whole-function source can see: an index computed differently per branch arm,
+spilled to a shared stack slot, and reloaded once at the merge right before
+the jump. A branch resolves only when **every** candidate lands on an
+existing block; partial CFGs are worse than unresolved ones. Candidates
+without blocks are not failures, they are *discoveries*, reported through
 `Context::reportDiscovery` — all of them at once, so one driver round lifts a
 whole table instead of one entry per round, and together with the branch's
 whole candidate set, which is what lets the driver put the edge back on the
@@ -125,9 +132,20 @@ and the evaluator all walk deep DAGs iteratively or under depth bounds).
 Whole-table enumeration (all three families) resolves its dispatcher brinds
 to full target sets. What remains are the `brind val(...)` forms whose
 targets are data-dependent with no static table shape; resolving those needs
-bounded-state / speculative resolution (v2), and the Resolved verifier gate
+bounded-state / speculative resolution, and the Resolved verifier gate
 reports them by address rather than papering over them. That is the correct
 P8 v1 outcome: maximum sound static resolution, honest about the rest.
+
+PathEval (docs/23-path-eval.md) is the first slice of that bounded-state
+work, not the whole of it: it closes the single-function case — an index
+that a whole-function evaluator can only see as a union across arms, but
+that a bounded per-path walk pins down exactly — while staying capped
+(`maxPaths`, `maxBlockRevisits`, `maxStepsPerPath`) so it degrades to "no
+candidates" rather than to a hang on a dispatcher the size of ammana's. A
+brind whose index genuinely depends on state from *other* functions (an
+inherited register, a cross-call dataflow fact) is still outside it by
+design — see docs/22 §7's sealed branch, which PathEval was evaluated
+against and correctly declines to guess at.
 
 Honest, but on a dispatcher of that size it used to mean handing back nothing
 at all: a few hundred unanswerable branches failed the gate, and the few

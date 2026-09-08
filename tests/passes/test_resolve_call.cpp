@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "il/il_test_support.h"
+#include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 #include "xdec/il/verify.h"
 #include "xdec/pass/manager.h"
@@ -417,4 +418,50 @@ TEST_CASE("a direct call gets no note", "[passes][resolve-call]") {
   runToSsa(b.function, space);
 
   CHECK(noteOnCall(b.function).empty());
+}
+
+// A call target that arrives *already constant* -- typically because
+// const-fold-memory folded a pointer slot's raw bytes before this pass ever
+// saw a Load -- is not automatically trustworthy: a dyld shared cache pointer
+// slot's bytes may still carry a tag above the value's low bits (see
+// binary::CachePointerDecoder). Silently accepting "already a direct call"
+// without checking would call the tag, not the function.
+TEST_CASE("an already-constant call target is decoded when tagged", "[passes][resolve-call]") {
+  Space space;
+  const xdec::binary::CachePointerDecoder decoder;
+  const uint64_t tagged = (uint64_t{1} << 40) | (Space::kCode + 0x20);
+  REQUIRE(decoder.decode(tagged) == Space::kCode + 0x20);
+
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  b.function.appendCall(entry, 0x1000, b.i64(tagged), Type::integer(64));
+  b.function.appendReturn(entry, 0x1004);
+  b.atCfg();
+
+  runToSsa(b.function, space);
+
+  uint64_t target = 0;
+  REQUIRE(calledAddress(b.function, target));
+  CHECK(target == Space::kCode + 0x20);
+}
+
+// The same tag bits, but the untagged form does not land on executable
+// memory: nothing decodes it, so the raw (unresolved-looking) constant is
+// left exactly as the image spelled it, not silently rewritten to a guess.
+TEST_CASE("an already-constant call target whose decoded form is not code stays untouched",
+          "[passes][resolve-call]") {
+  Space space;
+  const uint64_t tagged = (uint64_t{1} << 40) | (Space::kRodata + 0x20);
+
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  b.function.appendCall(entry, 0x1000, b.i64(tagged), Type::integer(64));
+  b.function.appendReturn(entry, 0x1004);
+  b.atCfg();
+
+  runToSsa(b.function, space);
+
+  uint64_t target = 0;
+  REQUIRE(calledAddress(b.function, target));
+  CHECK(target == tagged);
 }

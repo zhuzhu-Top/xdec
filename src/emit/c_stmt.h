@@ -236,6 +236,15 @@ class StmtPrinter {
   /// remaining trace, same as any other dead op that never gets its own
   /// statement. False for every other Store, and then nothing is printed.
   [[nodiscard]] bool printFoldedImportStore(const il::Op& op, std::string& out);
+  /// `strcpy(&var_6b, "com.apple.absd");` in place of the run of individual
+  /// `var_6b = 0x...; var_63 = 0x...; ...` assignments an
+  /// analysis::findFoldableStringStores run compiles down to (see
+  /// CContext::foldableStringStores, filled in once `addressOfLocal` names
+  /// the destination). False for every Store that is not such a run's
+  /// first, and then nothing is printed -- including for one of the run's
+  /// own continuations, already silently skipped by `ctx_.deadOps` before
+  /// this is ever reached.
+  [[nodiscard]] bool printFoldedStringStore(il::OpId opId, std::string& out);
   void printIntrinsic(il::OpId opId, const il::Op& op, std::string& out);
   /// The `svc` intrinsic as a syscall. False when this op is not one, or when
   /// nothing is known about the number, and then nothing has been printed and

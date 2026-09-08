@@ -193,6 +193,15 @@ class BinaryImage {
   [[nodiscard]] const Symbol* symbolAt(uint64_t va) const noexcept;
   /// Innermost sized symbol whose range covers `va`.
   [[nodiscard]] const Symbol* symbolContaining(uint64_t va) const noexcept;
+  /// The widest defined symbol starting at or before `va`, with no size
+  /// requirement. `symbolContaining` cannot answer for a format whose
+  /// symbols carry no size -- a dyld shared cache's local symbols are nlist
+  /// entries with no length field -- but "the last named thing before this
+  /// address" is still the useful anchor a disassembly comment wants. Not a
+  /// replacement for symbolContaining where sizes exist: with no upper bound
+  /// this can return a symbol whose real extent ends long before `va`, so
+  /// callers that have sizes should prefer symbolContaining.
+  [[nodiscard]] const Symbol* symbolNearestBefore(uint64_t va) const noexcept;
   [[nodiscard]] const Symbol* symbolNamed(std::string_view name) const noexcept;
 
   /// Relocation patching exactly `va`.

@@ -1053,6 +1053,16 @@ bool StmtPrinter::printFoldedImportStore(const il::Op& op, std::string& out) {
   return true;
 }
 
+bool StmtPrinter::printFoldedStringStore(il::OpId opId, std::string& out) {
+  const auto found = ctx_.foldableStringStores.find(opId.index());
+  if (found == ctx_.foldableStringStores.end()) {
+    return false;
+  }
+  line(out, std::format("strcpy({}, {});", found->second.address,
+                        analysis::quoteCString(found->second.text)));
+  return true;
+}
+
 void StmtPrinter::printOp(il::OpId opId, std::string& out) {
   const il::Op& op = ctx_.function.op(opId);
   // Ahead of the statement, on its own line: what a pass established about this
@@ -1089,7 +1099,7 @@ void StmtPrinter::printOp(il::OpId opId, std::string& out) {
       break;
     }
     case il::OpCode::Store: {
-      if (printFoldedImportStore(op, out)) {
+      if (printFoldedImportStore(op, out) || printFoldedStringStore(opId, out)) {
         break;
       }
       // The lvalue first, always: it can hoist a temporary of its own, and one

@@ -232,6 +232,7 @@ class DyldCacheLoader {
     XDEC_TRY_VOID(discoverParts());
     XDEC_TRY_VOID(buildMemoryMap());
     parseImages();
+    parseLocalSymbols();
 
     return finish();
   }
@@ -430,6 +431,86 @@ class DyldCacheLoader {
     }
   }
 
+  // -- local symbols ------------------------------------------------------
+
+  /// The `dyld_cache_local_symbols_info` blob lives in one of two places: the
+  /// main file's own `localSymbolsOffset` (every cache before local symbols
+  /// were split out), or -- once a cache is split -- inside the unmapped
+  /// `.symbols` sibling, at that sibling's *own* `localSymbolsOffset` (the
+  /// sibling has a full dyld_cache_header of its own; only its mapping count
+  /// is zero). Whichever it is, this loader does not need the accompanying
+  /// per-dylib entry table: n_value in each nlist is already an absolute
+  /// cache VA, so every entry is a usable symbol on its own regardless of
+  /// which dylib it names.
+  void parseLocalSymbols() {
+    std::size_t infoPart = 0;
+    uint64_t infoOffset = 0;
+    if (mainHeader_.localSymbolsOffset != 0 && mainHeader_.localSymbolsSize != 0) {
+      infoPart = 0;
+      infoOffset = mainHeader_.localSymbolsOffset;
+    } else if (symbolsPartIndex_.has_value() && localSymbolsHeader_.has_value() &&
+               localSymbolsHeader_->localSymbolsOffset != 0) {
+      infoPart = *symbolsPartIndex_;
+      infoOffset = localSymbolsHeader_->localSymbolsOffset;
+    } else {
+      return;
+    }
+
+    FieldReader info(store_.bytes(infoPart), Endian::Little);
+    const uint64_t nlistOffset = infoOffset + info.u32(infoOffset + kLocalSymNlistOffset);
+    const uint64_t nlistCount = info.u32(infoOffset + kLocalSymNlistCount);
+    const uint64_t stringsOffset = infoOffset + info.u32(infoOffset + kLocalSymStringsOffset);
+    const uint64_t stringsSize = info.u32(infoOffset + kLocalSymStringsSize);
+    if (info.failed()) {
+      XDEC_LOG_WARN(logBinary(), "'{}': dyld_cache_local_symbols_info header did not parse; no local symbols",
+                    store_.part(infoPart).name);
+      return;
+    }
+
+    FieldReader nlist(store_.bytes(infoPart), Endian::Little);
+    FieldReader strings(store_.bytes(infoPart), Endian::Little);
+    symbols_.reserve(symbols_.size() + nlistCount);
+    for (uint64_t index = 0; index < nlistCount; ++index) {
+      const uint64_t base = nlistOffset + index * kNlistRecordSize;
+      const auto strx = static_cast<uint32_t>(nlist.u32(base + kNlistStrx));
+      const auto type = static_cast<uint8_t>(nlist.u8(base + kNlistType));
+      const uint64_t value = nlist.u64(base + kNlistValue);
+      if (nlist.failed()) {
+        XDEC_LOG_WARN(logBinary(), "'{}': truncated local symbol nlist entry {}; stopping there",
+                      store_.part(infoPart).name, index);
+        break;
+      }
+      if ((type & kNStab) != 0) {
+        continue;  // debugger-only stab symbol, not a real one.
+      }
+
+      const uint8_t typeField = type & kNTypeMask;
+      Symbol symbol;
+      symbol.va = value;
+      symbol.defined = typeField == kNSect || typeField == kNAbs;
+      symbol.binding = (type & kNExt) != 0 ? SymbolBinding::Global : SymbolBinding::Local;
+      if (symbol.defined) {
+        if (const MemoryRegion* region = memory_.regionAt(value); region != nullptr) {
+          symbol.kind = hasPermission(region->permissions, MemoryPermissions::Execute)
+                            ? SymbolKind::Function
+                            : SymbolKind::Object;
+        }
+      }
+      if (strx != 0 && strx < stringsSize) {
+        const std::string_view name = strings.cstring(stringsOffset + strx);
+        if (!strings.failed()) {
+          symbol.name = std::string{name};
+        }
+        strings.clearFailure();
+      }
+      if (!symbol.name.empty()) {
+        symbols_.push_back(std::move(symbol));
+      }
+    }
+    XDEC_LOG_INFO(logBinary(), "'{}': loaded {} local symbol(s) from '{}'", mainPath_.string(),
+                 symbols_.size(), store_.part(infoPart).name);
+  }
+
   // -- finish -------------------------------------------------------------
 
   Result<std::unique_ptr<BinaryImage>> finish() {
@@ -443,6 +524,7 @@ class DyldCacheLoader {
     contents.path = mainPath_.string();
     contents.memory = std::move(memory_);
     contents.store = std::move(store_);
+    contents.symbols = std::move(symbols_);
     contents.formatMetadata = std::move(metadata_);
 
     XDEC_LOG_INFO(logBinary(),
@@ -462,6 +544,7 @@ class DyldCacheLoader {
   std::optional<PartHeader> localSymbolsHeader_;
   std::optional<std::size_t> symbolsPartIndex_;
   std::unique_ptr<DyldCacheMetadata> metadata_;
+  std::vector<Symbol> symbols_;
 };
 
 }  // namespace

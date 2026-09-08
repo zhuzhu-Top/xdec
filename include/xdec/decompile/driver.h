@@ -68,6 +68,7 @@
 #include <memory>
 #include <vector>
 
+#include "xdec/analysis/path_explorer.h"
 #include "xdec/il/function.h"
 #include "xdec/il/maturity.h"
 #include "xdec/pass/manager.h"
@@ -190,6 +191,12 @@ struct DriverOptions {
   /// missing, so it still never resolves, and the blocks lifted for the prefix
   /// are there anyway.
   std::size_t maxDiscoveryPerBranch = 0;
+  /// What resolve-indirect's path-sensitive fallback may spend when the
+  /// table/value-set candidates come up empty -- see analysis/path_explorer.h
+  /// and docs/23-path-eval.md. Enabled with conservative bounds by default,
+  /// the same "on and inexpensive when it finds nothing to do" posture the
+  /// rest of this pipeline's optional facts take.
+  analysis::PathExploreOptions pathExplore;
 };
 
 /// What the loop did, for CLI reporting and tests.
