@@ -156,6 +156,7 @@ std::string_view toString(ExecStop stop) noexcept {
     case ExecStop::Unreachable: return "unreachable";
     case ExecStop::Unimplemented: return "unimplemented";
     case ExecStop::Intrinsic: return "intrinsic";
+    case ExecStop::Interrupted: return "interrupted";
     case ExecStop::Error: return "error";
   }
   return "?";
@@ -167,6 +168,12 @@ Interpreter::Interpreter(const Function& function, ExecMemory* memory)
     ownedMemory_ = std::make_unique<ExecMemory>();
     memory_ = ownedMemory_.get();
   }
+  memoryBackend_ = memory_;
+  resetState();
+}
+
+Interpreter::Interpreter(const Function& function, ExecMemoryBackend& memory)
+    : function_(&function), memoryBackend_(&memory) {
   resetState();
 }
 
@@ -606,6 +613,15 @@ ExecOutcome Interpreter::runBlock(BlockId blockId) {
 
   for (const OpId opId : block.ops) {
     const Op& op = function_->op(opId);
+    if (interruptHook_ && interruptHook_(op)) {
+      ExecOutcome outcome;
+      outcome.stop = ExecStop::Interrupted;
+      outcome.va = op.va;
+      return outcome;
+    }
+    if (opHook_) {
+      opHook_(op);
+    }
     const std::span<const ExprId> operands = function_->operands(op);
     switch (op.code) {
       case OpCode::ReadReg:
@@ -624,7 +640,7 @@ ExecOutcome Interpreter::runBlock(BlockId blockId) {
         if (!address) {
           return fail(address.error().format(), op.va);
         }
-        auto contents = memory_->read(address->lo, op.type.bits() / 8);
+        auto contents = memoryBackend_->read(address->lo, op.type.bits() / 8);
         if (!contents) {
           return fail(contents.error().format(), op.va);
         }
@@ -640,7 +656,7 @@ ExecOutcome Interpreter::runBlock(BlockId blockId) {
         if (!value) {
           return fail(value.error().format(), op.va);
         }
-        if (auto written = memory_->write(address->lo, op.type.bits() / 8, *value);
+        if (auto written = memoryBackend_->write(address->lo, op.type.bits() / 8, *value);
             !written) {
           return fail(written.error().format(), op.va);
         }

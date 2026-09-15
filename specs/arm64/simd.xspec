@@ -8,17 +8,476 @@
 // SIMD and floating point
 // ---------------------------------------------------------------------------
 //
-// The arithmetic is not modelled. These rules exist so that a vector instruction
-// is a known unmodelled instruction rather than an undecodable word, and the
-// difference matters more than it looks: `Unimplemented` terminates a block, so
-// a single unmodelled instruction in a prologue would cut the rest of the
-// function off from its entry and every later analysis would be reasoning about
-// a truncated graph.
+// Start with operations whose values the current DSL can express exactly. The
+// register file calls the 128-bit view `q`; it deliberately has no arrangement
+// printer, so assembly below uses the internal q/d names rather than claiming a
+// particular `vN.<arrangement>` spelling.
 //
-// An intrinsic falls through and is opaque, which is exactly the truth. What it
-// does not yet say is which V registers it read and wrote; that arrives with the
-// arithmetic, and until then a vector value that passes through arithmetic is
-// lost even though one that only moves through memory is not.
+// The DSL has no lane map or loop. Fixed-width lane arithmetic is nevertheless
+// expressible without an intrinsic: the masks below prevent a carry or borrow
+// from escaping its lane.
+fn read_vec(n: int(0..31), q: int(0..1)) -> bits(64 << q) {
+  if q == 1 {
+    return vec[n];
+  } else {
+    return vec[n].d;
+  }
+}
+
+fn write_vec(n: int(0..31), q: int(0..1), v: bits(64 << q)) {
+  if q == 1 {
+    vec[n] = v;
+  } else {
+    vec[n].d = v;
+  }
+}
+
+// Compile-time xspec integers are 64-bit, so construct Q results from two
+// D-sized computations rather than silently truncating a 128-bit mask.
+//
+// Modular addition in lanes of `lane_bits`. The partial sum omits each lane's
+// top bit, so it cannot carry into the next lane.
+fn add_lanes64(lane_bits: int, a: bits(64), b: bits(64)) -> bits(64) {
+  let lo = imm(replicate_int(ones_int(lane_bits - 1), lane_bits, 64), 64);
+  let hi = imm(replicate_int(1 << (lane_bits - 1), lane_bits, 64), 64);
+  let sum = (a & lo) + (b & lo);
+  return (sum & lo) | ((a ^ b ^ sum) & hi);
+}
+
+fn add_lanes(q: int(0..1), lane_bits: int, a: bits(64 << q), b: bits(64 << q))
+    -> bits(64 << q) {
+  if q == 1 {
+    return concat(add_lanes64(lane_bits, extract(a, 64, 64), extract(b, 64, 64)),
+                  add_lanes64(lane_bits, extract(a, 0, 64), extract(b, 0, 64)));
+  } else {
+    return add_lanes64(lane_bits, a, b);
+  }
+}
+
+// Bias each low lane with its top bit, making packed subtraction non-borrowing
+// at the word level. `~diff` then holds the per-lane borrow bit.
+fn sub_lanes64(lane_bits: int, a: bits(64), b: bits(64)) -> bits(64) {
+  let lo = imm(replicate_int(ones_int(lane_bits - 1), lane_bits, 64), 64);
+  let hi = imm(replicate_int(1 << (lane_bits - 1), lane_bits, 64), 64);
+  let diff = ((a & lo) | hi) - (b & lo);
+  return (diff & lo) | ((a ^ b ^ ~diff) & hi);
+}
+
+fn sub_lanes(q: int(0..1), lane_bits: int, a: bits(64 << q), b: bits(64 << q))
+    -> bits(64 << q) {
+  if q == 1 {
+    return concat(sub_lanes64(lane_bits, extract(a, 64, 64), extract(b, 64, 64)),
+                  sub_lanes64(lane_bits, extract(a, 0, 64), extract(b, 0, 64)));
+  } else {
+    return sub_lanes64(lane_bits, a, b);
+  }
+}
+
+fn shl_lanes64(lane_bits: int, v: bits(64), amount: int) -> bits(64) {
+  let keep = imm(replicate_int(ones_int(lane_bits - amount), lane_bits, 64), 64);
+  return (v & keep) << imm(amount, 64);
+}
+
+fn shl_lanes(q: int(0..1), lane_bits: int, v: bits(64 << q), amount: int)
+    -> bits(64 << q) {
+  if q == 1 {
+    return concat(shl_lanes64(lane_bits, extract(v, 64, 64), amount),
+                  shl_lanes64(lane_bits, extract(v, 0, 64), amount));
+  } else {
+    return shl_lanes64(lane_bits, v, amount);
+  }
+}
+
+// The post-shift mask removes bits that shifted in from the next physical lane.
+fn ushr_lanes64(lane_bits: int, v: bits(64), amount: int) -> bits(64) {
+  let keep = imm(replicate_int(ones_int(lane_bits - amount), lane_bits, 64), 64);
+  return (v >> imm(amount, 64)) & keep;
+}
+
+fn ushr_lanes(q: int(0..1), lane_bits: int, v: bits(64 << q), amount: int)
+    -> bits(64 << q) {
+  if q == 1 {
+    return concat(ushr_lanes64(lane_bits, extract(v, 64, 64), amount),
+                  ushr_lanes64(lane_bits, extract(v, 0, 64), amount));
+  } else {
+    return ushr_lanes64(lane_bits, v, amount);
+  }
+}
+
+// Floating vector arithmetic is expanded lane-by-lane into the existing scalar
+// float IL. The DSL has no vector value type yet, so this preserves the exact
+// per-lane operation instead of hiding it behind an opaque intrinsic.
+fn neon_fadd_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(bitcast_int(fadd(bitcast_float(extract(a, 32, 32), 32),
+                                bitcast_float(extract(b, 32, 32), 32)), 32),
+                bitcast_int(fadd(bitcast_float(extract(a, 0, 32), 32),
+                                bitcast_float(extract(b, 0, 32), 32)), 32));
+}
+
+fn neon_fadd_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  let low = neon_fadd_2s(trunc(a, 64), trunc(b, 64));
+  let high = neon_fadd_2s(extract(a, 64, 64), extract(b, 64, 64));
+  return concat(high, low);
+}
+
+fn neon_fadd_2d(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(bitcast_int(fadd(bitcast_float(extract(a, 64, 64), 64),
+                                bitcast_float(extract(b, 64, 64), 64)), 64),
+                bitcast_int(fadd(bitcast_float(extract(a, 0, 64), 64),
+                                bitcast_float(extract(b, 0, 64), 64)), 64));
+}
+
+fn neon_fsub_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(bitcast_int(fsub(bitcast_float(extract(a, 32, 32), 32),
+                                bitcast_float(extract(b, 32, 32), 32)), 32),
+                bitcast_int(fsub(bitcast_float(extract(a, 0, 32), 32),
+                                bitcast_float(extract(b, 0, 32), 32)), 32));
+}
+
+fn neon_fsub_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(neon_fsub_2s(extract(a, 64, 64), extract(b, 64, 64)),
+                neon_fsub_2s(trunc(a, 64), trunc(b, 64)));
+}
+
+fn neon_fsub_2d(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(bitcast_int(fsub(bitcast_float(extract(a, 64, 64), 64),
+                                bitcast_float(extract(b, 64, 64), 64)), 64),
+                bitcast_int(fsub(bitcast_float(extract(a, 0, 64), 64),
+                                bitcast_float(extract(b, 0, 64), 64)), 64));
+}
+
+fn neon_fmul_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(bitcast_int(fmul(bitcast_float(extract(a, 32, 32), 32),
+                                bitcast_float(extract(b, 32, 32), 32)), 32),
+                bitcast_int(fmul(bitcast_float(extract(a, 0, 32), 32),
+                                bitcast_float(extract(b, 0, 32), 32)), 32));
+}
+
+fn neon_fmul_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(neon_fmul_2s(extract(a, 64, 64), extract(b, 64, 64)),
+                neon_fmul_2s(trunc(a, 64), trunc(b, 64)));
+}
+
+fn neon_fmul_2d(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(bitcast_int(fmul(bitcast_float(extract(a, 64, 64), 64),
+                                bitcast_float(extract(b, 64, 64), 64)), 64),
+                bitcast_int(fmul(bitcast_float(extract(a, 0, 64), 64),
+                                bitcast_float(extract(b, 0, 64), 64)), 64));
+}
+
+fn neon_fdiv_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(bitcast_int(fdiv(bitcast_float(extract(a, 32, 32), 32),
+                                bitcast_float(extract(b, 32, 32), 32)), 32),
+                bitcast_int(fdiv(bitcast_float(extract(a, 0, 32), 32),
+                                bitcast_float(extract(b, 0, 32), 32)), 32));
+}
+
+fn neon_fdiv_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(neon_fdiv_2s(extract(a, 64, 64), extract(b, 64, 64)),
+                neon_fdiv_2s(trunc(a, 64), trunc(b, 64)));
+}
+
+fn neon_fdiv_2d(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(bitcast_int(fdiv(bitcast_float(extract(a, 64, 64), 64),
+                                bitcast_float(extract(b, 64, 64), 64)), 64),
+                bitcast_int(fdiv(bitcast_float(extract(a, 0, 64), 64),
+                                bitcast_float(extract(b, 0, 64), 64)), 64));
+}
+
+fn neon_fsqrt_2s(a: bits(64)) -> bits(64) {
+  return concat(bitcast_int(fsqrt(bitcast_float(extract(a, 32, 32), 32)), 32),
+                bitcast_int(fsqrt(bitcast_float(extract(a, 0, 32), 32)), 32));
+}
+
+fn neon_fsqrt_4s(a: bits(128)) -> bits(128) {
+  return concat(neon_fsqrt_2s(extract(a, 64, 64)), neon_fsqrt_2s(trunc(a, 64)));
+}
+
+fn neon_fsqrt_2d(a: bits(128)) -> bits(128) {
+  return concat(bitcast_int(fsqrt(bitcast_float(extract(a, 64, 64), 64)), 64),
+                bitcast_int(fsqrt(bitcast_float(extract(a, 0, 64), 64)), 64));
+}
+
+// Comparison results are integer masks: every bit of a true lane is one.
+fn neon_fcmeq_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  let a0 = bitcast_float(extract(a, 0, 32), 32);
+  let b0 = bitcast_float(extract(b, 0, 32), 32);
+  let a1 = bitcast_float(extract(a, 32, 32), 32);
+  let b1 = bitcast_float(extract(b, 32, 32), 32);
+  return concat(select(fcmp_eq(a1, b1), imm(0xffffffff, 32), imm(0, 32)),
+                select(fcmp_eq(a0, b0), imm(0xffffffff, 32), imm(0, 32)));
+}
+
+fn neon_fcmeq_4s(a: bits(128), b: bits(128)) -> bits(128) {
+  return concat(neon_fcmeq_2s(extract(a, 64, 64), extract(b, 64, 64)),
+                neon_fcmeq_2s(trunc(a, 64), trunc(b, 64)));
+}
+
+fn neon_fcmeq_2d(a: bits(128), b: bits(128)) -> bits(128) {
+  let a0 = bitcast_float(extract(a, 0, 64), 64);
+  let b0 = bitcast_float(extract(b, 0, 64), 64);
+  let a1 = bitcast_float(extract(a, 64, 64), 64);
+  let b1 = bitcast_float(extract(b, 64, 64), 64);
+  return concat(select(fcmp_eq(a1, b1), imm(0xffffffffffffffff, 64), imm(0, 64)),
+                select(fcmp_eq(a0, b0), imm(0xffffffffffffffff, 64), imm(0, 64)));
+}
+
+// Three-same vector FP operations.  The S forms use D for two lanes and Q for
+// four; the D form is always Q and therefore has no Q field.
+insn neon_fadd_2s_4s {
+  encoding "0" Q:1 "001110" "00" "1" Rm:5 "110101" Rn:5 Rd:5
+  asm "fadd {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fadd_2s(read_vec(Rn, 0), read_vec(Rm, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fadd_4s(read_vec(Rn, 1), read_vec(Rm, 1)));
+    }
+  }
+}
+
+insn neon_fadd_2d {
+  encoding "0" "1" "001110" "01" "1" Rm:5 "110101" Rn:5 Rd:5
+  asm "fadd v{Rd:dec}.2d, v{Rn:dec}.2d, v{Rm:dec}.2d"
+  semantics {
+    write_vec(Rd, 1, neon_fadd_2d(vec[Rn], vec[Rm]));
+  }
+}
+
+insn neon_fsub_2s_4s {
+  encoding "0" Q:1 "001110" "10" "1" Rm:5 "110101" Rn:5 Rd:5
+  asm "fsub {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fsub_2s(read_vec(Rn, 0), read_vec(Rm, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fsub_4s(read_vec(Rn, 1), read_vec(Rm, 1)));
+    }
+  }
+}
+
+insn neon_fsub_2d {
+  encoding "0" "1" "001110" "11" "1" Rm:5 "110101" Rn:5 Rd:5
+  asm "fsub v{Rd:dec}.2d, v{Rn:dec}.2d, v{Rm:dec}.2d"
+  semantics {
+    write_vec(Rd, 1, neon_fsub_2d(vec[Rn], vec[Rm]));
+  }
+}
+
+insn neon_fmul_2s_4s {
+  encoding "0" Q:1 "101110" "00" "1" Rm:5 "110111" Rn:5 Rd:5
+  asm "fmul {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fmul_2s(read_vec(Rn, 0), read_vec(Rm, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fmul_4s(read_vec(Rn, 1), read_vec(Rm, 1)));
+    }
+  }
+}
+
+insn neon_fmul_2d {
+  encoding "0" "1" "101110" "01" "1" Rm:5 "110111" Rn:5 Rd:5
+  asm "fmul v{Rd:dec}.2d, v{Rn:dec}.2d, v{Rm:dec}.2d"
+  semantics {
+    write_vec(Rd, 1, neon_fmul_2d(vec[Rn], vec[Rm]));
+  }
+}
+
+insn neon_fdiv_2s_4s {
+  encoding "0" Q:1 "101110" "00" "1" Rm:5 "111111" Rn:5 Rd:5
+  asm "fdiv {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fdiv_2s(read_vec(Rn, 0), read_vec(Rm, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fdiv_4s(read_vec(Rn, 1), read_vec(Rm, 1)));
+    }
+  }
+}
+
+insn neon_fdiv_2d {
+  encoding "0" "1" "101110" "01" "1" Rm:5 "111111" Rn:5 Rd:5
+  asm "fdiv v{Rd:dec}.2d, v{Rn:dec}.2d, v{Rm:dec}.2d"
+  semantics {
+    write_vec(Rd, 1, neon_fdiv_2d(vec[Rn], vec[Rm]));
+  }
+}
+
+insn neon_fsqrt_2s_4s {
+  encoding "0" Q:1 "101110" "10" "1" "00001" "111110" Rn:5 Rd:5
+  asm "fsqrt {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fsqrt_2s(read_vec(Rn, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fsqrt_4s(read_vec(Rn, 1)));
+    }
+  }
+}
+
+insn neon_fsqrt_2d {
+  encoding "0" "1" "101110" "11" "1" "00001" "111110" Rn:5 Rd:5
+  asm "fsqrt v{Rd:dec}.2d, v{Rn:dec}.2d"
+  semantics {
+    vec[Rd] = neon_fsqrt_2d(vec[Rn]);
+  }
+}
+
+insn neon_fcmeq_2s_4s {
+  encoding "0" Q:1 "001110" "00" "1" Rm:5 "111001" Rn:5 Rd:5
+  asm "fcmeq {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    if Q == 0 {
+      write_vec(Rd, 0, neon_fcmeq_2s(read_vec(Rn, 0), read_vec(Rm, 0)));
+    } else {
+      write_vec(Rd, 1, neon_fcmeq_4s(read_vec(Rn, 1), read_vec(Rm, 1)));
+    }
+  }
+}
+
+insn neon_fcmeq_2d {
+  encoding "0" "1" "001110" "01" "1" Rm:5 "111001" Rn:5 Rd:5
+  asm "fcmeq v{Rd:dec}.2d, v{Rn:dec}.2d, v{Rm:dec}.2d"
+  semantics {
+    vec[Rd] = neon_fcmeq_2d(vec[Rn], vec[Rm]);
+  }
+}
+
+// FABS/FNEG are exact sign-bit transforms, including for NaN payloads.
+insn neon_fabs_2s_4s {
+  encoding "0" Q:1 "001110" "10" "1" "00000" "111110" Rn:5 Rd:5
+  asm "fabs {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
+  semantics {
+    let width = 64 << Q;
+    write_vec(Rd, Q, read_vec(Rn, Q) & imm(replicate_int(0x7fffffff, 32, width), width));
+  }
+}
+
+insn neon_fneg_2s_4s {
+  encoding "0" Q:1 "101110" "10" "1" "00000" "111110" Rn:5 Rd:5
+  asm "fneg {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
+  semantics {
+    let width = 64 << Q;
+    write_vec(Rd, Q, read_vec(Rn, Q) ^ imm(replicate_int(0x80000000, 32, width), width));
+  }
+}
+
+insn neon_fabs_2d {
+  encoding "0" "1" "001110" "11" "1" "00000" "111110" Rn:5 Rd:5
+  asm "fabs v{Rd:dec}.2d, v{Rn:dec}.2d"
+  semantics {
+    vec[Rd] = vec[Rn] & imm(replicate_int(0x7fffffffffffffff, 64, 128), 128);
+  }
+}
+
+insn neon_fneg_2d {
+  encoding "0" "1" "101110" "11" "1" "00000" "111110" Rn:5 Rd:5
+  asm "fneg v{Rd:dec}.2d, v{Rn:dec}.2d"
+  semantics {
+    vec[Rd] = vec[Rn] ^ imm(replicate_int(0x8000000000000000, 64, 128), 128);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD logical (two-register miscellaneous), 8B / 16B.
+// These operate on the complete D or Q bitstring, so no lane helper is needed.
+// ---------------------------------------------------------------------------
+
+insn neon_and {
+  encoding "0" Q:1 "001110001" Rm:5 "000111" Rn:5 Rd:5
+  asm "and {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, read_vec(Rn, Q) & read_vec(Rm, Q));
+  }
+}
+
+insn neon_bic {
+  encoding "0" Q:1 "001110011" Rm:5 "000111" Rn:5 Rd:5
+  asm "bic {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, read_vec(Rn, Q) & ~read_vec(Rm, Q));
+  }
+}
+
+insn neon_orr {
+  encoding "0" Q:1 "001110101" Rm:5 "000111" Rn:5 Rd:5
+  asm "orr {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, read_vec(Rn, Q) | read_vec(Rm, Q));
+  }
+}
+
+insn neon_orn {
+  encoding "0" Q:1 "001110111" Rm:5 "000111" Rn:5 Rd:5
+  asm "orn {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, read_vec(Rn, Q) | ~read_vec(Rm, Q));
+  }
+}
+
+insn neon_eor {
+  encoding "0" Q:1 "101110001" Rm:5 "000111" Rn:5 Rd:5
+  asm "eor {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, read_vec(Rn, Q) ^ read_vec(Rm, Q));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Advanced SIMD three-same integer: ADD/SUB 8B/16B, 4H/8H, 2S/4S, 2D.
+// ---------------------------------------------------------------------------
+
+insn neon_add_lanes {
+  encoding "0" Q:1 "001110" size:2 "1" Rm:5 "100001" Rn:5 Rd:5
+  require Q == 1 || size != 3;
+  asm "add {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, add_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q)));
+  }
+}
+
+insn neon_sub_lanes {
+  encoding "0" Q:1 "101110" size:2 "1" Rm:5 "100001" Rn:5 Rd:5
+  require Q == 1 || size != 3;
+  asm "sub {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    write_vec(Rd, Q, sub_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q)));
+  }
+}
+
+// Advanced SIMD shift-by-immediate. `immh:immb` encodes element size and
+// amount: SHL uses `lane_bits + amount`; USHR uses `2*lane_bits - amount`.
+insn neon_shl_lanes {
+  encoding "0" Q:1 "001111" "0" immh:4 immb:3 "010101" Rn:5 Rd:5
+  require immh != 0 && (Q == 1 || immh != 8);
+  asm "shl {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, #{((immh << 3) | immb) - (8 << highestbit_int(immh)):dec}"
+  semantics {
+    let lane_bits = 8 << highestbit_int(immh);
+    let amount = ((immh << 3) | immb) - lane_bits;
+    write_vec(Rd, Q, shl_lanes(Q, lane_bits, read_vec(Rn, Q), amount));
+  }
+}
+
+insn neon_ushr_lanes {
+  encoding "0" Q:1 "101111" "0" immh:4 immb:3 "000001" Rn:5 Rd:5
+  require immh != 0 && (Q == 1 || immh != 8);
+  asm "ushr {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, #{(16 << highestbit_int(immh)) - ((immh << 3) | immb):dec}"
+  semantics {
+    let lane_bits = 8 << highestbit_int(immh);
+    let amount = (lane_bits << 1) - ((immh << 3) | immb);
+    write_vec(Rd, Q, ushr_lanes(Q, lane_bits, read_vec(Rn, Q), amount));
+  }
+}
+
+// Permutes and lane moves remain unmodelled. They need a value-dependent
+// sequence of slices, while this DSL cannot prove that
+// `shift + (width - shift) == width` for field-dependent EXT. Do not pretend
+// that this proof gap has value semantics.
+//
+// The remaining SIMD and floating-point encodings stop explicitly. A real rule
+// above wins over this negative-priority catch-all; no unsupported instruction
+// may silently masquerade as a successfully executed opaque intrinsic.
 //
 // The priority is negative so that any real rule added later wins without the
 // catch-alls having to be edited.
@@ -30,7 +489,7 @@ insn simd_fp_unmodelled {
   priority -100
   asm "simd #{opcode:hex}"
   semantics {
-    intrinsic("aarch64.simd", imm(opcode, 32));
+    unimplemented("aarch64 Scalar FP or Advanced SIMD/NEON");
   }
 }
 

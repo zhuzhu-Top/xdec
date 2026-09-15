@@ -1,0 +1,24 @@
+// Focused scalar-FP compile fixture: no SIMD rules are required for these
+// scalar encodings, so failures localise to the helpers and rules under test.
+arch arm64 {
+  endian little
+  insnwidth 32
+  pointer 64
+
+  regfile gpr : bits(64) [32] {
+    prefix "x"
+    zero 31 as "xzr"
+    view w : bits(32) = low 0 zeroext prefix "w" zero "wzr"
+  }
+  regfile vec : bits(128) [32] {
+    prefix "q"
+    role vector
+    view d : bits(64) = low 0 zeroext prefix "d"
+    view s : bits(32) = low 0 zeroext prefix "s"
+  }
+  reg sp : bits(64) role stack
+  reg nzcv : flags role flags
+}
+
+include "../../specs/arm64/common.xspec"
+include "../../specs/arm64/scalar-fp.xspec"

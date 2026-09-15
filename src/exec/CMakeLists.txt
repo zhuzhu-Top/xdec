@@ -1,0 +1,12 @@
+xdec_add_library(xdec_exec
+  SOURCES
+    exec_ir.cpp
+    memory.cpp
+    session.cpp
+    state.cpp
+    trace.cpp
+  DEPS
+    xdec_binary
+    xdec_il
+    xdec_spec
+    xdec_support)

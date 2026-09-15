@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <span>
 
 #include "xdec/spec/check.h"
 #include "xdec/spec/program.h"

@@ -9,6 +9,7 @@
 #include <string>
 
 #include "spec/spec_test_support.h"
+#include "xdec/il/interp.h"
 #include "xdec/il/printer.h"
 #include "xdec/il/verify.h"
 #include "xdec/spec/compile.h"
@@ -84,6 +85,11 @@ TEST_CASE("real instruction words decode to the right rule", "[spec][engine]") {
   CHECK(ruleOf(0xd65f03c0) == "ret_reg");            // ret
   CHECK(ruleOf(0xf9400420) == "ldr_imm_unsigned");   // ldr  x0, [x1, #8]
   CHECK(ruleOf(0xd5033bbf) == "dmb_barrier");        // dmb  ish
+  CHECK(ruleOf(0x1e222820) == "fadd_scalar");        // fadd s0, s1, s2
+  CHECK(ruleOf(0x1e622820) == "fadd_scalar");        // fadd d0, d1, d2
+  CHECK(ruleOf(0x1e212000) == "fcmp_scalar");        // fcmp s0, s1
+  CHECK(ruleOf(0x1e220020) == "scvtf_scalar");       // scvtf s0, w1
+  CHECK(ruleOf(0x9e790020) == "fcvtzu_scalar");      // fcvtzu x0, d1
 
   SECTION("an alias wins over the encoding it refines") {
     // cmp x1, x2 is subs xzr, x1, x2. Decoding it as subs would be defensible
@@ -104,6 +110,44 @@ TEST_CASE("real instruction words decode to the right rule", "[spec][engine]") {
   SECTION("a truncated buffer decodes to nothing") {
     const auto bytes = encode(0xd65f03c0);
     CHECK_FALSE(engine().decode(std::span{bytes}.first(3), 0x1000).valid);
+  }
+}
+
+TEST_CASE("real Advanced SIMD integer words select exact semantics", "[spec][engine][simd]") {
+  // Produced by an AArch64 assembler, independently of the xspec encodings.
+  // The current DSL prints the existing q/d register views rather than inventing
+  // an arrangement suffix it cannot represent.
+  CHECK(ruleOf(0x4e221c20) == "neon_and");       // and v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x4e621c20) == "neon_bic");       // bic v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x4ea21c20) == "neon_orr");       // orr v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x4ee21c20) == "neon_orn");       // orn v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x6e221c20) == "neon_eor");       // eor v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x4e228420) == "neon_add_lanes");  // add v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x6e228420) == "neon_sub_lanes");  // sub v0.16b, v1.16b, v2.16b
+  CHECK(ruleOf(0x4f0b5420) == "neon_shl_lanes");  // shl v0.16b, v1.16b, #3
+  CHECK(ruleOf(0x6f0d0420) == "neon_ushr_lanes"); // ushr v0.16b, v1.16b, #3
+
+  SECTION("the D forms use the 64-bit vector view") {
+    CHECK(ruleOf(0x0e221c20) == "neon_and");       // and v0.8b, v1.8b, v2.8b
+    CHECK(ruleOf(0x0e228420) == "neon_add_lanes"); // add v0.8b, v1.8b, v2.8b
+    CHECK(ruleOf(0x0f0b5420) == "neon_shl_lanes"); // shl v0.8b, v1.8b, #3
+  }
+
+  SECTION("halfword, word and doubleword lanes share exact helpers") {
+    CHECK(ruleOf(0x4e628420) == "neon_add_lanes");  // add v0.8h, v1.8h, v2.8h
+    CHECK(ruleOf(0x4ea28420) == "neon_add_lanes");  // add v0.4s, v1.4s, v2.4s
+    CHECK(ruleOf(0x4ee28420) == "neon_add_lanes");  // add v0.2d, v1.2d, v2.2d
+    CHECK(ruleOf(0x4f135420) == "neon_shl_lanes");  // shl v0.8h, v1.8h, #3
+    CHECK(ruleOf(0x4f235420) == "neon_shl_lanes");  // shl v0.4s, v1.4s, #3
+    CHECK(ruleOf(0x4f435420) == "neon_shl_lanes");  // shl v0.2d, v1.2d, #3
+    CHECK(ruleOf(0x6f1d0420) == "neon_ushr_lanes"); // ushr v0.8h, v1.8h, #3
+    CHECK(ruleOf(0x6f3d0420) == "neon_ushr_lanes"); // ushr v0.4s, v1.4s, #3
+    CHECK(ruleOf(0x6f7d0420) == "neon_ushr_lanes"); // ushr v0.2d, v1.2d, #3
+  }
+
+  SECTION("unmodelled EXT remains explicitly unimplemented") {
+    // The current DSL cannot prove the field-dependent concatenation width.
+    CHECK(ruleOf(0x2e024020) == "simd_fp_unmodelled");
   }
 }
 
@@ -246,6 +290,10 @@ TEST_CASE("disassembly renders", "[spec][engine]") {
   CHECK(engine().disassemble(decode(0xeb02003f)) == "cmp x1, x2");
   CHECK(engine().disassemble(decode(0xd65f03c0)) == "ret");
   CHECK(engine().disassemble(decode(0x91004020)) == "add x0, x1, #0x10");
+  CHECK(engine().disassemble(decode(0x1e222820)) == "fadd s0, s1, s2");
+  CHECK(engine().disassemble(decode(0x1e622820)) == "fadd d0, d1, d2");
+  CHECK(engine().disassemble(decode(0x1e202008)) == "fcmp s0, #0.0");
+  CHECK(engine().disassemble(decode(0x1e260020)) == "fmov w0, s1");
 
   SECTION("a zero register prints by name") {
     // `sub x0, xzr, x2` is spelled `neg`, so a source-side 31 has to be found
@@ -361,6 +409,108 @@ TEST_CASE("the 32-bit form writes the 32-bit view", "[spec][engine]") {
   // The 64-bit registers must not appear: picking the wrong view is exactly the
   // bug the declared width `bits(32 << sf)` exists to prevent.
   CHECK(text.find("read x1") == std::string::npos);
+}
+
+TEST_CASE("scalar FP semantics use typed float IL and scalar V views", "[spec][engine]") {
+  xdec::il::Function function{engine().program().arch, engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  REQUIRE(engine().elaborate(decode(0x1e222820, 0x1000), site));  // fadd s0, s1, s2
+  const std::string text = xdec::il::print(function);
+  INFO(text);
+  CHECK(text.find("read s1") != std::string::npos);
+  CHECK(text.find("read s2") != std::string::npos);
+  CHECK(text.find("fadd:f32") != std::string::npos);
+  CHECK(text.find("write s0") != std::string::npos);
+}
+
+TEST_CASE("Advanced SIMD integer semantics retain vector data flow", "[spec][engine][simd]") {
+  xdec::il::Function function{engine().program().arch, engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  REQUIRE(engine().elaborate(decode(0x4e228420, 0x1000), site));
+  const std::string text = xdec::il::print(function);
+  INFO(text);
+  // add v0.16b, v1.16b, v2.16b must be visible as reads and a write, rather
+  // than the opaque catch-all that cannot express which registers it touches.
+  CHECK(text.find("read q1") != std::string::npos);
+  CHECK(text.find("read q2") != std::string::npos);
+  CHECK(text.find("write q0") != std::string::npos);
+  CHECK(text.find("unimplemented") == std::string::npos);
+}
+
+TEST_CASE("lifted NEON lane arithmetic executes independently per lane", "[spec][engine][simd][exec]") {
+  xdec::il::Function function{engine().program().arch, engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  // add v0.8h, v1.8h, v2.8h.  Each group includes a low-lane wrap and a
+  // neighbouring value that would be corrupted if a carry crossed lanes.
+  REQUIRE(engine().elaborate(decode(0x4e628420, 0x1000), site));
+  function.appendReturn(block, 0x1004);
+
+  xdec::il::Interpreter interpreter{function};
+  const auto reg = [&](std::string_view name) {
+    const xdec::il::RegId id = function.registers().find(name);
+    REQUIRE(id.valid());
+    return id;
+  };
+  interpreter.writeRegister(reg("q1"), {0x0001ffff0001ffff, 0x0001ffff0001ffff});
+  interpreter.writeRegister(reg("q2"), {0x0001000200030001, 0x0001000200030001});
+
+  REQUIRE(interpreter.runBlock(block).stop == xdec::il::ExecStop::Return);
+  const xdec::il::ConcreteValue result = interpreter.readRegister(reg("q0"));
+  CHECK(result.lo == 0x0002000100040000);
+  CHECK(result.hi == 0x0002000100040000);
+}
+
+TEST_CASE("lifted NEON lane shifts do not leak across lanes", "[spec][engine][simd][exec]") {
+  xdec::il::Function function{engine().program().arch, engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  // ushr v0.4s, v1.4s, #3. The low three bits of the next lane must not
+  // appear in the high three bits of its neighbour after the packed shift.
+  REQUIRE(engine().elaborate(decode(0x6f3d0420, 0x1000), site));
+  function.appendReturn(block, 0x1004);
+
+  xdec::il::Interpreter interpreter{function};
+  const xdec::il::RegId q1 = function.registers().find("q1");
+  const xdec::il::RegId q0 = function.registers().find("q0");
+  REQUIRE(q1.valid());
+  REQUIRE(q0.valid());
+  interpreter.writeRegister(q1, {0x8000000000000008, 0x8000000000000008});
+
+  REQUIRE(interpreter.runBlock(block).stop == xdec::il::ExecStop::Return);
+  const xdec::il::ConcreteValue result = interpreter.readRegister(q0);
+  CHECK(result.lo == 0x1000000000000001);
+  CHECK(result.hi == 0x1000000000000001);
 }
 
 TEST_CASE("a write to the zero register is discarded", "[spec][engine]") {

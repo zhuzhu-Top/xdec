@@ -70,6 +70,7 @@ include "arm64/dp-register.xspec"
 include "arm64/branch.xspec"
 include "arm64/loadstore.xspec"
 include "arm64/loadstore-fp.xspec"
+include "arm64/scalar-fp.xspec"
 include "arm64/system.xspec"
 
 // Last, because it is the floor everything else stands on: negative-priority

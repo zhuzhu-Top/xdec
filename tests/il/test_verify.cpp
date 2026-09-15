@@ -22,6 +22,14 @@ RegId reg(const char* name) {
   return id;
 }
 
+TEST_CASE("function constants support zero-extended i128 immediates", "[il]") {
+  Function function{xdec::Arch::AArch64, arm64Registers(), 0x1000};
+  const ExprId value =
+      function.constant(Type::integer(128), 0x123456789abcdef0ULL);
+  CHECK(function.expr(value).type == Type::integer(128));
+  CHECK(function.expr(value).immediate == 0x123456789abcdef0ULL);
+}
+
 bool reports(const VerifyReport& report, std::string_view fragment) {
   for (const xdec::Diag& diag : report.errors) {
     if (diag.message().find(fragment) != std::string::npos) {

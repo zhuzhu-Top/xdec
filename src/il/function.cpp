@@ -31,8 +31,12 @@ ExprId Function::intern(const Expr& expr) {
 }
 
 ExprId Function::constant(Type type, uint64_t value) {
-  XDEC_ASSERT(type.isScalarInteger() || type.isFloat(),
-              "constants are limited to scalar integers and floats");
+  // Spec immediates are 64-bit and therefore also represent zero-extended
+  // constants in the concrete executor's 128-bit register values. AArch64
+  // Q-register load/store semantics use i128 zero/offset constants even
+  // though no high immediate bits are required.
+  XDEC_ASSERT((type.isInteger() && type.bits() <= 128) || type.isFloat(),
+              "constants are limited to integers up to 128 bits and floats");
   Expr expr;
   expr.op = ExprOp::Const;
   expr.type = type;

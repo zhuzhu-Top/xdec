@@ -19,11 +19,9 @@ xdec_add_library(xdec_analysis
     live_register_frame.cpp
     load_inline.cpp
     loops.cpp
-    noreturn.cpp
     path_explorer.cpp
     path_interpreter.cpp
     path_state.cpp
-    plt_stub.cpp
     profile.cpp
     reachability.cpp
     scc.cpp
@@ -41,5 +39,6 @@ xdec_add_library(xdec_analysis
     vtable_call.cpp
   DEPS
     xdec_il
+    xdec_spec
     xdec_support
     xdec_types)

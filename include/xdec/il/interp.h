@@ -55,6 +55,21 @@ struct WrittenRange {
   uint64_t size = 0;
 };
 
+/// Memory contract used by the concrete interpreter.
+///
+/// Keeping this interface in the IL layer lets embedders supply permissioned,
+/// demand-paged memory without making the IL depend on an execution framework.
+class ExecMemoryBackend {
+ public:
+  virtual ~ExecMemoryBackend() = default;
+
+  [[nodiscard]] virtual bool mapped(uint64_t address, uint64_t size) const = 0;
+  [[nodiscard]] virtual Result<ConcreteValue> read(uint64_t address,
+                                                   unsigned bytes) const = 0;
+  [[nodiscard]] virtual Result<void> write(uint64_t address, unsigned bytes,
+                                           ConcreteValue value) = 0;
+};
+
 /// Sparse byte-addressed memory in two layers.
 ///
 /// The seed layer holds bytes that are there before execution: the binary
@@ -67,7 +82,7 @@ struct WrittenRange {
 /// Store ops record their bytes in a write set, so a differential run can
 /// compare exactly what execution touched instead of diffing whole pages.
 /// Setup writes through `seed` and `fillDelta` do not pollute that set.
-class ExecMemory {
+class ExecMemory final : public ExecMemoryBackend {
  public:
   static constexpr unsigned kPageBits = 12;
   static constexpr uint64_t kPageSize = uint64_t{1} << kPageBits;
@@ -79,13 +94,15 @@ class ExecMemory {
   /// how a workload supplies per-run initial memory.
   void fillDelta(uint64_t address, std::span<const std::byte> bytes);
 
-  [[nodiscard]] bool mapped(uint64_t address, uint64_t size) const;
+  [[nodiscard]] bool mapped(uint64_t address, uint64_t size) const override;
 
   /// Up to 16 bytes, little-endian, zero-extended into the value.
-  [[nodiscard]] Result<ConcreteValue> read(uint64_t address, unsigned bytes) const;
+  [[nodiscard]] Result<ConcreteValue> read(uint64_t address,
+                                           unsigned bytes) const override;
   /// Up to 16 bytes taken from the value's low bits, little-endian. Recorded in
   /// the write set.
-  [[nodiscard]] Result<void> write(uint64_t address, unsigned bytes, ConcreteValue value);
+  [[nodiscard]] Result<void> write(uint64_t address, unsigned bytes,
+                                   ConcreteValue value) override;
 
   /// Coalesced ranges the Store ops have written since the last `clearDelta`.
   [[nodiscard]] std::vector<WrittenRange> writtenRanges() const;
@@ -120,6 +137,8 @@ enum class ExecStop : uint8_t {
   Unimplemented,
   /// An intrinsic the hook declined, by name in `detail`.
   Intrinsic,
+  /// The embedder stopped before the op at `va`; no part of that op executed.
+  Interrupted,
   /// Something execution cannot continue past: a memory fault, a value used
   /// before definition, an unsupported width. `detail` says what.
   Error,
@@ -152,9 +171,16 @@ class Interpreter {
   /// own it, which is how a driver seeds the image once and runs many blocks
   /// against it.
   explicit Interpreter(const Function& function, ExecMemory* memory = nullptr);
+  /// Uses an embedder-owned memory implementation.
+  Interpreter(const Function& function, ExecMemoryBackend& memory);
 
   [[nodiscard]] const Function& function() const noexcept { return *function_; }
-  [[nodiscard]] ExecMemory& memory() noexcept { return *memory_; }
+  [[nodiscard]] ExecMemory& memory() noexcept {
+    XDEC_ASSERT(memory_ != nullptr,
+                "Interpreter::memory requires the concrete ExecMemory backend");
+    return *memory_;
+  }
+  [[nodiscard]] ExecMemoryBackend& memoryBackend() noexcept { return *memoryBackend_; }
 
   /// Register access through the register file's views: writing `w0`
   /// zero-extends into `x0` because the view declares it, and writing a
@@ -163,6 +189,12 @@ class Interpreter {
   [[nodiscard]] ConcreteValue readRegister(RegId reg) const;
 
   void setIntrinsicHook(IntrinsicHook hook) { hook_ = std::move(hook); }
+  /// Called immediately before each effectful IL op is interpreted. The hook
+  /// observes execution only; it cannot suppress or replace the operation.
+  using OpHook = std::function<void(const Op&)>;
+  void setOpHook(OpHook hook) { opHook_ = std::move(hook); }
+  using InterruptHook = std::function<bool(const Op&)>;
+  void setInterruptHook(InterruptHook hook) { interruptHook_ = std::move(hook); }
 
   /// Zeroes registers and defined values. Memory survives, delta included;
   /// clearing it is a separate decision (`ExecMemory::clearDelta`).
@@ -177,9 +209,13 @@ class Interpreter {
   [[nodiscard]] ExecOutcome fail(std::string message, uint64_t va);
 
   const Function* function_;
-  ExecMemory* memory_;
+  ExecMemoryBackend* memoryBackend_ = nullptr;
+  /// Non-null only for the legacy concrete-memory constructor and accessor.
+  ExecMemory* memory_ = nullptr;
   std::unique_ptr<ExecMemory> ownedMemory_;
   IntrinsicHook hook_;
+  OpHook opHook_;
+  InterruptHook interruptHook_;
 
   /// One cell per root register. Sub-register reads and writes resolve through
   /// the view chain; flags registers keep their four materialised bits in `lo`.

@@ -19,6 +19,7 @@
 | **结构化 C 输出** | `if/else`、`while`、`switch` — 能恢复的结构就不输出 goto；短名 helper 通过 `xdec_helpers.h` 提供 |
 | **库 API** | `decompile()`（Vars IL）与 `decompileToC()`（完整流水线 → C 文本），供测试、插件宿主、自动化工具直接调用 |
 | **插件系统** | `--plugin` 加载外部 pass；核心保持通用，样本特化逻辑留在插件侧（见 [docs/00-core-vs-plugin-prompt.md](docs/00-core-vs-plugin-prompt.md)） |
+| **确定性执行 API** | `ExecSession` 按需提升并跨基本块执行；外部调用、syscall 与 intrinsic 通过可恢复边界交给 embedder，trace 不绑定 CLI 或存储格式 |
 
 ---
 
@@ -203,6 +204,7 @@ xdec/
 │   ├── passes/         优化与去混淆 pass
 │   ├── analysis/       CFG、支配树、跳转表、dispatcher 形状、EntryReg 等
 │   ├── decompile/      多轮发现 driver + decompileToC API
+│   ├── exec/           确定性执行、guest 内存、外部边界与基础 trace
 │   ├── emit/           结构化器 + C 打印器
 │   ├── plugin/         插件 ABI 与加载器
 │   └── tools/          xdec CLI
@@ -277,6 +279,7 @@ cd eval
 | [22-dyld-shared-cache.md](docs/22-dyld-shared-cache.md) | dyld shared cache 完整支持：多文件 backing、subcache 发现、指针 tag 解码、本地符号 |
 | [23-path-eval.md](docs/23-path-eval.md) | PathEval：路径敏感的间接跳转回退 |
 | [24-apple-indirect-dispatch.md](docs/24-apple-indirect-dispatch.md) | absd / AuthKit 间接跳转怎么算（偏移表、指针表减常数、字段加起点）以及 xdec 为何解不完 |
+| [25-execution.md](docs/25-execution.md) | 独立执行 API、guest 内存所有权、外部模型边界与基础 trace |
 | [eval/FINDINGS.md](eval/FINDINGS.md) | 回归历史、性能记录、OLLVM 优化日志 |
 
 架构 spec DSL 参考：[docs/02-dsl-ref.md](docs/02-dsl-ref.md)、[docs/03-spec-compiler.md](docs/03-spec-compiler.md)。

@@ -7,6 +7,8 @@ xdec_add_library(xdec_spec
     engine.cpp
     lexer.cpp
     lift.cpp
+    ../analysis/noreturn.cpp
+    ../analysis/plt_stub.cpp
     parser.cpp
     program.cpp
     serialize.cpp

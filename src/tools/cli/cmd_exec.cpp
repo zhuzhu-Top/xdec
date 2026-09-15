@@ -284,6 +284,9 @@ int commandExec(std::string_view path, std::string_view workloadPath) {
       case xdec::il::ExecStop::Intrinsic:
         print("flow intrinsic {}", outcome.detail);
         break;
+      case xdec::il::ExecStop::Interrupted:
+        print("flow interrupted 0x{:x}", outcome.va);
+        break;
       case xdec::il::ExecStop::Error:
         print("flow error 0x{:x} {}", outcome.va, outcome.detail);
         break;

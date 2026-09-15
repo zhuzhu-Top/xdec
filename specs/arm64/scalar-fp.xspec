@@ -1,0 +1,188 @@
+// Scalar floating-point data processing.
+//
+// The scalar S and D names are views of the architectural V registers.  The
+// register file intentionally retains their raw bits so that vector loads and
+// stores can share the same backing register.  These helpers give scalar
+// instructions a typed float view without hiding that representation change.
+// Writing an S or D view zero-extends the V register, as required by AArch64.
+
+fn read_fp(n: int(0..31), ftype: int(0..1)) -> float(32 << ftype) {
+  if ftype == 0 {
+    return bitcast_float(vec[n].s, 32);
+  } else {
+    return bitcast_float(vec[n].d, 64);
+  }
+}
+
+fn write_fp(n: int(0..31), ftype: int(0..1), value: float(32 << ftype)) {
+  if ftype == 0 {
+    vec[n].s = bitcast_int(value, 32);
+  } else {
+    vec[n].d = bitcast_int(value, 64);
+  }
+}
+
+// FCMP does not have an integer subtraction whose lazy flags can stand in for
+// its IEEE-754 ordering.  Materialise its architectural NZCV result directly.
+// FPSR exceptions (including the signalling distinction) remain outside this
+// base IL because FPSR is not presently modelled.
+fn fcmp_flags(ftype: int(0..1), a: float(32 << ftype), b: float(32 << ftype)) -> flags {
+  return select_flags(fcmp_uno(a, b), flagconst(imm(3, 4)),
+         select_flags(fcmp_lt(a, b), flagconst(imm(8, 4)),
+         select_flags(fcmp_eq(a, b), flagconst(imm(6, 4)), flagconst(imm(2, 4)))));
+}
+
+// Floating-point data processing (two source).  ftype 00/01 select S/D;
+// ftype 10 is the optional FP16 extension and is intentionally not claimed.
+insn fmul_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 "0000" "10" Rn:5 Rd:5
+  asm "fmul {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fmul(read_fp(Rn, ftype), read_fp(Rm, ftype)));
+  }
+}
+
+insn fdiv_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 "0001" "10" Rn:5 Rd:5
+  asm "fdiv {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fdiv(read_fp(Rn, ftype), read_fp(Rm, ftype)));
+  }
+}
+
+insn fadd_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 "0010" "10" Rn:5 Rd:5
+  asm "fadd {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fadd(read_fp(Rn, ftype), read_fp(Rm, ftype)));
+  }
+}
+
+insn fsub_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 "0011" "10" Rn:5 Rd:5
+  asm "fsub {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fsub(read_fp(Rn, ftype), read_fp(Rm, ftype)));
+  }
+}
+
+// Floating-point data processing (one source).
+insn fmov_scalar {
+  encoding "00011110" "0" ftype:1 "1" "00000" "010000" Rn:5 Rd:5
+  asm "fmov {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, read_fp(Rn, ftype));
+  }
+}
+
+insn fabs_scalar {
+  encoding "00011110" "0" ftype:1 "1" "00000" "110000" Rn:5 Rd:5
+  asm "fabs {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fabs(read_fp(Rn, ftype)));
+  }
+}
+
+insn fneg_scalar {
+  encoding "00011110" "0" ftype:1 "1" "00001" "010000" Rn:5 Rd:5
+  asm "fneg {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fneg(read_fp(Rn, ftype)));
+  }
+}
+
+insn fsqrt_scalar {
+  encoding "00011110" "0" ftype:1 "1" "00001" "110000" Rn:5 Rd:5
+  asm "fsqrt {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_fp(Rd, ftype, fsqrt(read_fp(Rn, ftype)));
+  }
+}
+
+// Floating-point compare, register and +0.0 forms.
+insn fcmp_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 "001000" Rn:5 "00000"
+  asm "fcmp {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}"
+  semantics {
+    nzcv = fcmp_flags(ftype, read_fp(Rn, ftype), read_fp(Rm, ftype));
+  }
+}
+
+insn fcmp_zero_scalar {
+  encoding "00011110" "0" ftype:1 "1" "00000" "001000" Rn:5 "01000"
+  asm "fcmp {Rn:vreg(32 << ftype)}, #0.0"
+  semantics {
+    let zero = bitcast_float(imm(0, 32 << ftype), 32 << ftype);
+    nzcv = fcmp_flags(ftype, read_fp(Rn, ftype), zero);
+  }
+}
+
+// Integer / scalar-float conversions.  sf selects W/X independently of the
+// destination or source S/D ftype.
+insn scvtf_scalar {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "00010" "000000" Rn:5 Rd:5
+  asm "scvtf {Rd:vreg(32 << ftype)}, {Rn:reg(sf)}"
+  semantics {
+    write_fp(Rd, ftype, inttofp_s(read_gpr(Rn, sf), 32 << ftype));
+  }
+}
+
+insn ucvtf_scalar {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "00011" "000000" Rn:5 Rd:5
+  asm "ucvtf {Rd:vreg(32 << ftype)}, {Rn:reg(sf)}"
+  semantics {
+    write_fp(Rd, ftype, inttofp_u(read_gpr(Rn, sf), 32 << ftype));
+  }
+}
+
+insn fcvtzs_scalar {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "11000" "000000" Rn:5 Rd:5
+  asm "fcvtzs {Rd:reg(sf)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_gpr(Rd, sf, fptoint_s(read_fp(Rn, ftype), 32 << sf));
+  }
+}
+
+insn fcvtzu_scalar {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "11001" "000000" Rn:5 Rd:5
+  asm "fcvtzu {Rd:reg(sf)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_gpr(Rd, sf, fptoint_u(read_fp(Rn, ftype), 32 << sf));
+  }
+}
+
+// Scalar width conversion has two encodings, one for each source width.
+insn fcvt_d_from_s {
+  encoding "00011110" "00" "1" "00010" "110000" Rn:5 Rd:5
+  asm "fcvt d{Rd:dec}, s{Rn:dec}"
+  semantics {
+    write_fp(Rd, 1, fpconvert(read_fp(Rn, 0), 64));
+  }
+}
+
+insn fcvt_s_from_d {
+  encoding "00011110" "01" "1" "00010" "010000" Rn:5 Rd:5
+  asm "fcvt s{Rd:dec}, d{Rn:dec}"
+  semantics {
+    write_fp(Rd, 0, fpconvert(read_fp(Rn, 1), 32));
+  }
+}
+
+// Bitwise moves between GPR and scalar FP registers.
+insn fmov_gpr_from_fp {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "00110" "000000" Rn:5 Rd:5
+  require ftype == sf;
+  asm "fmov {Rd:reg(sf)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_gpr(Rd, sf, bitcast_int(read_fp(Rn, ftype), 32 << sf));
+  }
+}
+
+insn fmov_fp_from_gpr {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "00111" "000000" Rn:5 Rd:5
+  require ftype == sf;
+  asm "fmov {Rd:vreg(32 << ftype)}, {Rn:reg(sf)}"
+  semantics {
+    write_fp(Rd, ftype, bitcast_float(read_gpr(Rn, sf), 32 << ftype));
+  }
+}

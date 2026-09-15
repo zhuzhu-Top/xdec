@@ -78,6 +78,7 @@ add_executable(xdec_tests
     emit/test_c_types.cpp
   emit/test_c_phi_edges.cpp
   emit/test_c_typed_return.cpp
+  exec/test_exec.cpp
   binary/test_memory_map.cpp
   binary/test_elf.cpp
   binary/test_macho.cpp
@@ -116,6 +117,8 @@ add_executable(xdec_tests
   spec/test_spec_check.cpp
   spec/test_spec_encoding.cpp
   spec/test_spec_engine.cpp
+  spec/test_scalar_fp_spec.cpp
+  spec/test_vector_fp_spec.cpp
   types/test_type_database.cpp
   types/test_hdecl_parser.cpp
   types/test_syscall_table.cpp
@@ -158,6 +161,7 @@ target_link_libraries(xdec_tests PRIVATE
   xdec_binary
   xdec_decompile
   xdec_emit
+  xdec_exec
   xdec_il
   xdec_pass
   xdec_passes
