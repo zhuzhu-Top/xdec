@@ -47,6 +47,9 @@ TEST_CASE("scalar FP rules decode and elaborate typed IL", "[spec][scalar-fp]") 
   CHECK(ruleOf(0x1e220020) == "scvtf_scalar");      // scvtf s0, w1
   CHECK(ruleOf(0x9e790020) == "fcvtzu_scalar");     // fcvtzu x0, d1
   CHECK(ruleOf(0x1e260020) == "fmov_gpr_from_fp");  // fmov w0, s1
+  CHECK(ruleOf(0x1e6e1001) == "fmov_scalar_imm");   // fmov d1, #1.0
+  CHECK(ruleOf(0x1e2f1001) == "fmov_scalar_imm");   // fmov s1, #1.5
+  CHECK(ruleOf(0x1e61ac00) == "fcsel_scalar");      // fcsel d0, d0, d1, ge
 
   const auto instruction = decode(0x1e222820);
   CHECK(scalarFpEngine().disassemble(instruction) == "fadd s0, s1, s2");

@@ -171,6 +171,90 @@ TEST_CASE("execution session follows blocks and records instructions",
   CHECK_FALSE(trace.instructions[1].registers.empty());
 }
 
+TEST_CASE("register records carry sources, destinations, and operand widths",
+          "[exec]") {
+  // Backward data flow needs the values an instruction consumed, not only the
+  // ones it produced, and it needs to see `w0` as a 32-bit operand rather than
+  // as its 64-bit root.
+  //   mov x0,#0x11; add x1,x0,#2; mov w2,w1; ret
+  auto memory = codeMemory({0xd2800220, 0x91000801, 0x2a0103e2, 0xd65f03c0});
+  xdec::exec::MachineState state{engine().program().registers, 0x1000};
+  xdec::exec::VectorTraceSink trace;
+  xdec::exec::ExecSession session{engine(), memory, std::move(state)};
+  session.setObserver(&trace);
+  REQUIRE(session.run().stop == xdec::exec::SessionStop::Returned);
+  REQUIRE(trace.instructions.size() == 4);
+
+  const auto& registers = engine().program().registers;
+  const auto find = [&](const xdec::exec::InstructionRecord& record,
+                        std::string_view name, bool write) {
+    const xdec::il::RegId reg = registers.find(name);
+    for (const auto& delta : record.registers) {
+      if (delta.reg == reg && delta.write == write) return &delta;
+    }
+    return static_cast<const xdec::exec::RegisterDelta*>(nullptr);
+  };
+
+  // add x1,x0,#2 reads x0 and writes x1; the read carries x0's value.
+  const auto* readX0 = find(trace.instructions[1], "x0", false);
+  REQUIRE(readX0 != nullptr);
+  CHECK(readX0->before.lo == 0x11);
+  CHECK(readX0->before == readX0->after);
+  const auto* writeX1 = find(trace.instructions[1], "x1", true);
+  REQUIRE(writeX1 != nullptr);
+  CHECK(writeX1->after.lo == 0x13);
+
+  // mov w2,w1 names 32-bit views, so the record must too.
+  CHECK(find(trace.instructions[2], "w1", false) != nullptr);
+  CHECK(find(trace.instructions[2], "w2", true) != nullptr);
+  CHECK(find(trace.instructions[2], "x2", true) == nullptr);
+}
+
+TEST_CASE("trace policy can drop source operands and unchanged writes",
+          "[exec]") {
+  // mov x0,#0; mov x0,#0; ret -- the second write stores the value x0 already
+  // held, which only the unfiltered policy reports.
+  auto memory = codeMemory({0xd2800000, 0xd2800000, 0xd65f03c0});
+  const auto countWrites = [&](const xdec::exec::InstructionRecord& record) {
+    std::size_t writes = 0;
+    for (const auto& delta : record.registers) writes += delta.write ? 1 : 0;
+    return writes;
+  };
+
+  SECTION("reads are omitted when the policy declines them") {
+    xdec::exec::MachineState state{engine().program().registers, 0x1000};
+    xdec::exec::VectorTraceSink trace;
+    xdec::exec::ExecOptions options;
+    options.trace.registerReads = false;
+    xdec::exec::ExecSession session{engine(), memory, std::move(state), options};
+    session.setObserver(&trace);
+    REQUIRE(session.run().stop == xdec::exec::SessionStop::Returned);
+    for (const auto& record : trace.instructions) {
+      for (const auto& delta : record.registers) CHECK(delta.write);
+    }
+  }
+
+  SECTION("a write of the value already held is reported by default") {
+    xdec::exec::MachineState state{engine().program().registers, 0x1000};
+    xdec::exec::VectorTraceSink trace;
+    xdec::exec::ExecSession session{engine(), memory, std::move(state)};
+    session.setObserver(&trace);
+    REQUIRE(session.run().stop == xdec::exec::SessionStop::Returned);
+    CHECK(countWrites(trace.instructions[1]) == 1);
+  }
+
+  SECTION("and suppressed when the policy asks for changes only") {
+    xdec::exec::MachineState state{engine().program().registers, 0x1000};
+    xdec::exec::VectorTraceSink trace;
+    xdec::exec::ExecOptions options;
+    options.trace.unchangedRegisterWrites = false;
+    xdec::exec::ExecSession session{engine(), memory, std::move(state), options};
+    session.setObserver(&trace);
+    REQUIRE(session.run().stop == xdec::exec::SessionStop::Returned);
+    CHECK(countWrites(trace.instructions[1]) == 0);
+  }
+}
+
 TEST_CASE("guest memory enforces permissions and records accesses", "[exec]") {
   CHECK_FALSE(xdec::exec::hasPermission(
       xdec::exec::MemoryPermission::Read,
@@ -563,6 +647,49 @@ TEST_CASE("missing pages can be supplied without weakening permissions",
   CHECK(memory.read(0x3004, 1)->lo == 0x5a);
   CHECK_FALSE(memory.write(0x3004, 1, {1, 0}));
   CHECK_FALSE(memory.read(0x4000, 1));
+}
+
+TEST_CASE("external write patches materialize writable provider pages",
+          "[exec]") {
+  xdec::exec::GuestAddressSpace memory;
+  memory.setPageProvider([](uint64_t page)
+                             -> xdec::Result<std::optional<xdec::exec::PageSeed>> {
+    if (page != 0x4000) {
+      return std::optional<xdec::exec::PageSeed>{};
+    }
+    xdec::exec::PageSeed seed;
+    seed.permissions = xdec::exec::MemoryPermission::Read |
+                       xdec::exec::MemoryPermission::Write;
+    return std::optional<xdec::exec::PageSeed>{seed};
+  });
+
+  const std::array patches{
+      xdec::exec::MemoryPatch::write(0x4004, {std::byte{0x5a}})};
+  REQUIRE(memory.apply(patches));
+  CHECK(memory.read(0x4004, 1)->lo == 0x5a);
+}
+
+TEST_CASE("guest addresses are canonicalized before page lookup", "[exec]") {
+  unsigned fetches = 0;
+  xdec::exec::GuestAddressSpace memory{
+      [](uint64_t address) { return address & 0x00ffffffffffffffULL; }};
+  memory.setPageProvider(
+      [&](uint64_t page)
+          -> xdec::Result<std::optional<xdec::exec::PageSeed>> {
+        ++fetches;
+        CHECK(page == 0x4000);
+        xdec::exec::PageSeed seed;
+        seed.permissions = xdec::exec::MemoryPermission::Read |
+                           xdec::exec::MemoryPermission::Write;
+        return std::optional<xdec::exec::PageSeed>{seed};
+      });
+
+  REQUIRE(memory.write(0xb400000000004004, 1, {0x5a, 0}));
+  CHECK(memory.read(0x4004, 1)->lo == 0x5a);
+  CHECK(memory.read(0xb400000000004004, 1)->lo == 0x5a);
+  CHECK(fetches == 1);
+  REQUIRE(memory.dirtyRanges().size() == 1);
+  CHECK(memory.dirtyRanges()[0].address == 0x4004);
 }
 
 TEST_CASE("external memory patches can map protect and unmap", "[exec]") {

@@ -79,6 +79,7 @@ add_executable(xdec_tests
   emit/test_c_phi_edges.cpp
   emit/test_c_typed_return.cpp
   exec/test_exec.cpp
+  exec/test_insn_semantics.cpp
   binary/test_memory_map.cpp
   binary/test_elf.cpp
   binary/test_macho.cpp

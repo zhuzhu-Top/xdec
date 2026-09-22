@@ -7,19 +7,44 @@
 #include <string>
 #include <vector>
 
+#include "xdec/exec/insn_semantics.h"
 #include "xdec/exec/memory.h"
 #include "xdec/spec/engine.h"
 #include "xdec/spec/lift.h"
 
 namespace xdec::exec {
 
+/// One register an instruction names, as the instruction names it: `w0` stays
+/// `w0` rather than collapsing to `x0`, so a consumer can tell a 32-bit write
+/// from a 64-bit one.
+struct RegisterOperand {
+  il::RegId reg;
+  bool write = false;
+};
+
 struct ExecInstruction {
   uint64_t pc = 0;
   uint64_t word = 0;
   unsigned length = 0;
   std::string disassembly;
+  /// Lowercased opcode, e.g. "ldr" out of "ldr x0, [x1]". Computed once here
+  /// instead of by every observer on every execution of a hot loop's body.
+  std::string mnemonic;
   spec::InsnFlow flow;
   std::vector<il::OpId> ops;
+  /// Every register the instruction reads, then every one it writes, taken
+  /// from the lifted ReadReg/WriteReg ops. This is a property of the encoding,
+  /// not of one execution, so it is resolved once here rather than rediscovered
+  /// each time a hot loop's body comes around. Duplicates within a direction
+  /// are folded: naming x0 twice still describes one operand.
+  std::vector<RegisterOperand> registerOperands;
+  /// Where the writes begin in registerOperands; everything before is a read.
+  std::size_t firstWriteOperand = 0;
+  /// What the instruction computes, flattened out of `ops` so that a consumer
+  /// outside the process gets the lifter's answer instead of decoding the word
+  /// again. Like registerOperands, a property of the encoding and so resolved
+  /// once here.
+  InstructionSemantics semantics;
 };
 
 struct CodePageStamp {
@@ -36,6 +61,12 @@ struct ExecBlock {
   spec::LiftedBlock lifted;
   std::vector<ExecInstruction> instructions;
   std::vector<CodePageStamp> codePages;
+  /// Root registers the block's WriteReg ops target, resolved while lifting.
+  /// WriteReg is the interpreter's only way into the register file, so this
+  /// covers every register an execution of this block can change -- a superset
+  /// when a path is not taken, which is all a caller mirroring registers
+  /// elsewhere needs. Computed once per compile rather than tracked per write.
+  std::vector<il::RegId> writtenRoots;
 
   [[nodiscard]] bool validFor(const GuestAddressSpace& memory) const;
   [[nodiscard]] const ExecInstruction* instructionAt(uint64_t pc) const;

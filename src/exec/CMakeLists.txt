@@ -1,6 +1,7 @@
 xdec_add_library(xdec_exec
   SOURCES
     exec_ir.cpp
+    insn_semantics.cpp
     memory.cpp
     session.cpp
     state.cpp

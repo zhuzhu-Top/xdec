@@ -121,6 +121,7 @@ enum class ExprCategory : uint8_t {
   X(FNeg, "fneg", 1, 1, FloatArithmetic, SameAsOperands)                                     \
   X(FAbs, "fabs", 1, 1, FloatArithmetic, SameAsOperands)                                      \
   X(FSqrt, "fsqrt", 1, 1, FloatArithmetic, SameAsOperands)                                     \
+  X(FCeil, "fceil", 1, 1, FloatArithmetic, SameAsOperands)                                      \
   X(FCmpEq, "fcmp.eq", 2, 2, FloatCompare, Boolean)                                            \
   X(FCmpLt, "fcmp.lt", 2, 2, FloatCompare, Boolean)                                            \
   X(FCmpLe, "fcmp.le", 2, 2, FloatCompare, Boolean)                                            \

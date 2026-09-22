@@ -117,6 +117,19 @@ insn fcmp_zero_scalar {
   }
 }
 
+insn fcsel_scalar {
+  encoding "00011110" "0" ftype:1 "1" Rm:5 cc:4 "11" Rn:5 Rd:5
+  asm "fcsel {Rd:vreg(32 << ftype)}, {Rn:vreg(32 << ftype)}, {Rm:vreg(32 << ftype)}, {cc:cond}"
+  semantics {
+    let width = 32 << ftype;
+    write_fp(Rd, ftype, bitcast_float(
+        select(cond(nzcv, cc),
+               bitcast_int(read_fp(Rn, ftype), width),
+               bitcast_int(read_fp(Rm, ftype), width)),
+        width));
+  }
+}
+
 // Integer / scalar-float conversions.  sf selects W/X independently of the
 // destination or source S/D ftype.
 insn scvtf_scalar {
@@ -148,6 +161,15 @@ insn fcvtzu_scalar {
   asm "fcvtzu {Rd:reg(sf)}, {Rn:vreg(32 << ftype)}"
   semantics {
     write_gpr(Rd, sf, fptoint_u(read_fp(Rn, ftype), 32 << sf));
+  }
+}
+
+// Floating-point convert to unsigned integer, rounding toward +infinity.
+insn fcvtpu_scalar {
+  encoding sf:1 "0011110" "0" ftype:1 "1" "01001" "000000" Rn:5 Rd:5
+  asm "fcvtpu {Rd:reg(sf)}, {Rn:vreg(32 << ftype)}"
+  semantics {
+    write_gpr(Rd, sf, fptoint_u(fceil(read_fp(Rn, ftype)), 32 << sf));
   }
 }
 
@@ -184,5 +206,33 @@ insn fmov_fp_from_gpr {
   asm "fmov {Rd:vreg(32 << ftype)}, {Rn:reg(sf)}"
   semantics {
     write_fp(Rd, ftype, bitcast_float(read_gpr(Rn, sf), 32 << ftype));
+  }
+}
+
+// VFPExpandImm: 8-bit (sign, exp-bias-bit, 6-bit fraction) to IEEE-754.
+fn vfp_expand_imm32(imm8: int) -> int {
+  let hi16 = (((imm8 >> 7) & 1) << 15)
+           | (((imm8 >> 6) & 1) == 1 ? 0x3e00 : 0x4000)
+           | ((imm8 & 0x3f) << 3);
+  return hi16 << 16;
+}
+
+fn vfp_expand_imm64(imm8: int) -> int {
+  let hi16 = (((imm8 >> 7) & 1) << 15)
+           | (((imm8 >> 6) & 1) == 1 ? 0x3fc0 : 0x4000)
+           | (imm8 & 0x3f);
+  return hi16 << 48;
+}
+
+insn fmov_scalar_imm {
+  encoding "00011110" ftype:2 "1" imm8:8 "10000000" Rd:5
+  require ftype == 0 || ftype == 1;
+  asm "fmov {Rd:vreg(32 << ftype)}, #{imm8:hex}"
+  semantics {
+    if ftype == 0 {
+      write_fp(Rd, 0, bitcast_float(imm(vfp_expand_imm32(imm8), 32), 32));
+    } else {
+      write_fp(Rd, 1, bitcast_float(imm(vfp_expand_imm64(imm8), 64), 64));
+    }
   }
 }

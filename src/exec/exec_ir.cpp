@@ -2,11 +2,28 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstring>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
+#include "xdec/exec/insn_semantics.h"
+
 namespace xdec::exec {
+namespace {
+
+/// The opcode token before the first space or tab, lowercased. Mirrors
+/// xdec_trace_remote's tracedb_observer, which classifies on exactly this.
+std::string mnemonicOf(std::string_view disassembly) {
+  const std::size_t end = disassembly.find_first_of(" \t");
+  std::string mnemonic(disassembly.substr(0, end));
+  std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(),
+                 [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+  return mnemonic;
+}
+
+}  // namespace
 
 bool ExecBlock::validFor(const GuestAddressSpace& memory) const {
   return std::ranges::all_of(codePages, [&](const CodePageStamp& stamp) {
@@ -61,6 +78,7 @@ Result<std::shared_ptr<ExecBlock>> compileExecBlock(
   block->lifted = std::move(lifted);
 
   std::unordered_map<uint64_t, std::size_t> byPc;
+  const il::RegisterFile& registers = block->lifted.function->registers();
   const il::Block& entry = block->lifted.function->block(block->lifted.block);
   for (const il::OpId opId : entry.ops) {
     const il::Op& op = block->lifted.function->op(opId);
@@ -74,11 +92,51 @@ Result<std::shared_ptr<ExecBlock>> compileExecBlock(
         instruction.word = decodedIt->word;
         instruction.length = decodedIt->length;
         instruction.disassembly = engine.disassemble(*decodedIt);
+        instruction.mnemonic = mnemonicOf(instruction.disassembly);
         instruction.flow = engine.probe(*decodedIt);
       }
       block->instructions.push_back(std::move(instruction));
     }
-    block->instructions[it->second].ops.push_back(opId);
+    ExecInstruction& instruction = block->instructions[it->second];
+    instruction.ops.push_back(opId);
+    if (op.code == il::OpCode::ReadReg || op.code == il::OpCode::WriteReg) {
+      const bool write = op.code == il::OpCode::WriteReg;
+      const RegisterOperand operand{op.reg(), write};
+      const auto same = [&](const RegisterOperand& other) {
+        return other.reg == operand.reg && other.write == operand.write;
+      };
+      if (std::ranges::none_of(instruction.registerOperands, same)) {
+        instruction.registerOperands.push_back(operand);
+      }
+    }
+    if (op.code == il::OpCode::WriteReg) {
+      // Mirrors Interpreter::writeRegister's own classification: a zero-class
+      // write lands nowhere, and a flags bundle owns its cell instead of
+      // resolving through a parent.
+      const il::RegClass regClass = registers[op.reg()].regClass;
+      if (regClass != il::RegClass::Zero) {
+        const il::RegId root = regClass == il::RegClass::Flags
+                                   ? op.reg()
+                                   : registers.rootOf(op.reg());
+        if (std::ranges::find(block->writtenRoots, root) ==
+            block->writtenRoots.end()) {
+          block->writtenRoots.push_back(root);
+        }
+      }
+    }
+  }
+
+  // Reads first, so a consumer can capture every source value before the
+  // instruction runs and every destination value after it, walking one
+  // contiguous range each time.
+  for (ExecInstruction& instruction : block->instructions) {
+    const auto firstWrite = std::stable_partition(
+        instruction.registerOperands.begin(),
+        instruction.registerOperands.end(),
+        [](const RegisterOperand& operand) { return !operand.write; });
+    instruction.firstWriteOperand = static_cast<std::size_t>(
+        firstWrite - instruction.registerOperands.begin());
+    instruction.semantics = summarize(*block->lifted.function, instruction);
   }
 
   const uint64_t firstPage = pc & ~(GuestAddressSpace::kPageSize - 1);

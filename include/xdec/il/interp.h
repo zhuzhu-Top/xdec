@@ -200,6 +200,15 @@ class Interpreter {
   /// clearing it is a separate decision (`ExecMemory::clearDelta`).
   void resetState();
 
+  /// Retargets this interpreter at another block's function without
+  /// reconstructing it. Registers (and their dirty tracking) are machine
+  /// state and carry over untouched; only the per-block IL value slots are
+  /// reset, since a value index means nothing outside the function that
+  /// defined it. Requires `function` to share the same register file as the
+  /// function this interpreter is currently bound to -- true for every block
+  /// lifted by one SpecEngine, which is the only caller that needs this.
+  void rebind(const Function& function);
+
   /// Executes one block from its first op through its terminator.
   [[nodiscard]] ExecOutcome runBlock(BlockId block);
 

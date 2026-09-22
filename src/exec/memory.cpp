@@ -72,6 +72,7 @@ MemoryPatch MemoryPatch::unmap(uint64_t address, uint64_t size) {
 
 Result<void> GuestAddressSpace::map(uint64_t address, uint64_t size,
                                     MemoryPermission permissions) {
+  address = canonicalize(address);
   if (size == 0) {
     return ok();
   }
@@ -104,6 +105,7 @@ Result<void> GuestAddressSpace::map(uint64_t address, uint64_t size,
 Result<void> GuestAddressSpace::seed(uint64_t address,
                                      std::span<const std::byte> bytes,
                                      MemoryPermission permissions) {
+  address = canonicalize(address);
   if (bytes.empty()) {
     return ok();
   }
@@ -153,6 +155,7 @@ Result<void> GuestAddressSpace::seedImage(const binary::BinaryImage& image) {
 
 Result<void> GuestAddressSpace::protect(uint64_t address, uint64_t size,
                                         MemoryPermission permissions) {
+  address = canonicalize(address);
   XDEC_TRY_VOID(ensure(address, size, MemoryPermission::None));
   if (size == 0) {
     return ok();
@@ -171,6 +174,7 @@ Result<void> GuestAddressSpace::protect(uint64_t address, uint64_t size,
 }
 
 Result<void> GuestAddressSpace::unmap(uint64_t address, uint64_t size) {
+  address = canonicalize(address);
   if (size == 0) {
     return ok();
   }
@@ -187,6 +191,7 @@ Result<void> GuestAddressSpace::unmap(uint64_t address, uint64_t size) {
 }
 
 bool GuestAddressSpace::mapped(uint64_t address, uint64_t size) const {
+  address = canonicalize(address);
   if (size == 0) {
     return true;
   }
@@ -206,6 +211,7 @@ bool GuestAddressSpace::mapped(uint64_t address, uint64_t size) const {
 
 Result<void> GuestAddressSpace::ensure(uint64_t address, uint64_t size,
                                        MemoryPermission permission) const {
+  address = canonicalize(address);
   if (size == 0) {
     return ok();
   }
@@ -249,6 +255,7 @@ Result<void> GuestAddressSpace::ensure(uint64_t address, uint64_t size,
 Result<void> GuestAddressSpace::readBytes(uint64_t address,
                                           std::span<std::byte> out,
                                           MemoryPermission permission) const {
+  address = canonicalize(address);
   XDEC_TRY_VOID(ensure(address, out.size(), permission));
   for (std::size_t index = 0; index < out.size(); ++index) {
     const Page* page = pageAt(address + index);
@@ -257,8 +264,34 @@ Result<void> GuestAddressSpace::readBytes(uint64_t address,
   return ok();
 }
 
+bool GuestAddressSpace::readResidentBytes(uint64_t address,
+                                          std::span<std::byte> out) const {
+  address = canonicalize(address);
+  if (out.empty()) {
+    return true;
+  }
+  if (address > std::numeric_limits<uint64_t>::max() - (out.size() - 1)) {
+    return false;
+  }
+  const uint64_t last = pageBase(address + out.size() - 1);
+  for (uint64_t page = pageBase(address);; page += kPageSize) {
+    if (!pages_.contains(page)) {
+      return false;
+    }
+    if (page == last) {
+      break;
+    }
+  }
+  for (std::size_t index = 0; index < out.size(); ++index) {
+    const Page* page = pageAt(address + index);
+    out[index] = page->bytes[(address + index) & (kPageSize - 1)];
+  }
+  return true;
+}
+
 Result<void> GuestAddressSpace::writeBytes(uint64_t address,
                                            std::span<const std::byte> bytes) {
+  address = canonicalize(address);
   if (bytes.empty()) {
     return ok();
   }
@@ -268,6 +301,9 @@ Result<void> GuestAddressSpace::writeBytes(uint64_t address,
     Page* page = pageAt(va);
     page->bytes[va & (kPageSize - 1)] = bytes[index];
     dirtyBytes_.push_back(va);
+  }
+  if (dirtyBytes_.size() >= dirtyCompactAt_) {
+    compactDirty();
   }
   const uint64_t last = pageBase(address + bytes.size() - 1);
   for (uint64_t page = pageBase(address);; page += kPageSize) {
@@ -345,6 +381,7 @@ Result<void> GuestAddressSpace::validate(
   };
 
   for (const MemoryPatch& patch : patches) {
+    const uint64_t address = canonicalize(patch.address);
     const uint64_t size =
         patch.kind == MemoryPatch::Kind::Write ? patch.bytes.size() : patch.size;
     if (patch.kind == MemoryPatch::Kind::Map && patch.bytes.size() > size) {
@@ -354,15 +391,20 @@ Result<void> GuestAddressSpace::validate(
     if (size == 0) {
       continue;
     }
-    if (patch.address > std::numeric_limits<uint64_t>::max() - (size - 1)) {
+    if (address > std::numeric_limits<uint64_t>::max() - (size - 1)) {
       return err(DiagCode::OutOfRange,
                  "memory patch wraps the guest address space");
     }
-    const uint64_t last = pageBase(patch.address + size - 1);
-    for (uint64_t page = pageBase(patch.address);; page += kPageSize) {
-      const std::optional<MemoryPermission> current = permissionAt(page);
+    const uint64_t last = pageBase(address + size - 1);
+    for (uint64_t page = pageBase(address);; page += kPageSize) {
+      std::optional<MemoryPermission> current = permissionAt(page);
       switch (patch.kind) {
         case MemoryPatch::Kind::Write:
+          if (!current.has_value()) {
+            const auto materialized =
+                ensure(page, kPageSize, MemoryPermission::Write);
+            if (materialized) current = permissionAt(page);
+          }
           if (!current.has_value() ||
               !hasPermission(*current, MemoryPermission::Write)) {
             return err(Diag{DiagCode::OutOfRange,
@@ -419,9 +461,10 @@ Result<void> GuestAddressSpace::apply(std::span<const MemoryPatch> patches) {
                      "initial mapping bytes exceed the mapped size");
         }
         XDEC_TRY_VOID(map(patch.address, patch.size, patch.permissions));
+        const uint64_t address = canonicalize(patch.address);
         for (std::size_t index = 0; index < patch.bytes.size(); ++index) {
-          Page* page = pageAt(patch.address + index);
-          page->bytes[(patch.address + index) & (kPageSize - 1)] =
+          Page* page = pageAt(address + index);
+          page->bytes[(address + index) & (kPageSize - 1)] =
               patch.bytes[index];
         }
         break;
@@ -435,6 +478,16 @@ Result<void> GuestAddressSpace::apply(std::span<const MemoryPatch> patches) {
     }
   }
   return ok();
+}
+
+void GuestAddressSpace::compactDirty() {
+  std::sort(dirtyBytes_.begin(), dirtyBytes_.end());
+  dirtyBytes_.erase(std::unique(dirtyBytes_.begin(), dirtyBytes_.end()),
+                    dirtyBytes_.end());
+  // Leaving headroom proportional to what survived keeps compaction amortized:
+  // a session whose distinct set already sits at the threshold would otherwise
+  // re-sort on nearly every write.
+  dirtyCompactAt_ = std::max(kDirtyCompactFloor, dirtyBytes_.size() * 2);
 }
 
 std::vector<MemoryRange> GuestAddressSpace::dirtyRanges() const {
@@ -459,7 +512,7 @@ std::vector<MemoryRange> GuestAddressSpace::dirtyRanges() const {
 }
 
 uint64_t GuestAddressSpace::generationAt(uint64_t address) const {
-  const Page* page = pageAt(address);
+  const Page* page = pageAt(canonicalize(address));
   return page == nullptr ? 0 : page->generation;
 }
 

@@ -15,6 +15,8 @@
 
 namespace xdec::exec {
 
+struct InstructionSemantics;
+
 enum class BoundaryKind : uint8_t {
   DirectCall,
   IndirectCall,
@@ -25,10 +27,14 @@ enum class BoundaryKind : uint8_t {
 
 [[nodiscard]] std::string_view toString(BoundaryKind kind) noexcept;
 
+/// One register an instruction touched, at the granularity the instruction
+/// named it: a 32-bit write reports `w0`, not `x0`. Reads carry the value the
+/// instruction consumed, with `before` and `after` equal.
 struct RegisterDelta {
   il::RegId reg;
   ConcreteValue before;
   ConcreteValue after;
+  bool write = true;
 };
 
 struct InstructionRecord {
@@ -37,8 +43,30 @@ struct InstructionRecord {
   uint64_t word = 0;
   unsigned length = 0;
   std::string disassembly;
+  /// The compiled instruction's precomputed ExecInstruction::mnemonic, so
+  /// observers that classify by opcode don't re-parse disassembly per
+  /// occurrence of a hot loop's body.
+  std::string mnemonic;
   std::vector<RegisterDelta> registers;
   std::vector<MemoryAccess> memory;
+  /// What the lifter says this instruction computes, so an observer that needs
+  /// more than the mnemonic -- which constant an `and` masks with, which way a
+  /// variable shift goes -- reads xdec's own answer instead of decoding the
+  /// word a second time and drifting from the xspec rules.
+  ///
+  /// Borrowed from the compiled block, which the session keeps alive for as
+  /// long as the record is live, and shared by every execution of the same
+  /// instruction: copying it per record would allocate on the hottest path
+  /// there is. Null when the block did not compile the instruction.
+  const InstructionSemantics* semantics = nullptr;
+  /// Control-flow shape, taken from the lifted instruction rather than guessed
+  /// from the mnemonic, so an observer can build a call tree without decoding
+  /// anything itself.
+  bool call = false;
+  bool returns = false;
+  /// The call target where the encoding names one. Zero for an indirect call,
+  /// whose real target is simply the next instruction executed.
+  uint64_t callTarget = 0;
 };
 
 struct BoundaryRecord {
@@ -74,6 +102,17 @@ struct BoundaryEffectRecord {
 struct TracePolicy {
   bool disassembly = true;
   bool registerDeltas = true;
+  /// Whether source operands are recorded alongside destinations. Backward
+  /// data flow needs them -- without a read there is no edge from a value to
+  /// the instruction that consumed it -- but they roughly double the register
+  /// records a trace produces, so a consumer that only wants results can
+  /// decline them.
+  bool registerReads = true;
+  /// Whether a destination is recorded even when the instruction wrote the
+  /// value it already held. Off, the trace shows only changes; on, it shows
+  /// every write the encoding performs, which is what a consumer reconciling
+  /// against a disassembler expects.
+  bool unchangedRegisterWrites = true;
   bool memoryAccesses = true;
   bool memoryValues = true;
   /// Total bytes captured around each access; zero disables context.

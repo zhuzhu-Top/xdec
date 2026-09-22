@@ -65,6 +65,7 @@ const std::unordered_map<std::string_view, BuiltinLowering>& loweringTable() {
       {"fneg", {Opcode::ExprUnary, static_cast<uint8_t>(ExprOp::FNeg), false}},
       {"fabs", {Opcode::ExprUnary, static_cast<uint8_t>(ExprOp::FAbs), false}},
       {"fsqrt", {Opcode::ExprUnary, static_cast<uint8_t>(ExprOp::FSqrt), false}},
+      {"fceil", {Opcode::ExprUnary, static_cast<uint8_t>(ExprOp::FCeil), false}},
       {"fcmp_eq", {Opcode::ExprBinary, static_cast<uint8_t>(ExprOp::FCmpEq), false}},
       {"fcmp_lt", {Opcode::ExprBinary, static_cast<uint8_t>(ExprOp::FCmpLt), false}},
       {"fcmp_le", {Opcode::ExprBinary, static_cast<uint8_t>(ExprOp::FCmpLe), false}},

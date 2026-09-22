@@ -137,6 +137,16 @@ insn ldurh {
   }
 }
 
+insn ldursh64 {
+  encoding "01111000100" imm9:9 "00" Rn:5 Rt:5
+  asm "ldursh {Rt:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
+  semantics {
+    write_gpr(Rt, 1,
+              sext(load(read_gpr_sp(Rn, 1) +
+                        imm(sextint(imm9, 9), 64), 16), 64));
+  }
+}
+
 insn stur {
   encoding "1" sz:1 "111000000" imm9:9 "00" Rn:5 Rt:5
   asm "stur {Rt:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
@@ -676,6 +686,25 @@ insn ldaxr {
   }
 }
 
+insn ldxr {
+  encoding "1" sz:1 "00100001011111011111" Rn:5 Rt:5
+  asm "ldxr {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, sz, load(read_gpr_sp(Rn, 1), 32 << sz));
+  }
+}
+
+insn ldaxrb {
+  encoding "0000100001011111111111" Rn:5 Rt:5
+  asm "ldaxrb {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.reserve", read_gpr_sp(Rn, 1));
+    write_gpr(Rt, 0, zext(load(read_gpr_sp(Rn, 1), 8), 32));
+    intrinsic("aarch64.acquire");
+  }
+}
+
 insn stlxr {
   encoding "1" sz:1 "001000000" Rs:5 "111111" Rn:5 Rt:5
   asm "stlxr {Rs:reg(0)}, {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
@@ -687,9 +716,110 @@ insn stlxr {
   }
 }
 
+insn stxr {
+  encoding "1" sz:1 "001000000" Rs:5 "011111" Rn:5 Rt:5
+  asm "stxr {Rs:reg(0)}, {Rt:reg(sz)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1), read_gpr(Rt, sz));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
+insn stlxrb {
+  encoding "00001000000" Rs:5 "111111" Rn:5 Rt:5
+  asm "stlxrb {Rs:reg(0)}, {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    intrinsic("aarch64.release");
+    store(read_gpr_sp(Rn, 1), trunc(read_gpr(Rt, 0), 8));
+    write_gpr(Rs, 0, intrinsic_value("aarch64.store_exclusive_status", 32));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Loads and stores: compare and swap (LSE atomics)
 // ---------------------------------------------------------------------------
+//
+// In the concrete executor there is no contending thread, so SWPALB's
+// observable behavior is an ordered byte load/exchange/store. Capture the
+// source before writing Rt because the architecture permits Rs == Rt.
+insn swpalb {
+  encoding "00111000" "11" "1" Rs:5 "1" "000" "00" Rn:5 Rt:5
+  asm "swpalb {Rs:reg(0)}, {Rt:reg(0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    let source = trunc(read_gpr(Rs, 0), 8);
+    intrinsic("aarch64.release");
+    let old = load(address, 8);
+    store(address, source);
+    intrinsic("aarch64.acquire");
+    write_gpr(Rt, 0, zext(old, 32));
+  }
+}
+
+insn ldadd {
+  encoding size:2 "111000" "00" "1" Rs:5 "0" "000" "00" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "ldadd {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    if size == 2 {
+      let source = read_gpr(Rs, 0);
+      let old = load(address, 32);
+      store(address, old + source);
+      write_gpr(Rt, 0, old);
+    } else {
+      let source = read_gpr(Rs, 1);
+      let old = load(address, 64);
+      store(address, old + source);
+      write_gpr(Rt, 1, old);
+    }
+  }
+}
+
+insn ldaddal {
+  encoding size:2 "111000" "11" "1" Rs:5 "0" "000" "00" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "ldaddal {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    intrinsic("aarch64.release");
+    if size == 2 {
+      let source = read_gpr(Rs, 0);
+      let old = load(address, 32);
+      store(address, old + source);
+      write_gpr(Rt, 0, old);
+    } else {
+      let source = read_gpr(Rs, 1);
+      let old = load(address, 64);
+      store(address, old + source);
+      write_gpr(Rt, 1, old);
+    }
+    intrinsic("aarch64.acquire");
+  }
+}
+
+insn swpal {
+  encoding size:2 "111000" "11" "1" Rs:5 "1" "000" "00" Rn:5 Rt:5
+  require size == 2 || size == 3;
+  asm "swpal {Rs:reg(size == 3 ? 1 : 0)}, {Rt:reg(size == 3 ? 1 : 0)}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    intrinsic("aarch64.release");
+    if size == 2 {
+      let source = read_gpr(Rs, 0);
+      let old = load(address, 32);
+      store(address, source);
+      write_gpr(Rt, 0, old);
+    } else {
+      let source = read_gpr(Rs, 1);
+      let old = load(address, 64);
+      store(address, source);
+      write_gpr(Rt, 1, old);
+    }
+    intrinsic("aarch64.acquire");
+  }
+}
+
 //
 // Word and doubleword only: the byte/halfword forms (casb/cash) and the
 // paired form (casp) share this instruction class but are not modelled yet,

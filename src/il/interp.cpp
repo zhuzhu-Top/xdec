@@ -183,6 +183,14 @@ void Interpreter::resetState() {
   defined_.assign(function_->valueCount(), false);
 }
 
+void Interpreter::rebind(const Function& function) {
+  XDEC_ASSERT(&function.registers() == &function_->registers(),
+             "Interpreter::rebind requires blocks that share one register file");
+  function_ = &function;
+  values_.resize(function_->valueCount());
+  defined_.assign(function_->valueCount(), false);
+}
+
 void Interpreter::writeRegister(RegId reg, ConcreteValue value) {
   const RegisterFile& file = function_->registers();
   const RegisterInfo& info = file[reg];
@@ -507,6 +515,16 @@ Result<ConcreteValue> Interpreter::eval(ExprId id, unsigned depth) {
         return ConcreteValue{args[0].lo & 0x7FFFFFFFull, 0};
       }
       return ConcreteValue{args[0].lo & ~(uint64_t{1} << 63), 0};
+    case ExprOp::FCeil:
+      if (width == 32) {
+        const float value =
+            std::bit_cast<float>(static_cast<uint32_t>(args[0].lo));
+        return ConcreteValue{
+            std::bit_cast<uint32_t>(std::ceil(value)), 0};
+      }
+      return ConcreteValue{
+          std::bit_cast<uint64_t>(std::ceil(std::bit_cast<double>(args[0].lo))),
+          0};
 
     case ExprOp::FCmpEq:
     case ExprOp::FCmpLt:

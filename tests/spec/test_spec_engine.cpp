@@ -145,6 +145,13 @@ TEST_CASE("real Advanced SIMD integer words select exact semantics", "[spec][eng
     CHECK(ruleOf(0x6f7d0420) == "neon_ushr_lanes"); // ushr v0.2d, v1.2d, #3
   }
 
+  SECTION("modified-immediate MOVI and byte CNT / UADDLV") {
+    CHECK(ruleOf(0x6f00e400) == "neon_movi_d");     // movi v0.2d, #0
+    CHECK(ruleOf(0x4f00e400) == "neon_movi_b");     // movi v0.16b, #0
+    CHECK(ruleOf(0x0e205800) == "neon_cnt");        // cnt v0.8b, v0.8b
+    CHECK(ruleOf(0x2e303800) == "neon_uaddlv_8b");  // uaddlv h0, v0.8b
+  }
+
   SECTION("unmodelled EXT remains explicitly unimplemented") {
     // The current DSL cannot prove the field-dependent concatenation width.
     CHECK(ruleOf(0x2e024020) == "simd_fp_unmodelled");
@@ -451,6 +458,112 @@ TEST_CASE("Advanced SIMD integer semantics retain vector data flow", "[spec][eng
   CHECK(text.find("read q2") != std::string::npos);
   CHECK(text.find("write q0") != std::string::npos);
   CHECK(text.find("unimplemented") == std::string::npos);
+}
+
+TEST_CASE("FCVTPU lifts ceil-before-unsigned-conversion semantics",
+          "[spec][engine][float]") {
+  xdec::il::Function function{engine().program().arch,
+                              engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  REQUIRE(engine().elaborate(decode(0x9e290008, 0x1000), site));
+  const std::string text = xdec::il::print(function);
+  INFO(text);
+  CHECK(text.find("read s0") != std::string::npos);
+  CHECK(text.find("fceil:f32") != std::string::npos);
+  CHECK(text.find("fptoint.u:i64") != std::string::npos);
+  CHECK(text.find("write x8") != std::string::npos);
+  CHECK(text.find("unimplemented") == std::string::npos);
+}
+
+TEST_CASE("SWPALB lifts an ordered byte exchange with aliased registers",
+          "[spec][engine][atomic]") {
+  xdec::il::Function function{engine().program().arch,
+                              engine().program().registers, 0x1000};
+  const xdec::il::BlockId block = function.createBlock(0x1000);
+  function.setEntryBlock(block);
+
+  xdec::spec::LiftSite site;
+  site.function = &function;
+  site.block = block;
+  site.address = 0x1000;
+  site.blockAt = [&](uint64_t) { return block; };
+
+  REQUIRE(engine().elaborate(decode(0x38e08020, 0x1000), site));
+  const std::string text = xdec::il::print(function);
+  INFO(text);
+  CHECK(text.find("read w0") != std::string::npos);
+  CHECK(text.find("read x1") != std::string::npos);
+  CHECK(text.find("load:i8") != std::string::npos);
+  CHECK(text.find("store") != std::string::npos);
+  CHECK(text.find("aarch64.release") != std::string::npos);
+  CHECK(text.find("aarch64.acquire") != std::string::npos);
+  CHECK(text.find("write w0") != std::string::npos);
+  CHECK(text.find("intrinsic \"aarch64.memory\"") == std::string::npos);
+}
+
+TEST_CASE("moneyman target instruction families lift without catch-alls",
+          "[spec][engine][simd][atomic][target]") {
+  constexpr std::array<uint32_t, 29> kWords = {
+      0x6f08a402,  // ushll2 v2.8h, v0.16b, #0
+      0x6ea23462,  // cmhi v2.4s, v3.4s, v2.4s
+      0x4e021862,  // uzp1 v2.16b, v3.16b, v2.16b
+      0x6e205800,  // mvn v0.16b, v0.16b
+      0x2ea11c40,  // bit v0.8b, v2.8b, v1.8b
+      0x0e212842,  // xtn v2.8b, v2.8h
+      0x6ee01c41,  // bif v1.16b, v2.16b, v0.16b
+      0x6e631045,  // uaddw2 v5.4s, v2.4s, v3.8h
+      0x2e631043,  // uaddw v3.4s, v2.4s, v3.4h
+      0x4f000743,  // movi v3.4s, #0x1a
+      0x0e010c60,  // dup v0.8b, w3
+      0x6f010722,  // mvni v2.4s, #0x39
+      0x2e641ca2,  // bsl v2.8b, v5.8b, v4.8b
+      0x0e20a822,  // cmlt v2.8b, v1.8b, #0
+      0x6e0c0462,  // mov v2.s[1], v3.s[0]
+      0x0e1f3c0a,  // umov w10, v0.b[15]
+      0x6e004000,  // ext v0.16b, v0.16b, v0.16b, #8
+      0x0d400520,  // ld1 {v0.b}[1], [x9]
+      0x085ffd09,  // ldaxrb w9, [x8]
+      0x080bfd0a,  // stlxrb w11, w10, [x8]
+      0x78801129,  // ldursh x9, [x9, #1]
+      0xb8e00020,  // ldaddal w0, w0, [x1]
+      0xf8e00020,  // ldaddal x0, x0, [x1]
+      0x0d001d40,  // st1 {v0.b}[7], [x10]
+      0x4c408120,  // ld2 {v0.16b, v1.16b}, [x9]
+      0xf8e08020,  // swpal x0, x0, [x1]
+      0xf8200020,  // ldadd x0, x0, [x1]
+      0xc85f7c20,  // ldxr x0, [x1]
+      0xc80f7c31,  // stxr w15, x17, [x1]
+  };
+
+  for (const uint32_t word : kWords) {
+    xdec::il::Function function{engine().program().arch,
+                                engine().program().registers, 0x1000};
+    const xdec::il::BlockId block = function.createBlock(0x1000);
+    function.setEntryBlock(block);
+    xdec::spec::LiftSite site;
+    site.function = &function;
+    site.block = block;
+    site.address = 0x1000;
+    site.blockAt = [&](uint64_t) { return block; };
+
+    CAPTURE(word);
+    const DecodedInsn instruction = decode(word, 0x1000);
+    REQUIRE(instruction.valid);
+    REQUIRE(engine().elaborate(instruction, site));
+    const std::string text = xdec::il::print(function);
+    INFO(text);
+    CHECK(text.find("unimplemented") == std::string::npos);
+    CHECK(text.find("intrinsic \"aarch64.simd-fp\"") == std::string::npos);
+    CHECK(text.find("intrinsic \"aarch64.memory\"") == std::string::npos);
+  }
 }
 
 TEST_CASE("lifted NEON lane arithmetic executes independently per lane", "[spec][engine][simd][exec]") {

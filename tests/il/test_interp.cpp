@@ -336,6 +336,12 @@ TEST_CASE("floating point", "[il][interp]") {
   CHECK(rig.val(rig.function.unary(ExprOp::FAbs, rig.function.constant(
                                                     Type::floating(64), f64(-1.5)))) ==
         c(f64(1.5)));
+  CHECK(rig.val(rig.function.unary(ExprOp::FCeil, rig.function.constant(
+                                                     Type::floating(64), f64(1.25)))) ==
+        c(f64(2.0)));
+  CHECK(rig.val(rig.function.unary(ExprOp::FCeil, rig.function.constant(
+                                                     Type::floating(32), f32(-1.25F)))) ==
+        c(f32(-1.0F)));
 
   SECTION("comparisons are ordered, NaN is not less than anything") {
     const ExprId nan = rig.function.constant(Type::floating(64),
@@ -557,6 +563,24 @@ TEST_CASE("a load and store round trip through the IL", "[il][interp]") {
   REQUIRE(ranges.size() == 1);
   CHECK(ranges[0].address == 0x8004);  // unaligned, as written
   CHECK(ranges[0].size == 8);
+}
+
+TEST_CASE("rebind retargets the interpreter without losing register state",
+         "[il][interp]") {
+  // ExecSession reuses one Interpreter across every block in a session
+  // instead of constructing one per block, so machine state (registers) must
+  // survive rebind() while per-block IL values do not.
+  Rig rig;
+  rig.interp.writeRegister(rig.reg("x0"), c(0x42));
+
+  Function other(Arch::AArch64, xdec::test::arm64Registers(), 0x2000);
+  const BlockId otherBlock = other.createBlock(0x2000);
+  other.appendReturn(otherBlock, 0x2000);
+
+  rig.interp.rebind(other);
+  CHECK(&rig.interp.function() == &other);
+  CHECK(rig.interp.readRegister(rig.reg("x0")) == c(0x42));
+  CHECK(rig.interp.runBlock(otherBlock).stop == ExecStop::Return);
 }
 
 TEST_CASE("a memory fault inside a block is an error, not a guess", "[il][interp]") {

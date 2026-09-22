@@ -59,6 +59,7 @@ namespace {
   X(FNeg, "fneg", 1, 1)                           \
   X(FAbs, "fabs", 1, 1)                           \
   X(FSqrt, "fsqrt", 1, 1)                         \
+  X(FCeil, "fceil", 1, 1)                         \
   X(FCmpEq, "fcmp_eq", 2, 2)                      \
   X(FCmpLt, "fcmp_lt", 2, 2)                      \
   X(FCmpLe, "fcmp_le", 2, 2)                      \
@@ -1546,7 +1547,8 @@ class Checker {
       }
       case Builtin::FNeg:
       case Builtin::FAbs:
-      case Builtin::FSqrt: {
+      case Builtin::FSqrt:
+      case Builtin::FCeil: {
         if (!requireFloat(0)) {
           return SemType::error();
         }

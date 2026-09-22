@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "xdec/il/interp.h"
@@ -61,6 +62,7 @@ struct PageSeed {
 using PageProvider =
     std::function<Result<std::optional<PageSeed>>(uint64_t pageAddress)>;
 using MemoryAccessObserver = std::function<void(const MemoryAccess&)>;
+using AddressCanonicalizer = std::function<uint64_t(uint64_t address)>;
 
 struct MemoryPatch {
   enum class Kind : uint8_t {
@@ -93,6 +95,9 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
  public:
   static constexpr uint64_t kPageSize = il::ExecMemory::kPageSize;
 
+  explicit GuestAddressSpace(AddressCanonicalizer canonicalizer = {})
+      : canonicalizer_(std::move(canonicalizer)) {}
+
   [[nodiscard]] Result<void> map(uint64_t address, uint64_t size,
                                  MemoryPermission permissions);
   [[nodiscard]] Result<void> seed(uint64_t address, std::span<const std::byte> bytes,
@@ -118,6 +123,14 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
                                        std::span<std::byte> out,
                                        MemoryPermission permission =
                                            MemoryPermission::Read) const;
+  /// Reads only pages already resident, never asking the page provider to
+  /// materialize one, and reports failure rather than faulting. Observational
+  /// reads use this: capturing the bytes around an access to describe it must
+  /// not itself fetch memory, which would cost a round trip per access and
+  /// pull in pages the program never touched. Permissions are not checked --
+  /// looking at a page is not the program reading it.
+  [[nodiscard]] bool readResidentBytes(uint64_t address,
+                                       std::span<std::byte> out) const;
   [[nodiscard]] Result<void> writeBytes(uint64_t address,
                                         std::span<const std::byte> bytes);
   [[nodiscard]] Result<void> validate(
@@ -125,7 +138,10 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
   [[nodiscard]] Result<void> apply(std::span<const MemoryPatch> patches);
 
   [[nodiscard]] std::vector<MemoryRange> dirtyRanges() const;
-  void clearDirty() { dirtyBytes_.clear(); }
+  void clearDirty() {
+    dirtyBytes_.clear();
+    dirtyCompactAt_ = kDirtyCompactFloor;
+  }
   [[nodiscard]] uint64_t generationAt(uint64_t address) const;
 
  private:
@@ -138,16 +154,28 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
   [[nodiscard]] uint64_t freshGeneration() const noexcept {
     return nextGeneration_++;
   }
+  [[nodiscard]] uint64_t canonicalize(uint64_t address) const {
+    return canonicalizer_ ? canonicalizer_(address) : address;
+  }
   [[nodiscard]] Result<void> ensure(uint64_t address, uint64_t size,
                                     MemoryPermission permission) const;
   [[nodiscard]] Page* pageAt(uint64_t address);
   [[nodiscard]] const Page* pageAt(uint64_t address) const;
+  void compactDirty();
 
   mutable std::unordered_map<uint64_t, Page> pages_;
+  AddressCanonicalizer canonicalizer_;
   PageProvider provider_;
   mutable MemoryAccessObserver observer_;
   uint64_t instruction_ = 0;
+  // One entry per written byte, appended without checking for repeats because
+  // the write path is hot. A long session rewrites the same stack and heap
+  // bytes constantly, so the raw log is unbounded while the distinct set is
+  // not; compactDirty() folds it down whenever it outgrows the threshold, and
+  // the threshold then tracks the distinct count to keep this amortized.
+  static constexpr std::size_t kDirtyCompactFloor = 1u << 16;
   std::vector<uint64_t> dirtyBytes_;
+  std::size_t dirtyCompactAt_ = kDirtyCompactFloor;
   mutable uint64_t nextGeneration_ = 1;
 };
 

@@ -19,6 +19,34 @@
 // register zero-extended, which is what the architecture does and what removes
 // the need to name a view: `ldr s0` is `v0 = zext(load(addr, 32), 128)`.
 
+fn replace_low_byte(v: bits(128), lane: int(0..7), b: bits(8)) -> bits(128) {
+  let shift = lane * 8;
+  let keep = imm(ones_int(64) ^ (0xff << shift), 64);
+  let low = (extract(v, 0, 64) & keep) |
+            (zext(b, 64) << imm(shift, 64));
+  return concat(extract(v, 64, 64), low);
+}
+
+fn structure_even_bytes64(v: bits(64)) -> bits(32) {
+  return concat(concat(extract(v, 48, 8), extract(v, 32, 8)),
+                concat(extract(v, 16, 8), extract(v, 0, 8)));
+}
+
+fn structure_odd_bytes64(v: bits(64)) -> bits(32) {
+  return concat(concat(extract(v, 56, 8), extract(v, 40, 8)),
+                concat(extract(v, 24, 8), extract(v, 8, 8)));
+}
+
+fn structure_even_bytes128(v: bits(128)) -> bits(64) {
+  return concat(structure_even_bytes64(extract(v, 64, 64)),
+                structure_even_bytes64(extract(v, 0, 64)));
+}
+
+fn structure_odd_bytes128(v: bits(128)) -> bits(64) {
+  return concat(structure_odd_bytes64(extract(v, 64, 64)),
+                structure_odd_bytes64(extract(v, 0, 64)));
+}
+
 insn str_fp_imm_unsigned {
   encoding sz:2 "11110100" imm12:12 Rn:5 Rt:5
   asm "str {Rt:vreg(8 << sz)}, \[{Rn:regsp(1)}, #{imm12 << sz:hex}\]"
@@ -298,5 +326,38 @@ insn ldr_fp_literal {
   asm "ldr {Rt:vreg(32 << opc)}, #{insn_pc + (sextint(imm19, 19) << 2):hex}"
   semantics {
     vec[Rt] = zext(load(imm(insn_pc + (sextint(imm19, 19) << 2), 64), 32 << opc), 128);
+  }
+}
+
+// Advanced SIMD single-structure lane transfers used by the target library.
+insn ld1_byte_lane {
+  encoding "0000110101000000000" lane:3 Rn:5 Rt:5
+  asm "ld1 {Rt:vreg(128)}.b[{lane:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    vec[Rt] = replace_low_byte(vec[Rt], lane,
+                               load(read_gpr_sp(Rn, 1), 8));
+  }
+}
+
+insn st1_byte_lane {
+  encoding "0000110100000000000" lane:3 Rn:5 Rt:5
+  asm "st1 {Rt:vreg(128)}.b[{lane:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    store(read_gpr_sp(Rn, 1), extract(vec[Rt], lane * 8, 8));
+  }
+}
+
+// LD2 {Vt.16B, Vt2.16B}: de-interleave 32 consecutive bytes.
+insn ld2_16b {
+  encoding "0100110001000000100000" Rn:5 "00000"
+  asm "ld2 v0.16b, v1.16b, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    let low = load(address, 128);
+    let high = load(address + imm(16, 64), 128);
+    vec[0] = concat(structure_even_bytes128(high),
+                    structure_even_bytes128(low));
+    vec[1] = concat(structure_odd_bytes128(high),
+                    structure_odd_bytes128(low));
   }
 }
