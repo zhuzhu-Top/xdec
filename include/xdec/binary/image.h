@@ -49,6 +49,10 @@ struct Section {
   /// as a variable, and presenting one as though it were invents a variable that
   /// does not exist.
   bool programData = false;
+  /// The object format explicitly marks this section as machine instructions.
+  /// This is narrower than Execute permission: Mach-O places constants and
+  /// strings in an r-x __TEXT segment too.
+  bool code = false;
   unsigned entrySize = 0;
 
   [[nodiscard]] uint64_t endVa() const noexcept { return va + size; }

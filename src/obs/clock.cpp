@@ -1,7 +1,9 @@
 #include "xdec/obs/clock.h"
 
 #include <atomic>
-#include <charconv>
+#include <cerrno>
+#include <cstdlib>
+#include <string>
 
 namespace xdec::obs {
 namespace {
@@ -37,14 +39,15 @@ bool parseDuration(std::string_view text, std::chrono::nanoseconds& out) noexcep
   if (text.empty()) {
     return false;
   }
-  double value = 0;
-  const char* begin = text.data();
-  const char* end = begin + text.size();
-  const auto parsed = std::from_chars(begin, end, value);
-  if (parsed.ec != std::errc{} || value < 0) {
+  const std::string input{text};
+  char* parsedEnd = nullptr;
+  errno = 0;
+  const double value = std::strtod(input.c_str(), &parsedEnd);
+  if (errno == ERANGE || parsedEnd == input.c_str() || value < 0) {
     return false;
   }
-  const std::string_view unit{parsed.ptr, static_cast<std::size_t>(end - parsed.ptr)};
+  const std::string_view unit{
+      parsedEnd, static_cast<std::size_t>(input.c_str() + input.size() - parsedEnd)};
   double seconds = 0;
   if (unit.empty() || unit == "s") {
     seconds = value;

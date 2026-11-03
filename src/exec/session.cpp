@@ -54,6 +54,7 @@ ExecSession::ExecSession(const spec::SpecEngine& engine,
       sessionId_(nextSessionId.fetch_add(1, std::memory_order_relaxed)),
       configurationValid_(&state_.registers() == &engine.program().registers &&
                           options_.maxBlockInstructions != 0) {
+  cache_ = options_.blockCache != nullptr ? options_.blockCache : &localCache_;
   const il::RegisterFile& registers = state_.registers();
   rootRegisters_.reserve(registers.size());
   for (uint32_t index = 0; index < registers.size(); ++index) {
@@ -219,8 +220,8 @@ ExecResult ExecSession::runLoop() {
     {
       const ScopedTimer lookupTimer{
           perfStats_ == nullptr ? nullptr : &perfStats_->blockLookup};
-      if (const auto found = cache_.find(pc);
-          found != cache_.end() && found->second->validFor(*memory_) &&
+      if (const auto found = cache_->find(pc);
+          found != cache_->end() && found->second->validFor(*memory_) &&
           found->second->instructions.size() <= blockBudget) {
         block = found->second;
         cached = true;
@@ -235,7 +236,7 @@ ExecResult ExecSession::runLoop() {
                           compiled.error().format()};
       }
       block = std::move(*compiled);
-      cache_[pc] = block;
+      (*cache_)[pc] = block;
     }
 
     {

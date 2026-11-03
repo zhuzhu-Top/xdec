@@ -36,6 +36,16 @@ struct ExternalResponse {
   /// with the real backing process. The patches still update guest truth and
   /// trace, but no byte remains pending for a later writeback.
   bool memoryAlreadySynchronized = false;
+  /// The exact input bytes the embedder handed to the real call, captured
+  /// before it ran, as write patches keyed by guest address. This is the
+  /// authoritative "before" image of every input region: a recorder must use it
+  /// rather than re-reading guest memory after the call, because a call that
+  /// consumes or reuses an input buffer -- a Mach out-of-line send hands its
+  /// pages to the kernel and the address is then reused by the next message --
+  /// leaves that memory holding something other than what was sent. Empty for a
+  /// handler that ran no real call, so a reader that finds no covering patch
+  /// falls back to reading guest memory, which is correct when nothing moved.
+  std::vector<MemoryPatch> boundaryInputs;
 };
 
 class IExternalHandler {

@@ -1,8 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <memory>
 #include <vector>
 
@@ -430,6 +432,94 @@ TEST_CASE("already synchronized external effects do not remain dirty",
 
   CHECK(session.run().stop == xdec::exec::SessionStop::Returned);
   CHECK(memory.read(0x2000, 1)->lo == 0x5a);
+  CHECK(memory.dirtyRanges().empty());
+}
+
+namespace {
+
+constexpr auto kReadWrite =
+    xdec::exec::MemoryPermission::Read | xdec::exec::MemoryPermission::Write;
+
+bool sameRanges(const std::vector<xdec::exec::MemoryRange>& actual,
+                std::initializer_list<xdec::exec::MemoryRange> expected) {
+  return std::equal(actual.begin(), actual.end(), expected.begin(),
+                    expected.end(),
+                    [](const xdec::exec::MemoryRange& lhs,
+                       const xdec::exec::MemoryRange& rhs) {
+                      return lhs.address == rhs.address && lhs.size == rhs.size;
+                    });
+}
+
+}  // namespace
+
+TEST_CASE("dirty ranges are exact, deduplicated and coalesced", "[exec]") {
+  xdec::exec::GuestAddressSpace memory;
+  REQUIRE(memory.map(0x10000, 0x3000, kReadWrite));
+
+  REQUIRE(memory.write(0x10010, 1, {0x01, 0}));
+  REQUIRE(memory.write(0x10010, 1, {0x02, 0}));
+  REQUIRE(memory.write(0x10020, 8, {0x1111, 0}));
+  REQUIRE(memory.write(0x10028, 8, {0x2222, 0}));
+  // A run ending on a page boundary continues on the next page.
+  REQUIRE(memory.write(0x10ffc, 4, {0x3333, 0}));
+  REQUIRE(memory.write(0x11000, 4, {0x4444, 0}));
+  // One write spanning two pages.
+  std::array<std::byte, 16> spanning{};
+  REQUIRE(memory.writeBytes(0x11ff8, spanning));
+  // A run crossing a 64-bit word of the page's dirty bitmap.
+  REQUIRE(memory.write(0x12038, 16, {~uint64_t{0}, ~uint64_t{0}}));
+
+  CHECK(sameRanges(memory.dirtyRanges(), {{0x10010, 1},
+                                          {0x10020, 16},
+                                          {0x10ffc, 8},
+                                          {0x11ff8, 16},
+                                          {0x12038, 16}}));
+  CHECK(memory.read(0x10010, 1)->lo == 0x02);
+  CHECK(memory.read(0x12040, 8)->lo == ~uint64_t{0});
+
+  memory.clearDirty();
+  CHECK(memory.dirtyRanges().empty());
+  REQUIRE(memory.write(0x10010, 1, {0x03, 0}));
+  CHECK(sameRanges(memory.dirtyRanges(), {{0x10010, 1}}));
+}
+
+TEST_CASE("a fully written page is one dirty range", "[exec]") {
+  xdec::exec::GuestAddressSpace memory;
+  REQUIRE(memory.map(0x10000, 0x2000, kReadWrite));
+  std::vector<std::byte> page(xdec::exec::GuestAddressSpace::kPageSize,
+                              std::byte{0x7f});
+  REQUIRE(memory.writeBytes(0x10000, page));
+  REQUIRE(memory.write(0x11000, 1, {0x01, 0}));
+  CHECK(sameRanges(memory.dirtyRanges(), {{0x10000, 0x1001}}));
+}
+
+TEST_CASE("unmapping a page drops its dirty bytes", "[exec]") {
+  xdec::exec::GuestAddressSpace memory;
+  REQUIRE(memory.map(0x10000, 0x2000, kReadWrite));
+  REQUIRE(memory.write(0x10008, 8, {0x1234, 0}));
+  REQUIRE(memory.write(0x11008, 8, {0x5678, 0}));
+  REQUIRE(memory.unmap(0x11000, 0x1000));
+  CHECK(sameRanges(memory.dirtyRanges(), {{0x10008, 8}}));
+  // The page cache must not hand back the page that is gone.
+  CHECK_FALSE(memory.read(0x11008, 8));
+
+  // Mapped and written again before a clear: reported once, not twice.
+  REQUIRE(memory.map(0x11000, 0x1000, kReadWrite));
+  REQUIRE(memory.write(0x11010, 4, {0x9abc, 0}));
+  CHECK(sameRanges(memory.dirtyRanges(), {{0x10008, 8}, {0x11010, 4}}));
+  memory.clearDirty();
+  CHECK(memory.dirtyRanges().empty());
+}
+
+TEST_CASE("a write faulting on its second page leaves the first clean",
+          "[exec]") {
+  xdec::exec::GuestAddressSpace memory;
+  REQUIRE(memory.map(0x10000, 0x1000, kReadWrite));
+  REQUIRE(memory.map(0x11000, 0x1000, xdec::exec::MemoryPermission::Read));
+  std::array<std::byte, 8> bytes{};
+  bytes.fill(std::byte{0xee});
+  CHECK_FALSE(memory.writeBytes(0x10ffc, bytes));
+  CHECK(memory.read(0x10ffc, 4)->lo == 0);
   CHECK(memory.dirtyRanges().empty());
 }
 

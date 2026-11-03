@@ -585,6 +585,66 @@ insn ldp_offset {
   }
 }
 
+// Non-temporal integer pairs have ordinary load/store semantics; the
+// non-temporal property is only a cache-allocation hint.
+insn stnp {
+  encoding sz:1 "010100000" imm7:7 Rt2:5 Rn:5 Rt:5
+  asm "stnp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    store(base, read_gpr(Rt, sz));
+    store(base + imm(4 << sz, 64), read_gpr(Rt2, sz));
+  }
+}
+
+insn ldnp {
+  encoding sz:1 "010100001" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  asm "ldnp {Rt:reg(sz)}, {Rt2:reg(sz)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << (2 + sz):dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << (2 + sz), 64);
+    write_gpr(Rt, sz, load(base, 32 << sz));
+    write_gpr(Rt2, sz, load(base + imm(4 << sz, 64), 32 << sz));
+  }
+}
+
+insn ldpsw_offset {
+  encoding "0110100101" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  asm "ldpsw {Rt:reg(1)}, {Rt2:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << 2:dec}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << 2, 64);
+    write_gpr(Rt, 1, sext(load(base, 32), 64));
+    write_gpr(Rt2, 1, sext(load(base + imm(4, 64), 32), 64));
+  }
+}
+
+insn ldpsw_post {
+  encoding "0110100011" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "ldpsw {Rt:reg(1)}, {Rt2:reg(1)}, \[{Rn:regsp(1)}\], #{sextint(imm7, 7) << 2:dec}"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    write_gpr(Rt, 1, sext(load(base, 32), 64));
+    write_gpr(Rt2, 1, sext(load(base + imm(4, 64), 32), 64));
+    write_gpr_sp(Rn, 1, base + imm(sextint(imm7, 7) << 2, 64));
+  }
+}
+
+insn ldpsw_pre {
+  encoding "0110100111" imm7:7 Rt2:5 Rn:5 Rt:5
+  require Rt != Rt2;
+  require Rn == 31 || (Rn != Rt && Rn != Rt2);
+  asm "ldpsw {Rt:reg(1)}, {Rt2:reg(1)}, \[{Rn:regsp(1)}, #{sextint(imm7, 7) << 2:dec}\]!"
+  semantics {
+    let base = read_gpr_sp(Rn, 1) + imm(sextint(imm7, 7) << 2, 64);
+    write_gpr(Rt, 1, sext(load(base, 32), 64));
+    write_gpr(Rt2, 1, sext(load(base + imm(4, 64), 32), 64));
+    write_gpr_sp(Rn, 1, base);
+  }
+}
+
 insn stp_pre {
   encoding sz:1 "010100110" imm7:7 Rt2:5 Rn:5 Rt:5
   require Rn == 31 || (Rn != Rt && Rn != Rt2);
@@ -872,6 +932,31 @@ insn stlxp {
 insn prfm_literal {
   encoding "11011000" imm19:19 prfop:5
   asm "prfm #{prfop:hex}, #{insn_pc + (sextint(imm19, 19) << 2):hex}"
+  semantics {
+    nop();
+  }
+}
+
+insn prfm_imm_unsigned {
+  encoding "1111100110" imm12:12 Rn:5 prfop:5
+  asm "prfm #{prfop:hex}, \[{Rn:regsp(1)}, #{imm12 << 3:dec}\]"
+  semantics {
+    nop();
+  }
+}
+
+insn prfm_reg_offset {
+  encoding "11111000101" Rm:5 option:3 S:1 "10" Rn:5 prfop:5
+  require option == 2 || option == 3 || option == 6 || option == 7;
+  asm "prfm #{prfop:hex}, \[{Rn:regsp(1)}, {Rm:reg(option & 1)}\]"
+  semantics {
+    nop();
+  }
+}
+
+insn prfum {
+  encoding "11111000100" imm9:9 "00" Rn:5 prfop:5
+  asm "prfum #{prfop:hex}, \[{Rn:regsp(1)}, #{sextint(imm9, 9):dec}\]"
   semantics {
     nop();
   }

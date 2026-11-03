@@ -63,6 +63,8 @@ inline constexpr uint64_t kSectionRecordSize = 80;
 // section_64 flags: low byte is the section type.
 inline constexpr uint32_t kSectionTypeMask = 0x000000ffu;
 inline constexpr uint32_t kSZerofill = 1;
+inline constexpr uint32_t kSAttrSomeInstructions = 0x00000400u;
+inline constexpr uint32_t kSAttrPureInstructions = 0x80000000u;
 
 // VM protection bits (segment_command_64.initprot).
 inline constexpr uint32_t kVmProtRead = 1;

@@ -103,10 +103,7 @@ int commandCoverage(std::string_view path, uint64_t limit) {
   // also holds .rodata, and counting string literals as undecoded instructions
   // makes the number meaningless.
   for (const xdec::binary::Section& section : image.sections()) {
-    const bool executable =
-        (section.permissions & xdec::binary::MemoryPermissions::Execute) !=
-        xdec::binary::MemoryPermissions::None;
-    if (!executable || section.zeroFilled || section.size == 0) {
+    if (!section.code || section.zeroFilled || section.size == 0) {
       continue;
     }
     std::vector<std::byte> bytes(static_cast<std::size_t>(section.size));

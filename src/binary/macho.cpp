@@ -936,6 +936,9 @@ class MachOLoader {
       // the tables about the program (symtab, strtab, dyld info bytes) live
       // in __LINKEDIT, which declares no sections at all.
       section.programData = true;
+      section.code =
+          (raw.flags &
+           (kSAttrPureInstructions | kSAttrSomeInstructions)) != 0;
       section.permissions = raw.permissions;
       contents.sections.push_back(std::move(section));
     }

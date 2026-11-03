@@ -75,6 +75,26 @@ def executable_words(path: Path) -> dict[int, list[int]]:
     return locations
 
 
+def traced_pcs(root: Path, image_base: int) -> set[int]:
+    """Reads the compact per-segment PC indexes without loading trace rows.
+
+    xdec_trace stores module-relative PCs in pc.idx. Each index starts with an
+    eight-byte header followed by 16-byte entries: key, posting offset, count.
+    Only the key is needed for an instruction-coverage gate.
+    """
+    result: set[int] = set()
+    for path in root.glob("threads/*/segments/*/pc.idx"):
+        data = path.read_bytes()
+        if len(data) < 8 or (len(data) - 8) % 16 != 0:
+            raise ValueError(f"malformed tracedb PC index: {path}")
+        for offset in range(8, len(data), 16):
+            (pc,) = struct.unpack_from("<Q", data, offset)
+            result.add(image_base + pc)
+    if not result:
+        raise ValueError(f"no PC indexes found under {root}")
+    return result
+
+
 def xdec_decode(
     words: list[int], xdec: Path, spec: Path
 ) -> dict[int, str]:
@@ -103,9 +123,27 @@ def main() -> int:
     parser.add_argument("--xdec", type=Path, required=True)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--details", action="store_true")
+    parser.add_argument(
+        "--tracedb",
+        type=Path,
+        help="only audit PCs executed in this xdec_trace engine directory",
+    )
+    parser.add_argument(
+        "--image-base",
+        type=lambda value: int(value, 0),
+        default=0x100000000,
+        help="preferred image base added to module-relative tracedb PCs",
+    )
     arguments = parser.parse_args()
 
     locations = executable_words(arguments.binary)
+    if arguments.tracedb:
+        executed = traced_pcs(arguments.tracedb, arguments.image_base)
+        locations = {
+            word: [address for address in addresses if address in executed]
+            for word, addresses in locations.items()
+        }
+        locations = {word: addresses for word, addresses in locations.items() if addresses}
     decoded = xdec_decode(sorted(locations), arguments.xdec, arguments.spec)
     disassembler = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
 

@@ -1,6 +1,7 @@
 #include "xdec/exec/memory.h"
 
 #include <algorithm>
+#include <bit>
 #include <format>
 #include <limits>
 #include <utility>
@@ -181,6 +182,7 @@ Result<void> GuestAddressSpace::unmap(uint64_t address, uint64_t size) {
   XDEC_TRY_VOID(ensure(address, size, MemoryPermission::None));
   const uint64_t first = pageBase(address);
   const uint64_t last = pageBase(address + size - 1);
+  cache_.forget();
   for (uint64_t page = first;; page += kPageSize) {
     pages_.erase(page);
     if (page == last) {
@@ -220,31 +222,7 @@ Result<void> GuestAddressSpace::ensure(uint64_t address, uint64_t size,
   }
   const uint64_t last = pageBase(address + size - 1);
   for (uint64_t page = pageBase(address);; page += kPageSize) {
-    auto found = pages_.find(page);
-    if (found == pages_.end() && provider_) {
-      XDEC_TRY(auto supplied, provider_(page));
-      if (supplied.has_value()) {
-        Page materialized;
-        materialized.bytes = supplied->bytes;
-        materialized.permissions = supplied->permissions;
-        materialized.generation = freshGeneration();
-        found = pages_.emplace(page, std::move(materialized)).first;
-      }
-    }
-    if (found == pages_.end()) {
-      return err(Diag{DiagCode::UnmappedAddress, "guest memory page is unmapped"}
-                     .at(page));
-    }
-    if (permission != MemoryPermission::None &&
-        !hasPermission(found->second.permissions, permission)) {
-      return err(Diag{DiagCode::OutOfRange,
-                      std::format("guest page lacks {} permission",
-                                  permission == MemoryPermission::Read
-                                      ? "read"
-                                      : permission == MemoryPermission::Write ? "write"
-                                                                             : "execute")}
-                     .at(page));
-    }
+    XDEC_TRY_VOID(residentPage(page, permission));
     if (page == last) {
       break;
     }
@@ -252,14 +230,64 @@ Result<void> GuestAddressSpace::ensure(uint64_t address, uint64_t size,
   return ok();
 }
 
+Result<GuestAddressSpace::Page*> GuestAddressSpace::residentPage(
+    uint64_t page, MemoryPermission permission) const {
+  Page* found = lookup(page);
+  if (found == nullptr && provider_) {
+    XDEC_TRY(auto supplied, provider_(page));
+    if (supplied.has_value()) {
+      Page materialized;
+      materialized.bytes = supplied->bytes;
+      materialized.permissions = supplied->permissions;
+      materialized.generation = freshGeneration();
+      found = &pages_.emplace(page, std::move(materialized)).first->second;
+      cache_.base = page;
+      cache_.page = found;
+    }
+  }
+  if (found == nullptr) {
+    return err(Diag{DiagCode::UnmappedAddress, "guest memory page is unmapped"}
+                   .at(page));
+  }
+  if (permission != MemoryPermission::None &&
+      !hasPermission(found->permissions, permission)) {
+    return err(Diag{DiagCode::OutOfRange,
+                    std::format("guest page lacks {} permission",
+                                permission == MemoryPermission::Read
+                                    ? "read"
+                                    : permission == MemoryPermission::Write ? "write"
+                                                                           : "execute")}
+                   .at(page));
+  }
+  return found;
+}
+
 Result<void> GuestAddressSpace::readBytes(uint64_t address,
                                           std::span<std::byte> out,
                                           MemoryPermission permission) const {
   address = canonicalize(address);
+  const std::size_t offset = static_cast<std::size_t>(address & (kPageSize - 1));
+  if (!out.empty() && offset + out.size() <= kPageSize) {
+    XDEC_TRY(const Page* page, residentPage(pageBase(address), permission));
+    std::copy_n(page->bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+                out.size(), out.begin());
+    return ok();
+  }
   XDEC_TRY_VOID(ensure(address, out.size(), permission));
-  for (std::size_t index = 0; index < out.size(); ++index) {
-    const Page* page = pageAt(address + index);
-    out[index] = page->bytes[(address + index) & (kPageSize - 1)];
+  std::size_t copied = 0;
+  while (copied < out.size()) {
+    const uint64_t cursor = address + copied;
+    const std::size_t pageOffset =
+        static_cast<std::size_t>(cursor & (kPageSize - 1));
+    const std::size_t chunk =
+        std::min(out.size() - copied,
+                 static_cast<std::size_t>(kPageSize) - pageOffset);
+    const Page* page = pageAt(cursor);
+    std::copy_n(page->bytes.begin() +
+                    static_cast<std::ptrdiff_t>(pageOffset),
+                chunk,
+                out.begin() + static_cast<std::ptrdiff_t>(copied));
+    copied += chunk;
   }
   return ok();
 }
@@ -275,16 +303,27 @@ bool GuestAddressSpace::readResidentBytes(uint64_t address,
   }
   const uint64_t last = pageBase(address + out.size() - 1);
   for (uint64_t page = pageBase(address);; page += kPageSize) {
-    if (!pages_.contains(page)) {
+    if (lookup(page) == nullptr) {
       return false;
     }
     if (page == last) {
       break;
     }
   }
-  for (std::size_t index = 0; index < out.size(); ++index) {
-    const Page* page = pageAt(address + index);
-    out[index] = page->bytes[(address + index) & (kPageSize - 1)];
+  std::size_t copied = 0;
+  while (copied < out.size()) {
+    const uint64_t cursor = address + copied;
+    const std::size_t pageOffset =
+        static_cast<std::size_t>(cursor & (kPageSize - 1));
+    const std::size_t chunk =
+        std::min(out.size() - copied,
+                 static_cast<std::size_t>(kPageSize) - pageOffset);
+    const Page* page = pageAt(cursor);
+    std::copy_n(page->bytes.begin() +
+                    static_cast<std::ptrdiff_t>(pageOffset),
+                chunk,
+                out.begin() + static_cast<std::ptrdiff_t>(copied));
+    copied += chunk;
   }
   return true;
 }
@@ -299,13 +338,12 @@ Result<void> GuestAddressSpace::refresh(uint64_t address, uint64_t size) {
   }
   const uint64_t last = pageBase(address + size - 1);
   for (uint64_t page = pageBase(address);; page += kPageSize) {
-    auto found = pages_.find(page);
-    if (found != pages_.end()) {
+    if (Page* found = lookup(page); found != nullptr) {
       XDEC_TRY(auto supplied, provider_(page));
       if (supplied.has_value()) {
-        found->second.bytes = supplied->bytes;
-        found->second.permissions = supplied->permissions;
-        found->second.generation = freshGeneration();
+        found->bytes = supplied->bytes;
+        found->permissions = supplied->permissions;
+        found->generation = freshGeneration();
       }
     }
     if (page == last) {
@@ -321,24 +359,54 @@ Result<void> GuestAddressSpace::writeBytes(uint64_t address,
   if (bytes.empty()) {
     return ok();
   }
+  const std::size_t offset = static_cast<std::size_t>(address & (kPageSize - 1));
+  if (offset + bytes.size() <= kPageSize) {
+    const uint64_t base = pageBase(address);
+    XDEC_TRY(Page* page, residentPage(base, MemoryPermission::Write));
+    std::copy_n(bytes.begin(), bytes.size(),
+                page->bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+    markDirty(*page, base, offset, bytes.size());
+    page->generation = freshGeneration();
+    return ok();
+  }
+  // Spanning pages: every page is checked before any is written, so a write
+  // that faults on its second page leaves the first untouched.
   XDEC_TRY_VOID(ensure(address, bytes.size(), MemoryPermission::Write));
-  for (std::size_t index = 0; index < bytes.size(); ++index) {
-    const uint64_t va = address + index;
-    Page* page = pageAt(va);
-    page->bytes[va & (kPageSize - 1)] = bytes[index];
-    dirtyBytes_.push_back(va);
-  }
-  if (dirtyBytes_.size() >= dirtyCompactAt_) {
-    compactDirty();
-  }
-  const uint64_t last = pageBase(address + bytes.size() - 1);
-  for (uint64_t page = pageBase(address);; page += kPageSize) {
-    pages_.at(page).generation = freshGeneration();
-    if (page == last) {
-      break;
-    }
+  std::size_t copied = 0;
+  while (copied < bytes.size()) {
+    const uint64_t cursor = address + copied;
+    const std::size_t pageOffset =
+        static_cast<std::size_t>(cursor & (kPageSize - 1));
+    const std::size_t chunk =
+        std::min(bytes.size() - copied,
+                 static_cast<std::size_t>(kPageSize) - pageOffset);
+    Page* page = pageAt(cursor);
+    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(copied), chunk,
+                page->bytes.begin() +
+                    static_cast<std::ptrdiff_t>(pageOffset));
+    markDirty(*page, pageBase(cursor), pageOffset, chunk);
+    page->generation = freshGeneration();
+    copied += chunk;
   }
   return ok();
+}
+
+void GuestAddressSpace::markDirty(Page& page, uint64_t base,
+                                  std::size_t offset, std::size_t size) {
+  if (!page.dirtyListed) {
+    page.dirtyListed = true;
+    dirtyPages_.push_back(base);
+  }
+  while (size != 0) {
+    const std::size_t word = offset / kDirtyWordBits;
+    const std::size_t bit = offset % kDirtyWordBits;
+    const std::size_t take = std::min(kDirtyWordBits - bit, size);
+    const uint64_t ones =
+        take == kDirtyWordBits ? ~uint64_t{0} : (uint64_t{1} << take) - 1;
+    page.dirty[word] |= ones << bit;
+    offset += take;
+    size -= take;
+  }
 }
 
 Result<il::ConcreteValue> GuestAddressSpace::read(uint64_t address,
@@ -506,35 +574,58 @@ Result<void> GuestAddressSpace::apply(std::span<const MemoryPatch> patches) {
   return ok();
 }
 
-void GuestAddressSpace::compactDirty() {
-  std::sort(dirtyBytes_.begin(), dirtyBytes_.end());
-  dirtyBytes_.erase(std::unique(dirtyBytes_.begin(), dirtyBytes_.end()),
-                    dirtyBytes_.end());
-  // Leaving headroom proportional to what survived keeps compaction amortized:
-  // a session whose distinct set already sits at the threshold would otherwise
-  // re-sort on nearly every write.
-  dirtyCompactAt_ = std::max(kDirtyCompactFloor, dirtyBytes_.size() * 2);
+std::vector<MemoryRange> GuestAddressSpace::dirtyRanges() const {
+  std::vector<uint64_t> pages = dirtyPages_;
+  std::sort(pages.begin(), pages.end());
+  pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+
+  std::vector<MemoryRange> ranges;
+  const auto emit = [&ranges](uint64_t address, uint64_t size) {
+    // A run that ends on a page boundary continues on the next page when that
+    // page's run starts at offset zero; reporting them as one range is what
+    // the byte-at-a-time log produced.
+    if (!ranges.empty() &&
+        ranges.back().address + ranges.back().size == address) {
+      ranges.back().size += size;
+    } else {
+      ranges.push_back(MemoryRange{address, size});
+    }
+  };
+
+  for (const uint64_t base : pages) {
+    const Page* page = lookup(base);
+    if (page == nullptr) continue;
+    std::size_t index = 0;
+    while (index < kPageSize) {
+      const std::size_t word = index / kDirtyWordBits;
+      const uint64_t pending = page->dirty[word] >> (index % kDirtyWordBits);
+      if (pending == 0) {
+        index = (word + 1) * kDirtyWordBits;
+        continue;
+      }
+      index += static_cast<std::size_t>(std::countr_zero(pending));
+      const std::size_t start = index;
+      while (index < kPageSize) {
+        const std::size_t bit = index % kDirtyWordBits;
+        const auto run = static_cast<std::size_t>(
+            std::countr_one(page->dirty[index / kDirtyWordBits] >> bit));
+        index += run;
+        if (bit + run < kDirtyWordBits) break;
+      }
+      emit(base + start, index - start);
+    }
+  }
+  return ranges;
 }
 
-std::vector<MemoryRange> GuestAddressSpace::dirtyRanges() const {
-  if (dirtyBytes_.empty()) {
-    return {};
-  }
-  std::vector<uint64_t> sorted = dirtyBytes_;
-  std::sort(sorted.begin(), sorted.end());
-  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
-  std::vector<MemoryRange> ranges;
-  uint64_t start = sorted.front();
-  uint64_t previous = start;
-  for (const uint64_t address : sorted) {
-    if (address > previous + 1) {
-      ranges.push_back(MemoryRange{start, previous - start + 1});
-      start = address;
+void GuestAddressSpace::clearDirty() {
+  for (const uint64_t base : dirtyPages_) {
+    if (Page* page = lookup(base); page != nullptr) {
+      page->dirty.fill(0);
+      page->dirtyListed = false;
     }
-    previous = address;
   }
-  ranges.push_back(MemoryRange{start, previous - start + 1});
-  return ranges;
+  dirtyPages_.clear();
 }
 
 uint64_t GuestAddressSpace::generationAt(uint64_t address) const {
@@ -542,14 +633,21 @@ uint64_t GuestAddressSpace::generationAt(uint64_t address) const {
   return page == nullptr ? 0 : page->generation;
 }
 
+GuestAddressSpace::Page* GuestAddressSpace::lookup(uint64_t page) const {
+  if (cache_.base == page) return cache_.page;
+  const auto found = pages_.find(page);
+  if (found == pages_.end()) return nullptr;
+  cache_.base = page;
+  cache_.page = &found->second;
+  return cache_.page;
+}
+
 GuestAddressSpace::Page* GuestAddressSpace::pageAt(uint64_t address) {
-  const auto found = pages_.find(pageBase(address));
-  return found == pages_.end() ? nullptr : &found->second;
+  return lookup(pageBase(address));
 }
 
 const GuestAddressSpace::Page* GuestAddressSpace::pageAt(uint64_t address) const {
-  const auto found = pages_.find(pageBase(address));
-  return found == pages_.end() ? nullptr : &found->second;
+  return lookup(pageBase(address));
 }
 
 }  // namespace xdec::exec

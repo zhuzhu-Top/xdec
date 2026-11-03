@@ -146,18 +146,50 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
   /// guest's own state. Without a provider it does nothing.
   [[nodiscard]] Result<void> refresh(uint64_t address, uint64_t size);
 
+  /// Every byte written through writeBytes since the last clearDirty, as
+  /// sorted, coalesced ranges. Bytes on pages unmapped since then are gone
+  /// with the page and are not reported.
   [[nodiscard]] std::vector<MemoryRange> dirtyRanges() const;
-  void clearDirty() {
-    dirtyBytes_.clear();
-    dirtyCompactAt_ = kDirtyCompactFloor;
-  }
+  void clearDirty();
   [[nodiscard]] uint64_t generationAt(uint64_t address) const;
 
  private:
+  static constexpr std::size_t kDirtyWordBits = 64;
+  static_assert(kPageSize % kDirtyWordBits == 0);
+  static constexpr std::size_t kDirtyWords = kPageSize / kDirtyWordBits;
+
   struct Page {
     std::array<std::byte, kPageSize> bytes{};
     MemoryPermission permissions = MemoryPermission::None;
     uint64_t generation = 0;
+    /// One bit per byte written since the last clearDirty. Marking a write
+    /// costs the same however much has been written before it, which a log of
+    /// written addresses cannot offer: that log grows with the trace, and
+    /// every operation on it grew with it.
+    std::array<uint64_t, kDirtyWords> dirty{};
+    /// Whether this page is already in dirtyPages_, so it is listed once.
+    bool dirtyListed = false;
+  };
+
+  /// The page the previous access resolved. Accesses are overwhelmingly local
+  /// -- a stack frame, a structure, a buffer being filled -- so most of them
+  /// skip the hash lookup. A copy starts empty rather than pointing into the
+  /// source's map.
+  struct PageCache {
+    static constexpr uint64_t kNoPage = 1;  // never page-aligned
+    uint64_t base = kNoPage;
+    Page* page = nullptr;
+
+    PageCache() = default;
+    PageCache(const PageCache&) noexcept {}
+    PageCache& operator=(const PageCache&) noexcept {
+      forget();
+      return *this;
+    }
+    void forget() noexcept {
+      base = kNoPage;
+      page = nullptr;
+    }
   };
 
   [[nodiscard]] uint64_t freshGeneration() const noexcept {
@@ -168,23 +200,28 @@ class GuestAddressSpace final : public il::ExecMemoryBackend {
   }
   [[nodiscard]] Result<void> ensure(uint64_t address, uint64_t size,
                                     MemoryPermission permission) const;
+  /// The page at `page` (a page base), materialized from the provider when it
+  /// is missing and checked for `permission`. The single lookup every access
+  /// path goes through.
+  [[nodiscard]] Result<Page*> residentPage(uint64_t page,
+                                           MemoryPermission permission) const;
+  /// The resident page at `page` (a page base), or null. Never fetches.
+  [[nodiscard]] Page* lookup(uint64_t page) const;
   [[nodiscard]] Page* pageAt(uint64_t address);
   [[nodiscard]] const Page* pageAt(uint64_t address) const;
-  void compactDirty();
+  void markDirty(Page& page, uint64_t base, std::size_t offset,
+                 std::size_t size);
 
   mutable std::unordered_map<uint64_t, Page> pages_;
+  mutable PageCache cache_;
   AddressCanonicalizer canonicalizer_;
   PageProvider provider_;
   mutable MemoryAccessObserver observer_;
   uint64_t instruction_ = 0;
-  // One entry per written byte, appended without checking for repeats because
-  // the write path is hot. A long session rewrites the same stack and heap
-  // bytes constantly, so the raw log is unbounded while the distinct set is
-  // not; compactDirty() folds it down whenever it outgrows the threshold, and
-  // the threshold then tracks the distinct count to keep this amortized.
-  static constexpr std::size_t kDirtyCompactFloor = 1u << 16;
-  std::vector<uint64_t> dirtyBytes_;
-  std::size_t dirtyCompactAt_ = kDirtyCompactFloor;
+  /// Pages with at least one dirty bit, in the order they became dirty. May
+  /// name a page that was unmapped, or name one twice if it was unmapped and
+  /// mapped again; readers skip the former and deduplicate the latter.
+  std::vector<uint64_t> dirtyPages_;
   mutable uint64_t nextGeneration_ = 1;
 };
 

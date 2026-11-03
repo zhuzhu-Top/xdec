@@ -51,6 +51,9 @@ struct ExecSessionPerfStats {
   PerfCounter dirtyScan;
 };
 
+using ExecBlockCache =
+    std::unordered_map<uint64_t, std::shared_ptr<ExecBlock>>;
+
 enum class SessionStop : uint8_t {
   Returned,
   InstructionBudget,
@@ -75,6 +78,10 @@ struct ExecOptions {
   // boundary; an embedder that tells the far side exactly which ranges to
   // synchronize never reads it and should not pay for it.
   bool externalDirtyRanges = true;
+  // Optional cache shared by sessions that execute the same image and address
+  // space. Long-lived embedders can retain lifted blocks across callbacks;
+  // null preserves the traditional session-local cache.
+  ExecBlockCache* blockCache = nullptr;
   // A client-supplied code-domain boundary. Taken branches for which this
   // returns true are treated as tail calls into an external environment.
   std::function<bool(uint64_t from, uint64_t target)> externalBranch;
@@ -117,7 +124,7 @@ class ExecSession {
                                   const ExternalResponse& response);
 
   [[nodiscard]] std::size_t cachedBlockCount() const noexcept {
-    return cache_.size();
+    return cache_->size();
   }
 
  private:
@@ -137,7 +144,8 @@ class ExecSession {
   IExecObserver* observer_ = nullptr;
   IExternalHandler* handler_ = nullptr;
   ExecSessionPerfStats* perfStats_ = nullptr;
-  std::unordered_map<uint64_t, std::shared_ptr<ExecBlock>> cache_;
+  ExecBlockCache localCache_;
+  ExecBlockCache* cache_ = nullptr;
   // The register file's full registers, resolved once. State transfer only
   // ever touches roots, and re-deriving them per block meant walking every
   // sub-register view (w0, s0, d0, ...) and its parent chain on a path that

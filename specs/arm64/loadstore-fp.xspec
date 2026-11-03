@@ -79,6 +79,117 @@ fn structure_odd_bytes128(v: bits(128)) -> bits(64) {
                 structure_odd_bytes64(extract(v, 0, 64)));
 }
 
+fn structure_bytes_mod4_0(v: bits(128)) -> bits(32) {
+  return structure_even_bytes64(structure_even_bytes128(v));
+}
+
+fn structure_bytes_mod4_1(v: bits(128)) -> bits(32) {
+  return structure_even_bytes64(structure_odd_bytes128(v));
+}
+
+fn structure_bytes_mod4_2(v: bits(128)) -> bits(32) {
+  return structure_odd_bytes64(structure_even_bytes128(v));
+}
+
+fn structure_bytes_mod4_3(v: bits(128)) -> bits(32) {
+  return structure_odd_bytes64(structure_odd_bytes128(v));
+}
+
+fn structure_halfwords_mod4_0(v: bits(128)) -> bits(32) {
+  return concat(extract(v, 64, 16), extract(v, 0, 16));
+}
+
+fn structure_halfwords_mod4_1(v: bits(128)) -> bits(32) {
+  return concat(extract(v, 80, 16), extract(v, 16, 16));
+}
+
+fn structure_halfwords_mod4_2(v: bits(128)) -> bits(32) {
+  return concat(extract(v, 96, 16), extract(v, 32, 16));
+}
+
+fn structure_halfwords_mod4_3(v: bits(128)) -> bits(32) {
+  return concat(extract(v, 112, 16), extract(v, 48, 16));
+}
+
+// Pack one 64-bit half from two or four structure registers in architectural
+// lane order. These helpers are shared by every element arrangement.
+fn interleave2_half(lane_bits: int, a: bits(64), b: bits(64)) -> bits(128) {
+  if lane_bits == 8 {
+    return concat(
+        concat(concat(concat(extract(b, 56, 8), extract(a, 56, 8)),
+                      concat(extract(b, 48, 8), extract(a, 48, 8))),
+               concat(concat(extract(b, 40, 8), extract(a, 40, 8)),
+                      concat(extract(b, 32, 8), extract(a, 32, 8)))),
+        concat(concat(concat(extract(b, 24, 8), extract(a, 24, 8)),
+                      concat(extract(b, 16, 8), extract(a, 16, 8))),
+               concat(concat(extract(b, 8, 8), extract(a, 8, 8)),
+                      concat(extract(b, 0, 8), extract(a, 0, 8)))));
+  } else if lane_bits == 16 {
+    return concat(
+        concat(concat(extract(b, 48, 16), extract(a, 48, 16)),
+               concat(extract(b, 32, 16), extract(a, 32, 16))),
+        concat(concat(extract(b, 16, 16), extract(a, 16, 16)),
+               concat(extract(b, 0, 16), extract(a, 0, 16))));
+  } else if lane_bits == 32 {
+    return concat(concat(extract(b, 32, 32), extract(a, 32, 32)),
+                  concat(extract(b, 0, 32), extract(a, 0, 32)));
+  } else {
+    return concat(b, a);
+  }
+}
+
+fn interleave4_first(lane_bits: int, a: bits(64), b: bits(64),
+                     c: bits(64), d: bits(64)) -> bits(128) {
+  if lane_bits == 8 {
+    return concat(
+        concat(concat(concat(extract(d, 24, 8), extract(c, 24, 8)),
+                      concat(extract(b, 24, 8), extract(a, 24, 8))),
+               concat(concat(extract(d, 16, 8), extract(c, 16, 8)),
+                      concat(extract(b, 16, 8), extract(a, 16, 8)))),
+        concat(concat(concat(extract(d, 8, 8), extract(c, 8, 8)),
+                      concat(extract(b, 8, 8), extract(a, 8, 8))),
+               concat(concat(extract(d, 0, 8), extract(c, 0, 8)),
+                      concat(extract(b, 0, 8), extract(a, 0, 8)))));
+  } else if lane_bits == 16 {
+    return concat(
+        concat(concat(extract(d, 16, 16), extract(c, 16, 16)),
+               concat(extract(b, 16, 16), extract(a, 16, 16))),
+        concat(concat(extract(d, 0, 16), extract(c, 0, 16)),
+               concat(extract(b, 0, 16), extract(a, 0, 16))));
+  } else if lane_bits == 32 {
+    return concat(concat(extract(d, 0, 32), extract(c, 0, 32)),
+                  concat(extract(b, 0, 32), extract(a, 0, 32)));
+  } else {
+    return concat(b, a);
+  }
+}
+
+fn interleave4_second(lane_bits: int, a: bits(64), b: bits(64),
+                      c: bits(64), d: bits(64)) -> bits(128) {
+  if lane_bits == 8 {
+    return concat(
+        concat(concat(concat(extract(d, 56, 8), extract(c, 56, 8)),
+                      concat(extract(b, 56, 8), extract(a, 56, 8))),
+               concat(concat(extract(d, 48, 8), extract(c, 48, 8)),
+                      concat(extract(b, 48, 8), extract(a, 48, 8)))),
+        concat(concat(concat(extract(d, 40, 8), extract(c, 40, 8)),
+                      concat(extract(b, 40, 8), extract(a, 40, 8))),
+               concat(concat(extract(d, 32, 8), extract(c, 32, 8)),
+                      concat(extract(b, 32, 8), extract(a, 32, 8)))));
+  } else if lane_bits == 16 {
+    return concat(
+        concat(concat(extract(d, 48, 16), extract(c, 48, 16)),
+               concat(extract(b, 48, 16), extract(a, 48, 16))),
+        concat(concat(extract(d, 32, 16), extract(c, 32, 16)),
+               concat(extract(b, 32, 16), extract(a, 32, 16))));
+  } else if lane_bits == 32 {
+    return concat(concat(extract(d, 32, 32), extract(c, 32, 32)),
+                  concat(extract(b, 32, 32), extract(a, 32, 32)));
+  } else {
+    return concat(d, c);
+  }
+}
+
 insn str_fp_imm_unsigned {
   encoding sz:2 "11110100" imm12:12 Rn:5 Rt:5
   asm "str {Rt:vreg(8 << sz)}, \[{Rn:regsp(1)}, #{imm12 << sz:hex}\]"
@@ -530,6 +641,128 @@ insn st1_single_64 {
   }
 }
 
+// Single-structure stores write the selected lane from consecutive registers.
+// The register list wraps modulo 32 and post-index accepts either the encoded
+// structure size or a general-purpose register.
+insn st2_single_8 {
+  encoding "0" Q:1 "001101" post:1 "0" "1" Rm:5 "000" S:1 size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st2 \{{Rt:vreg(128)}.b, ...\}[{Q * 8 + S * 4 + size:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    let lane = (Q * 8 + S * 4 + size) * 8;
+    store(base, extract(vec[Rt], lane, 8));
+    store(base + imm(1, 64), extract(vec[(Rt + 1) & 31], lane, 8));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(2, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn st4_single_8 {
+  encoding "0" Q:1 "001101" post:1 "0" "1" Rm:5 "001" S:1 size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st4 \{{Rt:vreg(128)}.b, ...\}[{Q * 8 + S * 4 + size:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    let lane = (Q * 8 + S * 4 + size) * 8;
+    store(base, extract(vec[Rt], lane, 8));
+    store(base + imm(1, 64), extract(vec[(Rt + 1) & 31], lane, 8));
+    store(base + imm(2, 64), extract(vec[(Rt + 2) & 31], lane, 8));
+    store(base + imm(3, 64), extract(vec[(Rt + 3) & 31], lane, 8));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(4, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+// LD4 single-structure forms load one lane in each of four consecutive vector
+// registers. The memory elements are contiguous and the register list wraps.
+insn ld4_single_8 {
+  encoding "0" Q:1 "001101" post:1 "1" "1" Rm:5 "001" S:1 size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.b, ...\}[{Q * 8 + S * 4 + size:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, (S * 4 + size) * 8, 0xff,
+                          zext(load(base, 8), 64));
+    vec[(Rt + 1) & 31] = insert_lane(vec[(Rt + 1) & 31], Q,
+        (S * 4 + size) * 8, 0xff, zext(load(base + imm(1, 64), 8), 64));
+    vec[(Rt + 2) & 31] = insert_lane(vec[(Rt + 2) & 31], Q,
+        (S * 4 + size) * 8, 0xff, zext(load(base + imm(2, 64), 8), 64));
+    vec[(Rt + 3) & 31] = insert_lane(vec[(Rt + 3) & 31], Q,
+        (S * 4 + size) * 8, 0xff, zext(load(base + imm(3, 64), 8), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(4, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld4_single_16 {
+  encoding "0" Q:1 "001101" post:1 "1" "1" Rm:5 "011" S:1 sizehi:1 "0" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.h, ...\}[{Q * 4 + S * 2 + sizehi:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, (S * 2 + sizehi) * 16, 0xffff,
+                          zext(load(base, 16), 64));
+    vec[(Rt + 1) & 31] = insert_lane(vec[(Rt + 1) & 31], Q,
+        (S * 2 + sizehi) * 16, 0xffff, zext(load(base + imm(2, 64), 16), 64));
+    vec[(Rt + 2) & 31] = insert_lane(vec[(Rt + 2) & 31], Q,
+        (S * 2 + sizehi) * 16, 0xffff, zext(load(base + imm(4, 64), 16), 64));
+    vec[(Rt + 3) & 31] = insert_lane(vec[(Rt + 3) & 31], Q,
+        (S * 2 + sizehi) * 16, 0xffff, zext(load(base + imm(6, 64), 16), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(8, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld4_single_32 {
+  encoding "0" Q:1 "001101" post:1 "1" "1" Rm:5 "101" S:1 "00" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.s, ...\}[{Q * 2 + S:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, S * 32, 0xffffffff,
+                          zext(load(base, 32), 64));
+    vec[(Rt + 1) & 31] = insert_lane(vec[(Rt + 1) & 31], Q, S * 32,
+        0xffffffff, zext(load(base + imm(4, 64), 32), 64));
+    vec[(Rt + 2) & 31] = insert_lane(vec[(Rt + 2) & 31], Q, S * 32,
+        0xffffffff, zext(load(base + imm(8, 64), 32), 64));
+    vec[(Rt + 3) & 31] = insert_lane(vec[(Rt + 3) & 31], Q, S * 32,
+        0xffffffff, zext(load(base + imm(12, 64), 32), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(16, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld4_single_64 {
+  encoding "0" Q:1 "001101" post:1 "1" "1" Rm:5 "101" "0" "01" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.d, ...\}[{Q:dec}], \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    vec[Rt] = insert_lane(vec[Rt], Q, 0, ones_int(64), load(base, 64));
+    vec[(Rt + 1) & 31] = insert_lane(vec[(Rt + 1) & 31], Q, 0,
+        ones_int(64), load(base + imm(8, 64), 64));
+    vec[(Rt + 2) & 31] = insert_lane(vec[(Rt + 2) & 31], Q, 0,
+        ones_int(64), load(base + imm(16, 64), 64));
+    vec[(Rt + 3) & 31] = insert_lane(vec[(Rt + 3) & 31], Q, 0,
+        ones_int(64), load(base + imm(24, 64), 64));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   base + (Rm == 31 ? imm(32, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
 // LD1R loads one element and fills every lane with it. Q selects whether the
 // upper half is written too; the architecture zeroes it when Q is clear,
 // which is what makes a load of the 64-bit form observable as a full write.
@@ -575,5 +808,163 @@ insn ld2_16b {
                     structure_even_bytes128(low));
     vec[1] = concat(structure_odd_bytes128(high),
                     structure_odd_bytes128(low));
+  }
+}
+
+// Multiple-structure stores interleave equal-width lanes from consecutive
+// vector registers. Q selects a 64- or 128-bit source from each register.
+insn st2_multiple {
+  encoding "0" Q:1 "001100" post:1 "0" "0" Rm:5 "1000" size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st2 \{{Rt:vreg(64 << Q)}, ...\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, interleave2_half(8 << size, vec[Rt].d,
+                                 vec[(Rt + 1) & 31].d));
+    if Q == 1 {
+      store(base + imm(16, 64),
+            interleave2_half(8 << size, extract(vec[Rt], 64, 64),
+                extract(vec[(Rt + 1) & 31], 64, 64)));
+    }
+    if post == 1 {
+      write_gpr_sp(Rn, 1, base + (Rm == 31
+          ? imm(16 << Q, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn st4_multiple {
+  encoding "0" Q:1 "001100" post:1 "0" "0" Rm:5 "0000" size:2 Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "st4 \{{Rt:vreg(64 << Q)}, ...\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let base = read_gpr_sp(Rn, 1);
+    store(base, interleave4_first(8 << size, vec[Rt].d,
+        vec[(Rt + 1) & 31].d, vec[(Rt + 2) & 31].d,
+        vec[(Rt + 3) & 31].d));
+    store(base + imm(16, 64), interleave4_second(8 << size, vec[Rt].d,
+        vec[(Rt + 1) & 31].d, vec[(Rt + 2) & 31].d,
+        vec[(Rt + 3) & 31].d));
+    if Q == 1 {
+      store(base + imm(32, 64), interleave4_first(8 << size,
+          extract(vec[Rt], 64, 64),
+          extract(vec[(Rt + 1) & 31], 64, 64),
+          extract(vec[(Rt + 2) & 31], 64, 64),
+          extract(vec[(Rt + 3) & 31], 64, 64)));
+      store(base + imm(48, 64), interleave4_second(8 << size,
+          extract(vec[Rt], 64, 64),
+          extract(vec[(Rt + 1) & 31], 64, 64),
+          extract(vec[(Rt + 2) & 31], 64, 64),
+          extract(vec[(Rt + 3) & 31], 64, 64)));
+    }
+    if post == 1 {
+      write_gpr_sp(Rn, 1, base + (Rm == 31
+          ? imm(32 << Q, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+// LD4 {Vt.16B-Vt4.16B}: de-interleave 64 consecutive bytes across four
+// vector registers. Consecutive register lists wrap modulo 32.
+insn ld4_16b {
+  encoding "01001100" post:1 "1" "0" Rm:5 "0000" "00" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.16b, ...\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    let block0 = load(address, 128);
+    let block1 = load(address + imm(16, 64), 128);
+    let block2 = load(address + imm(32, 64), 128);
+    let block3 = load(address + imm(48, 64), 128);
+    vec[Rt] = concat(
+        concat(structure_bytes_mod4_0(block3),
+               structure_bytes_mod4_0(block2)),
+        concat(structure_bytes_mod4_0(block1),
+               structure_bytes_mod4_0(block0)));
+    vec[(Rt + 1) & 31] = concat(
+        concat(structure_bytes_mod4_1(block3),
+               structure_bytes_mod4_1(block2)),
+        concat(structure_bytes_mod4_1(block1),
+               structure_bytes_mod4_1(block0)));
+    vec[(Rt + 2) & 31] = concat(
+        concat(structure_bytes_mod4_2(block3),
+               structure_bytes_mod4_2(block2)),
+        concat(structure_bytes_mod4_2(block1),
+               structure_bytes_mod4_2(block0)));
+    vec[(Rt + 3) & 31] = concat(
+        concat(structure_bytes_mod4_3(block3),
+               structure_bytes_mod4_3(block2)),
+        concat(structure_bytes_mod4_3(block1),
+               structure_bytes_mod4_3(block0)));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   address + (Rm == 31 ? imm(64, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld4_8h {
+  encoding "01001100" post:1 "1" "0" Rm:5 "0000" "01" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.8h, ...\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    let block0 = load(address, 128);
+    let block1 = load(address + imm(16, 64), 128);
+    let block2 = load(address + imm(32, 64), 128);
+    let block3 = load(address + imm(48, 64), 128);
+    vec[Rt] = concat(
+        concat(structure_halfwords_mod4_0(block3),
+               structure_halfwords_mod4_0(block2)),
+        concat(structure_halfwords_mod4_0(block1),
+               structure_halfwords_mod4_0(block0)));
+    vec[(Rt + 1) & 31] = concat(
+        concat(structure_halfwords_mod4_1(block3),
+               structure_halfwords_mod4_1(block2)),
+        concat(structure_halfwords_mod4_1(block1),
+               structure_halfwords_mod4_1(block0)));
+    vec[(Rt + 2) & 31] = concat(
+        concat(structure_halfwords_mod4_2(block3),
+               structure_halfwords_mod4_2(block2)),
+        concat(structure_halfwords_mod4_2(block1),
+               structure_halfwords_mod4_2(block0)));
+    vec[(Rt + 3) & 31] = concat(
+        concat(structure_halfwords_mod4_3(block3),
+               structure_halfwords_mod4_3(block2)),
+        concat(structure_halfwords_mod4_3(block1),
+               structure_halfwords_mod4_3(block0)));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   address + (Rm == 31 ? imm(64, 64) : read_gpr(Rm, 1)));
+    }
+  }
+}
+
+insn ld4_4s {
+  encoding "01001100" post:1 "1" "0" Rm:5 "0000" "10" Rn:5 Rt:5
+  require post == 1 || Rm == 0;
+  asm "ld4 \{{Rt:vreg(128)}.4s, ...\}, \[{Rn:regsp(1)}\]"
+  semantics {
+    let address = read_gpr_sp(Rn, 1);
+    let block0 = load(address, 128);
+    let block1 = load(address + imm(16, 64), 128);
+    let block2 = load(address + imm(32, 64), 128);
+    let block3 = load(address + imm(48, 64), 128);
+    vec[Rt] = concat(
+        concat(extract(block3, 0, 32), extract(block2, 0, 32)),
+        concat(extract(block1, 0, 32), extract(block0, 0, 32)));
+    vec[(Rt + 1) & 31] = concat(
+        concat(extract(block3, 32, 32), extract(block2, 32, 32)),
+        concat(extract(block1, 32, 32), extract(block0, 32, 32)));
+    vec[(Rt + 2) & 31] = concat(
+        concat(extract(block3, 64, 32), extract(block2, 64, 32)),
+        concat(extract(block1, 64, 32), extract(block0, 64, 32)));
+    vec[(Rt + 3) & 31] = concat(
+        concat(extract(block3, 96, 32), extract(block2, 96, 32)),
+        concat(extract(block1, 96, 32), extract(block0, 96, 32)));
+    if post == 1 {
+      write_gpr_sp(Rn, 1,
+                   address + (Rm == 31 ? imm(64, 64) : read_gpr(Rm, 1)));
+    }
   }
 }

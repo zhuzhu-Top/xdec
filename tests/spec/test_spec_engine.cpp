@@ -167,10 +167,10 @@ TEST_CASE("encodings reached by a shipping binary leave the catch-alls",
   CHECK(ruleOf(0x6e180528) == "neon_ins_elem_d");   // mov v8.d[1], v9.d[0]
   CHECK(ruleOf(0x4e0c1d31) == "neon_ins_gpr_s");    // mov v17.s[1], w9
   CHECK(ruleOf(0x4ea09800) == "neon_cmeq_zero_4s"); // cmeq v0.4s, v0.4s, #0
-  CHECK(ruleOf(0x0ea008a5) == "neon_rev64_2s");     // rev64 v5.2s, v5.2s
+  CHECK(ruleOf(0x0ea008a5) == "neon_rev64");        // rev64 v5.2s, v5.2s
   CHECK(ruleOf(0x6eae45ee) == "neon_ushl_4s");      // ushl v14.4s, v15.4s, v14.4s
-  CHECK(ruleOf(0x6ea0ba12) == "neon_neg_4s");       // neg v18.4s, v16.4s
-  CHECK(ruleOf(0x4ea09611) == "neon_mla_4s");       // mla v17.4s, v16.4s, v0.4s
+  CHECK(ruleOf(0x6ea0ba12) == "neon_neg_lanes");    // neg v18.4s, v16.4s
+  CHECK(ruleOf(0x4ea09611) == "neon_mla_lanes");    // mla v17.4s, v16.4s, v0.4s
   CHECK(ruleOf(0x0f0795f1) == "neon_orr_imm_16");   // orr v17.4h, #0xef
   CHECK(ruleOf(0x6f02141a) == "neon_bic_imm_32");   // bic v26.4s, #0x40
 
@@ -179,6 +179,14 @@ TEST_CASE("encodings reached by a shipping binary leave the catch-alls",
     CHECK(ruleOf(0x98267967) == "ldrsw_literal");      // ldrsw x7, #0x4cf2c
     CHECK(ruleOf(0xac50a224) == "ldnp_fp");            // ldnp q4, q8, [x17, #0x210]
     CHECK(ruleOf(0xd83cf9a5) == "prfm_literal");       // prfm pldl3strm, #...
+    CHECK(ruleOf(0xa84388f8) == "ldnp");               // ldnp x24, x2, [x7, #0x38]
+    CHECK(ruleOf(0xa80a8ba7) == "stnp");               // stnp x7, x2, [x29, #0xa8]
+    CHECK(ruleOf(0x6940cb37) == "ldpsw_offset");       // ldpsw x23, x18, [x25, #4]
+    CHECK(ruleOf(0x68c34d00) == "ldpsw_post");         // ldpsw x0, x19, [x8], #0x18
+    CHECK(ruleOf(0x69c2cadd) == "ldpsw_pre");          // ldpsw x29, x18, [x22, #0x14]!
+    CHECK(ruleOf(0xf98584cf) == "prfm_imm_unsigned");  // prfm ..., [x6, #0xb08]
+    CHECK(ruleOf(0xf8bac923) == "prfm_reg_offset");    // prfm ..., [x9, w26, sxtw]
+    CHECK(ruleOf(0xf886a162) == "prfum");              // prfum pldl2keep, [x11, #0x6a]
   }
 
   SECTION("the narrow and pair exclusives complete their matrix") {

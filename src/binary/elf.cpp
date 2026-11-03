@@ -1075,6 +1075,7 @@ class ElfLoader {
       // PROGBITS and NOBITS are the two ways an ELF section holds the program's
       // own bytes; every other type is a table about the program.
       section.programData = header.type == kShtProgBits || header.type == kShtNoBits;
+      section.code = (header.flags & kShfExecInstr) != 0;
       section.entrySize = static_cast<unsigned>(header.entrySize);
       section.permissions = section.allocated ? permissionsFromSectionFlags(header.flags)
                                               : MemoryPermissions::None;

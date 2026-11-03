@@ -221,6 +221,76 @@ fn ushll_lanes(lane_bits: int, v: bits(64), amount: int) -> bits(128) {
   }
 }
 
+fn sshll_8_to_16(v: bits(64), amount: int) -> bits(128) {
+  return concat(
+      concat(concat(sext(extract(v, 56, 8), 16) << imm(amount, 16),
+                    sext(extract(v, 48, 8), 16) << imm(amount, 16)),
+             concat(sext(extract(v, 40, 8), 16) << imm(amount, 16),
+                    sext(extract(v, 32, 8), 16) << imm(amount, 16))),
+      concat(concat(sext(extract(v, 24, 8), 16) << imm(amount, 16),
+                    sext(extract(v, 16, 8), 16) << imm(amount, 16)),
+             concat(sext(extract(v, 8, 8), 16) << imm(amount, 16),
+                    sext(extract(v, 0, 8), 16) << imm(amount, 16))));
+}
+
+fn sshll_16_to_32(v: bits(64), amount: int) -> bits(128) {
+  return concat(
+      concat(sext(extract(v, 48, 16), 32) << imm(amount, 32),
+             sext(extract(v, 32, 16), 32) << imm(amount, 32)),
+      concat(sext(extract(v, 16, 16), 32) << imm(amount, 32),
+             sext(extract(v, 0, 16), 32) << imm(amount, 32)));
+}
+
+fn sshll_32_to_64(v: bits(64), amount: int) -> bits(128) {
+  return concat(sext(extract(v, 32, 32), 64) << imm(amount, 64),
+                sext(extract(v, 0, 32), 64) << imm(amount, 64));
+}
+
+fn sshll_lanes(lane_bits: int, v: bits(64), amount: int) -> bits(128) {
+  if lane_bits == 8 {
+    return sshll_8_to_16(v, amount);
+  } else if lane_bits == 16 {
+    return sshll_16_to_32(v, amount);
+  } else {
+    return sshll_32_to_64(v, amount);
+  }
+}
+
+fn umull_8_to_16(a: bits(64), b: bits(64)) -> bits(128) {
+  return concat(
+      concat(concat(zext(extract(a, 56, 8), 16) * zext(extract(b, 56, 8), 16),
+                    zext(extract(a, 48, 8), 16) * zext(extract(b, 48, 8), 16)),
+             concat(zext(extract(a, 40, 8), 16) * zext(extract(b, 40, 8), 16),
+                    zext(extract(a, 32, 8), 16) * zext(extract(b, 32, 8), 16))),
+      concat(concat(zext(extract(a, 24, 8), 16) * zext(extract(b, 24, 8), 16),
+                    zext(extract(a, 16, 8), 16) * zext(extract(b, 16, 8), 16)),
+             concat(zext(extract(a, 8, 8), 16) * zext(extract(b, 8, 8), 16),
+                    zext(extract(a, 0, 8), 16) * zext(extract(b, 0, 8), 16))));
+}
+
+fn umull_16_to_32(a: bits(64), b: bits(64)) -> bits(128) {
+  return concat(
+      concat(zext(extract(a, 48, 16), 32) * zext(extract(b, 48, 16), 32),
+             zext(extract(a, 32, 16), 32) * zext(extract(b, 32, 16), 32)),
+      concat(zext(extract(a, 16, 16), 32) * zext(extract(b, 16, 16), 32),
+             zext(extract(a, 0, 16), 32) * zext(extract(b, 0, 16), 32)));
+}
+
+fn umull_32_to_64(a: bits(64), b: bits(64)) -> bits(128) {
+  return concat(zext(extract(a, 32, 32), 64) * zext(extract(b, 32, 32), 64),
+                zext(extract(a, 0, 32), 64) * zext(extract(b, 0, 32), 64));
+}
+
+fn umull_lanes(lane_bits: int, a: bits(64), b: bits(64)) -> bits(128) {
+  if lane_bits == 8 {
+    return umull_8_to_16(a, b);
+  } else if lane_bits == 16 {
+    return umull_16_to_32(a, b);
+  } else {
+    return umull_32_to_64(a, b);
+  }
+}
+
 fn even_bytes64(v: bits(64)) -> bits(32) {
   return concat(concat(extract(v, 48, 8), extract(v, 32, 8)),
                 concat(extract(v, 16, 8), extract(v, 0, 8)));
@@ -235,6 +305,28 @@ fn even_halfwords128(v: bits(128)) -> bits(64) {
   return concat(
       concat(extract(v, 96, 16), extract(v, 64, 16)),
       concat(extract(v, 32, 16), extract(v, 0, 16)));
+}
+
+fn odd_bytes128(v: bits(128)) -> bits(64) {
+  return concat(
+      concat(concat(extract(v, 120, 8), extract(v, 104, 8)),
+             concat(extract(v, 88, 8), extract(v, 72, 8))),
+      concat(concat(extract(v, 56, 8), extract(v, 40, 8)),
+             concat(extract(v, 24, 8), extract(v, 8, 8))));
+}
+
+fn odd_halfwords128(v: bits(128)) -> bits(64) {
+  return concat(
+      concat(extract(v, 112, 16), extract(v, 80, 16)),
+      concat(extract(v, 48, 16), extract(v, 16, 16)));
+}
+
+fn even_words128(v: bits(128)) -> bits(64) {
+  return concat(extract(v, 64, 32), extract(v, 0, 32));
+}
+
+fn odd_words128(v: bits(128)) -> bits(64) {
+  return concat(extract(v, 96, 32), extract(v, 32, 32));
 }
 
 fn narrow_8h_to_8b(v: bits(128)) -> bits(64) {
@@ -259,16 +351,108 @@ fn uaddw_4s_4h(acc: bits(128), src: bits(64)) -> bits(128) {
              extract(acc, 0, 32) + zext(extract(src, 0, 16), 32)));
 }
 
+fn usubw_8h_8b(acc: bits(128), src: bits(64)) -> bits(128) {
+  return concat(
+      concat(concat(extract(acc, 112, 16) - zext(extract(src, 56, 8), 16),
+                    extract(acc, 96, 16) - zext(extract(src, 48, 8), 16)),
+             concat(extract(acc, 80, 16) - zext(extract(src, 40, 8), 16),
+                    extract(acc, 64, 16) - zext(extract(src, 32, 8), 16))),
+      concat(concat(extract(acc, 48, 16) - zext(extract(src, 24, 8), 16),
+                    extract(acc, 32, 16) - zext(extract(src, 16, 8), 16)),
+             concat(extract(acc, 16, 16) - zext(extract(src, 8, 8), 16),
+                    extract(acc, 0, 16) - zext(extract(src, 0, 8), 16))));
+}
+
+fn usubw_4s_4h(acc: bits(128), src: bits(64)) -> bits(128) {
+  return concat(
+      concat(extract(acc, 96, 32) - zext(extract(src, 48, 16), 32),
+             extract(acc, 64, 32) - zext(extract(src, 32, 16), 32)),
+      concat(extract(acc, 32, 32) - zext(extract(src, 16, 16), 32),
+             extract(acc, 0, 32) - zext(extract(src, 0, 16), 32)));
+}
+
+fn usubw_2d_2s(acc: bits(128), src: bits(64)) -> bits(128) {
+  return concat(extract(acc, 64, 64) - zext(extract(src, 32, 32), 64),
+                extract(acc, 0, 64) - zext(extract(src, 0, 32), 64));
+}
+
+fn usubw_lanes(lane_bits: int, acc: bits(128), src: bits(64)) -> bits(128) {
+  if lane_bits == 8 {
+    return usubw_8h_8b(acc, src);
+  } else if lane_bits == 16 {
+    return usubw_4s_4h(acc, src);
+  } else {
+    return usubw_2d_2s(acc, src);
+  }
+}
+
 fn cmhi32(a: bits(32), b: bits(32)) -> bits(32) {
   return select(b <u a, imm(0xffffffff, 32), imm(0, 32));
 }
 
-fn cmhi_4s(a: bits(128), b: bits(128)) -> bits(128) {
+fn cmhi8(a: bits(8), b: bits(8)) -> bits(8) {
+  return select(b <u a, imm(0xff, 8), imm(0, 8));
+}
+
+fn cmhi16(a: bits(16), b: bits(16)) -> bits(16) {
+  return select(b <u a, imm(0xffff, 16), imm(0, 16));
+}
+
+fn cmhi64(a: bits(64), b: bits(64)) -> bits(64) {
+  return select(b <u a, imm(0xffffffffffffffff, 64), imm(0, 64));
+}
+
+fn cmhi_8b(a: bits(64), b: bits(64)) -> bits(64) {
   return concat(
-      concat(cmhi32(extract(a, 96, 32), extract(b, 96, 32)),
-             cmhi32(extract(a, 64, 32), extract(b, 64, 32))),
-      concat(cmhi32(extract(a, 32, 32), extract(b, 32, 32)),
-             cmhi32(extract(a, 0, 32), extract(b, 0, 32))));
+      concat(concat(cmhi8(extract(a, 56, 8), extract(b, 56, 8)),
+                    cmhi8(extract(a, 48, 8), extract(b, 48, 8))),
+             concat(cmhi8(extract(a, 40, 8), extract(b, 40, 8)),
+                    cmhi8(extract(a, 32, 8), extract(b, 32, 8)))),
+      concat(concat(cmhi8(extract(a, 24, 8), extract(b, 24, 8)),
+                    cmhi8(extract(a, 16, 8), extract(b, 16, 8))),
+             concat(cmhi8(extract(a, 8, 8), extract(b, 8, 8)),
+                    cmhi8(extract(a, 0, 8), extract(b, 0, 8)))));
+}
+
+fn cmhi_4h(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(
+      concat(cmhi16(extract(a, 48, 16), extract(b, 48, 16)),
+             cmhi16(extract(a, 32, 16), extract(b, 32, 16))),
+      concat(cmhi16(extract(a, 16, 16), extract(b, 16, 16)),
+             cmhi16(extract(a, 0, 16), extract(b, 0, 16))));
+}
+
+fn cmhi_2s(a: bits(64), b: bits(64)) -> bits(64) {
+  return concat(cmhi32(extract(a, 32, 32), extract(b, 32, 32)),
+                cmhi32(extract(a, 0, 32), extract(b, 0, 32)));
+}
+
+fn cmhi_half(lane_bits: int, a: bits(64), b: bits(64)) -> bits(64) {
+  if lane_bits == 8 {
+    return cmhi_8b(a, b);
+  } else if lane_bits == 16 {
+    return cmhi_4h(a, b);
+  } else if lane_bits == 32 {
+    return cmhi_2s(a, b);
+  } else {
+    return cmhi64(a, b);
+  }
+}
+
+fn addv8_64(v: bits(64)) -> bits(8) {
+  return extract(v, 0, 8) + extract(v, 8, 8)
+       + extract(v, 16, 8) + extract(v, 24, 8)
+       + extract(v, 32, 8) + extract(v, 40, 8)
+       + extract(v, 48, 8) + extract(v, 56, 8);
+}
+
+fn addv16_64(v: bits(64)) -> bits(16) {
+  return extract(v, 0, 16) + extract(v, 16, 16)
+       + extract(v, 32, 16) + extract(v, 48, 16);
+}
+
+fn addv32_64(v: bits(64)) -> bits(32) {
+  return extract(v, 0, 32) + extract(v, 32, 32);
 }
 
 fn cmlt8(v: bits(8)) -> bits(8) {
@@ -673,6 +857,41 @@ insn neon_eor {
   }
 }
 
+// ARMv8.2 SHA-3 helpers operate on the full 128-bit vector.
+insn neon_eor3 {
+  encoding "11001110000" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "eor3 {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}, {Ra:vreg(128)}"
+  semantics {
+    vec[Rd] = vec[Rn] ^ vec[Rm] ^ vec[Ra];
+  }
+}
+
+insn neon_bcax {
+  encoding "11001110001" Rm:5 "0" Ra:5 Rn:5 Rd:5
+  asm "bcax {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}, {Ra:vreg(128)}"
+  semantics {
+    vec[Rd] = vec[Rn] ^ (vec[Rm] & ~vec[Ra]);
+  }
+}
+
+fn ror64(v: bits(64), amount: int) -> bits(64) {
+  if amount == 0 {
+    return v;
+  } else {
+    return (v >> imm(amount, 64)) | (v << imm(64 - amount, 64));
+  }
+}
+
+insn neon_xar {
+  encoding "11001110100" Rm:5 imm6:6 Rn:5 Rd:5
+  asm "xar {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}, #{imm6:dec}"
+  semantics {
+    let mixed = vec[Rn] ^ vec[Rm];
+    vec[Rd] = concat(ror64(extract(mixed, 64, 64), imm6),
+                     ror64(extract(mixed, 0, 64), imm6));
+  }
+}
+
 insn neon_bsl {
   encoding "0" Q:1 "101110011" Rm:5 "000111" Rn:5 Rd:5
   asm "bsl {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
@@ -784,6 +1003,45 @@ insn neon_mul_lanes {
   }
 }
 
+insn neon_mla_lanes {
+  encoding "0" Q:1 "001110" size:2 "1" Rm:5 "100101" Rn:5 Rd:5
+  require size != 3;
+  asm "mla {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    let product = mul_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q));
+    write_vec(Rd, Q, add_lanes(Q, 8 << size, read_vec(Rd, Q), product));
+  }
+}
+
+insn neon_mls_lanes {
+  encoding "0" Q:1 "101110" size:2 "1" Rm:5 "100101" Rn:5 Rd:5
+  require size != 3;
+  asm "mls {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    let product = mul_lanes(Q, 8 << size, read_vec(Rn, Q), read_vec(Rm, Q));
+    write_vec(Rd, Q, sub_lanes(Q, 8 << size, read_vec(Rd, Q), product));
+  }
+}
+
+insn neon_umull_lanes {
+  encoding "00" "101110" size:2 "1" Rm:5 "110000" Rn:5 Rd:5
+  require size != 3;
+  asm "umull {Rd:vreg(128)}, {Rn:vreg(64)}, {Rm:vreg(64)}"
+  semantics {
+    vec[Rd] = umull_lanes(8 << size, vec[Rn].d, vec[Rm].d);
+  }
+}
+
+insn neon_umull2_lanes {
+  encoding "01" "101110" size:2 "1" Rm:5 "110000" Rn:5 Rd:5
+  require size != 3;
+  asm "umull2 {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+  semantics {
+    vec[Rd] = umull_lanes(8 << size, extract(vec[Rn], 64, 64),
+                          extract(vec[Rm], 64, 64));
+  }
+}
+
 insn neon_sub_lanes {
   encoding "0" Q:1 "101110" size:2 "1" Rm:5 "100001" Rn:5 Rd:5
   require Q == 1 || size != 3;
@@ -793,11 +1051,45 @@ insn neon_sub_lanes {
   }
 }
 
-insn neon_cmhi_4s {
-  encoding "01" "101110" "10" "1" Rm:5 "001101" Rn:5 Rd:5
-  asm "cmhi {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+insn neon_cmhi_lanes {
+  encoding "0" Q:1 "101110" size:2 "1" Rm:5 "001101" Rn:5 Rd:5
+  require Q == 1 || size != 3;
+  asm "cmhi {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
   semantics {
-    vec[Rd] = cmhi_4s(vec[Rn], vec[Rm]);
+    let low = cmhi_half(8 << size, vec[Rn].d, vec[Rm].d);
+    if Q == 1 {
+      vec[Rd] = concat(
+          cmhi_half(8 << size, extract(vec[Rn], 64, 64),
+                    extract(vec[Rm], 64, 64)),
+          low);
+    } else {
+      vec[Rd].d = low;
+    }
+  }
+}
+
+insn neon_cmhs_lanes {
+  encoding "0" Q:1 "101110" size:2 "1" Rm:5 "001111" Rn:5 Rd:5
+  require Q == 1 || size != 3;
+  asm "cmhs {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, {Rm:vreg(64 << Q)}"
+  semantics {
+    let low = ~cmhi_half(8 << size, vec[Rm].d, vec[Rn].d);
+    if Q == 1 {
+      vec[Rd] = concat(
+          ~cmhi_half(8 << size, extract(vec[Rm], 64, 64),
+                     extract(vec[Rn], 64, 64)),
+          low);
+    } else {
+      vec[Rd].d = low;
+    }
+  }
+}
+
+insn neon_cmhs_scalar_d {
+  encoding "01" "111110" "11" "1" Rm:5 "001111" Rn:5 Rd:5
+  asm "cmhs d{Rd:dec}, d{Rn:dec}, d{Rm:dec}"
+  semantics {
+    vec[Rd].d = ~cmhi64(vec[Rm].d, vec[Rn].d);
   }
 }
 
@@ -816,14 +1108,32 @@ insn neon_cmlt_b {
 
 insn neon_uzp1 {
   encoding "01" "001110" size:2 "0" Rm:5 "000110" Rn:5 Rd:5
-  require size == 0 || size == 1;
+  require size != 3;
   asm "uzp1 {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
   semantics {
     if size == 0 {
       vec[Rd] = concat(even_bytes128(vec[Rm]), even_bytes128(vec[Rn]));
-    } else {
+    } else if size == 1 {
       vec[Rd] = concat(even_halfwords128(vec[Rm]),
                        even_halfwords128(vec[Rn]));
+    } else {
+      vec[Rd] = concat(even_words128(vec[Rm]), even_words128(vec[Rn]));
+    }
+  }
+}
+
+insn neon_uzp2 {
+  encoding "01" "001110" size:2 "0" Rm:5 "010110" Rn:5 Rd:5
+  require size != 3;
+  asm "uzp2 {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+  semantics {
+    if size == 0 {
+      vec[Rd] = concat(odd_bytes128(vec[Rm]), odd_bytes128(vec[Rn]));
+    } else if size == 1 {
+      vec[Rd] = concat(odd_halfwords128(vec[Rm]),
+                       odd_halfwords128(vec[Rn]));
+    } else {
+      vec[Rd] = concat(odd_words128(vec[Rm]), odd_words128(vec[Rn]));
     }
   }
 }
@@ -857,6 +1167,25 @@ insn neon_uaddw2_4s {
   }
 }
 
+insn neon_usubw_lanes {
+  encoding "00" "101110" size:2 "1" Rm:5 "001100" Rn:5 Rd:5
+  require size != 3;
+  asm "usubw {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(64)}"
+  semantics {
+    vec[Rd] = usubw_lanes(8 << size, vec[Rn], vec[Rm].d);
+  }
+}
+
+insn neon_usubw2_lanes {
+  encoding "01" "101110" size:2 "1" Rm:5 "001100" Rn:5 Rd:5
+  require size != 3;
+  asm "usubw2 {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
+  semantics {
+    vec[Rd] = usubw_lanes(8 << size, vec[Rn],
+                          extract(vec[Rm], 64, 64));
+  }
+}
+
 // Advanced SIMD shift-by-immediate. `immh:immb` encodes element size and
 // amount: SHL uses `lane_bits + amount`; USHR uses `2*lane_bits - amount`.
 insn neon_shl_lanes {
@@ -881,6 +1210,18 @@ insn neon_ushr_lanes {
   }
 }
 
+insn neon_usra_lanes {
+  encoding "0" Q:1 "101111" "0" immh:4 immb:3 "000101" Rn:5 Rd:5
+  require immh != 0 && (Q == 1 || immh != 8);
+  asm "usra {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}, #{(16 << highestbit_int(immh)) - ((immh << 3) | immb):dec}"
+  semantics {
+    let lane_bits = 8 << highestbit_int(immh);
+    let amount = (lane_bits << 1) - ((immh << 3) | immb);
+    let shifted = ushr_lanes(Q, lane_bits, read_vec(Rn, Q), amount);
+    write_vec(Rd, Q, add_lanes(Q, lane_bits, read_vec(Rd, Q), shifted));
+  }
+}
+
 // Unsigned shift left long. Q selects the low (USHLL) or high (USHLL2)
 // 64-bit half of the source; every lane widens to twice its original width.
 insn neon_ushll_lanes {
@@ -902,6 +1243,50 @@ insn neon_ushll2_lanes {
     let lane_bits = 8 << highestbit_int(immh);
     let amount = ((immh << 3) | immb) - lane_bits;
     vec[Rd] = ushll_lanes(lane_bits, extract(vec[Rn], 64, 64), amount);
+  }
+}
+
+insn neon_sshll_lanes {
+  encoding "00" "001111" "0" immh:4 immb:3 "101001" Rn:5 Rd:5
+  require immh != 0 && immh < 8;
+  asm "sshll {Rd:vreg(128)}, {Rn:vreg(64)}, #{((immh << 3) | immb) - (8 << highestbit_int(immh)):dec}"
+  semantics {
+    let lane_bits = 8 << highestbit_int(immh);
+    let amount = ((immh << 3) | immb) - lane_bits;
+    vec[Rd] = sshll_lanes(lane_bits, vec[Rn].d, amount);
+  }
+}
+
+insn neon_sshll2_lanes {
+  encoding "01" "001111" "0" immh:4 immb:3 "101001" Rn:5 Rd:5
+  require immh != 0 && immh < 8;
+  asm "sshll2 {Rd:vreg(128)}, {Rn:vreg(128)}, #{((immh << 3) | immb) - (8 << highestbit_int(immh)):dec}"
+  semantics {
+    let lane_bits = 8 << highestbit_int(immh);
+    let amount = ((immh << 3) | immb) - lane_bits;
+    vec[Rd] = sshll_lanes(lane_bits, extract(vec[Rn], 64, 64), amount);
+  }
+}
+
+// Shift left long. Unlike USHLL, SHLL has no encoded shift amount: it always
+// shifts by the source element width.
+insn neon_shll_lanes {
+  encoding "00" "101110" size:2 "100001001110" Rn:5 Rd:5
+  require size != 3;
+  asm "shll {Rd:vreg(128)}, {Rn:vreg(64)}, #{8 << size:dec}"
+  semantics {
+    let lane_bits = 8 << size;
+    vec[Rd] = ushll_lanes(lane_bits, vec[Rn].d, lane_bits);
+  }
+}
+
+insn neon_shll2_lanes {
+  encoding "01" "101110" size:2 "100001001110" Rn:5 Rd:5
+  require size != 3;
+  asm "shll2 {Rd:vreg(128)}, {Rn:vreg(128)}, #{8 << size:dec}"
+  semantics {
+    let lane_bits = 8 << size;
+    vec[Rd] = ushll_lanes(lane_bits, extract(vec[Rn], 64, 64), lane_bits);
   }
 }
 
@@ -1139,15 +1524,22 @@ insn neon_dup_gpr_s {
   }
 }
 
-// Targeted lane transports present in libsdk_bc_lib.so.
-insn neon_mov_s1_s0 {
-  encoding "01101110" "00001100" "000001" Rn:5 Rd:5
-  asm "mov {Rd:vreg(128)}.s1, {Rn:vreg(128)}.s0"
-  semantics {
-    let low = concat(extract(vec[Rn], 0, 32),
-                     extract(vec[Rd], 0, 32));
-    vec[Rd] = concat(extract(vec[Rd], 64, 64), low);
-  }
+fn insert_lane8(v: bits(128), lane: bits(8), index: int) -> bits(128) {
+  let shift = index * 8;
+  let mask = imm(ones_int(8) << shift, 128);
+  return (v & ~mask) | (zext(lane, 128) << imm(shift, 128));
+}
+
+fn insert_lane16(v: bits(128), lane: bits(16), index: int) -> bits(128) {
+  let shift = index * 16;
+  let mask = imm(ones_int(16) << shift, 128);
+  return (v & ~mask) | (zext(lane, 128) << imm(shift, 128));
+}
+
+fn insert_lane32(v: bits(128), lane: bits(32), index: int) -> bits(128) {
+  let shift = index * 32;
+  let mask = imm(ones_int(32) << shift, 128);
+  return (v & ~mask) | (zext(lane, 128) << imm(shift, 128));
 }
 
 // EXT reads a window of the two sources laid end to end: `imm4` bytes are
@@ -1216,6 +1608,33 @@ insn neon_uaddlv_8b {
   }
 }
 
+// Integer add across lanes. The architectural scalar destination width follows
+// the source element width, and the reduction wraps at that width.
+insn neon_addv {
+  encoding "0" Q:1 "001110" size:2 "110001" "101110" Rn:5 Rd:5
+  require size != 3;
+  require size != 2 || Q == 1;
+  asm "addv {Rd:vreg(8 << size)}, {Rn:vreg(64 << Q)}"
+  semantics {
+    if size == 0 {
+      let low = addv8_64(vec[Rn].d);
+      vec[Rd].b = Q == 1
+          ? low + addv8_64(extract(vec[Rn], 64, 64))
+          : low;
+    } else {
+      if size == 1 {
+        let low = addv16_64(vec[Rn].d);
+        vec[Rd].h = Q == 1
+            ? low + addv16_64(extract(vec[Rn], 64, 64))
+            : low;
+      } else {
+        vec[Rd].s = addv32_64(vec[Rn].d)
+                  + addv32_64(extract(vec[Rn], 64, 64));
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Encodings found by decoding every instruction word in a shipping arm64
 // binary and diffing against this spec. Each one below was reached by real
@@ -1233,8 +1652,32 @@ insn neon_dup_gpr_d {
   }
 }
 
-// INS (element), 64-bit lanes. imm5 is `x1000` with the destination index in
-// the top bit, and imm4 is `x000` with the source index in its top bit.
+// INS (element). imm5 encodes the destination element size and lane while
+// imm4 encodes the source lane at the same size.
+insn neon_ins_elem_b {
+  encoding "01101110" "000" idxd:4 "1" "0" idxn:4 "1" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.b{idxd:dec}, {Rn:vreg(128)}.b{idxn:dec}"
+  semantics {
+    vec[Rd] = insert_lane8(vec[Rd], extract(vec[Rn], idxn * 8, 8), idxd);
+  }
+}
+
+insn neon_ins_elem_h {
+  encoding "01101110" "000" idxd:3 "10" "0" idxn:3 "0" "1" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.h{idxd:dec}, {Rn:vreg(128)}.h{idxn:dec}"
+  semantics {
+    vec[Rd] = insert_lane16(vec[Rd], extract(vec[Rn], idxn * 16, 16), idxd);
+  }
+}
+
+insn neon_ins_elem_s {
+  encoding "01101110" "000" idxd:2 "100" "0" idxn:2 "00" "1" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.s{idxd:dec}, {Rn:vreg(128)}.s{idxn:dec}"
+  semantics {
+    vec[Rd] = insert_lane32(vec[Rd], extract(vec[Rn], idxn * 32, 32), idxd);
+  }
+}
+
 insn neon_ins_elem_d {
   encoding "01101110" "000" idxd:1 "1000" "0" idxn:1 "000" "1" Rn:5 Rd:5
   asm "mov {Rd:vreg(128)}.d{idxd:dec}, {Rn:vreg(128)}.d{idxn:dec}"
@@ -1248,26 +1691,41 @@ insn neon_ins_elem_d {
   }
 }
 
-// INS (general), 32-bit lanes: imm5 is `idx:100`. The destination lane is
-// field-dependent and the other three lanes survive, so the vector is taken
-// apart and put back together rather than masked.
+// INS (general) moves a W/X register into one vector lane and preserves every
+// other lane.
+insn neon_ins_gpr_b {
+  encoding "01001110" "000" idx:4 "1" "000111" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.b{idx:dec}, {Rn:reg(0)}"
+  semantics {
+    vec[Rd] = insert_lane8(vec[Rd], trunc(read_gpr(Rn, 0), 8), idx);
+  }
+}
+
+insn neon_ins_gpr_h {
+  encoding "01001110" "000" idx:3 "10" "000111" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.h{idx:dec}, {Rn:reg(0)}"
+  semantics {
+    vec[Rd] = insert_lane16(vec[Rd], trunc(read_gpr(Rn, 0), 16), idx);
+  }
+}
+
 insn neon_ins_gpr_s {
   encoding "01001110" "000" idx:2 "100" "000111" Rn:5 Rd:5
   asm "mov {Rd:vreg(128)}.s{idx:dec}, {Rn:reg(0)}"
   semantics {
-    let src = read_gpr(Rn, 0);
-    let l0 = extract(vec[Rd], 0, 32);
-    let l1 = extract(vec[Rd], 32, 32);
-    let l2 = extract(vec[Rd], 64, 32);
-    let l3 = extract(vec[Rd], 96, 32);
-    if idx == 0 {
-      vec[Rd] = concat(concat(l3, l2), concat(l1, src));
-    } else if idx == 1 {
-      vec[Rd] = concat(concat(l3, l2), concat(src, l0));
-    } else if idx == 2 {
-      vec[Rd] = concat(concat(l3, src), concat(l1, l0));
+    vec[Rd] = insert_lane32(vec[Rd], read_gpr(Rn, 0), idx);
+  }
+}
+
+insn neon_ins_gpr_d {
+  encoding "01001110" "000" idx:1 "1000" "000111" Rn:5 Rd:5
+  asm "mov {Rd:vreg(128)}.d{idx:dec}, {Rn:reg(1)}"
+  semantics {
+    let src = read_gpr(Rn, 1);
+    if idx == 1 {
+      vec[Rd] = concat(src, extract(vec[Rd], 0, 64));
     } else {
-      vec[Rd] = concat(concat(src, l2), concat(l1, l0));
+      vec[Rd] = concat(extract(vec[Rd], 64, 64), src);
     }
   }
 }
@@ -1280,13 +1738,47 @@ insn neon_cmeq_zero_4s {
   }
 }
 
-// REV64 with 32-bit elements swaps the two words inside each doubleword. The
-// narrow form has only one doubleword, which is the whole instruction.
-insn neon_rev64_2s {
-  encoding "00" "001110" "10" "10000" "00000" "10" Rn:5 Rd:5
-  asm "rev64 {Rd:vreg(64)}, {Rn:vreg(64)}"
+fn rev64_bytes(v: bits(64)) -> bits(64) {
+  return concat(
+      concat(concat(extract(v, 0, 8), extract(v, 8, 8)),
+             concat(extract(v, 16, 8), extract(v, 24, 8))),
+      concat(concat(extract(v, 32, 8), extract(v, 40, 8)),
+             concat(extract(v, 48, 8), extract(v, 56, 8))));
+}
+
+fn rev64_halfwords(v: bits(64)) -> bits(64) {
+  return concat(
+      concat(extract(v, 0, 16), extract(v, 16, 16)),
+      concat(extract(v, 32, 16), extract(v, 48, 16)));
+}
+
+fn rev64_words(v: bits(64)) -> bits(64) {
+  return concat(extract(v, 0, 32), extract(v, 32, 32));
+}
+
+fn rev64_lanes(lane_bits: int, v: bits(64)) -> bits(64) {
+  if lane_bits == 8 {
+    return rev64_bytes(v);
+  } else if lane_bits == 16 {
+    return rev64_halfwords(v);
+  } else {
+    return rev64_words(v);
+  }
+}
+
+insn neon_rev64 {
+  encoding "0" Q:1 "001110" size:2 "10000" "00000" "10" Rn:5 Rd:5
+  require size != 3;
+  asm "rev64 {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
   semantics {
-    write_vec(Rd, 0, concat(extract(vec[Rn], 0, 32), extract(vec[Rn], 32, 32)));
+    let low = rev64_lanes(8 << size, vec[Rn].d);
+    if Q == 1 {
+      vec[Rd] = concat(rev64_lanes(8 << size,
+                                   extract(vec[Rn], 64, 64)),
+                       low);
+    } else {
+      vec[Rd].d = low;
+    }
   }
 }
 
@@ -1298,19 +1790,13 @@ insn neon_ushl_4s {
   }
 }
 
-insn neon_neg_4s {
-  encoding "01" "101110" "10" "10000" "01011" "10" Rn:5 Rd:5
-  asm "neg {Rd:vreg(128)}, {Rn:vreg(128)}"
+insn neon_neg_lanes {
+  encoding "0" Q:1 "101110" size:2 "10000" "01011" "10" Rn:5 Rd:5
+  require Q == 1 || size != 3;
+  asm "neg {Rd:vreg(64 << Q)}, {Rn:vreg(64 << Q)}"
   semantics {
-    vec[Rd] = sub_lanes(1, 32, zext(imm(0, 32), 128), vec[Rn]);
-  }
-}
-
-insn neon_mla_4s {
-  encoding "01" "001110" "10" "1" Rm:5 "100101" Rn:5 Rd:5
-  asm "mla {Rd:vreg(128)}, {Rn:vreg(128)}, {Rm:vreg(128)}"
-  semantics {
-    vec[Rd] = add_lanes(1, 32, vec[Rd], mul_lanes(1, 32, vec[Rn], vec[Rm]));
+    write_vec(Rd, Q,
+              sub_lanes(Q, 8 << size, imm(0, 64 << Q), read_vec(Rn, Q)));
   }
 }
 

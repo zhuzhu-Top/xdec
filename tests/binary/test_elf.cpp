@@ -221,6 +221,13 @@ TEST_CASE("elf memory map comes from segments, not sections", "[elf]") {
   CHECK(image.isExecutable(ElfBuilder::kTextVa));
   CHECK_FALSE(image.isExecutable(ElfBuilder::kDataVa));
   CHECK(image.isWritable(ElfBuilder::kDataVa));
+
+  const Section* text = image.sectionNamed(".text");
+  const Section* dataSection = image.sectionNamed(".data");
+  REQUIRE(text != nullptr);
+  REQUIRE(dataSection != nullptr);
+  CHECK(text->code);
+  CHECK_FALSE(dataSection->code);
 }
 
 TEST_CASE("elf bss reads as zeros rather than failing", "[elf]") {
