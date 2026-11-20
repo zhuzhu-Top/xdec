@@ -261,6 +261,15 @@ float xdec_fdiv32(float a, float b);
 double xdec_fdiv64(double a, double b);
 float xdec_fneg32(float a);
 double xdec_fneg64(double a);
+float xdec_fabs32(float a);
+double xdec_fabs64(double a);
+float xdec_fsqrt32(float a);
+double xdec_fsqrt64(double a);
+float xdec_fceil32(float a);
+double xdec_fceil64(double a);
+
+static inline bool xdec_fcmp_uno32(float a, float b) { return a != a || b != b; }
+static inline bool xdec_fcmp_uno64(double a, double b) { return a != a || b != b; }
 
 /* ---- AArch64 exclusive-access load/store ----
  * ldaxr/stlxr split into a reservation-plus-load and a store-plus-status in

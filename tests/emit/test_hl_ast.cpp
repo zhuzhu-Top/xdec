@@ -58,7 +58,7 @@ TEST_CASE("HlFunction AST renders idiomatic Objective-C via ObjcBackend", "[emit
   CHECK(sig.find("- (void)writeCookieValue:(id)arg3 forKey:(id)arg4") != std::string::npos);
 
   const std::string encSig = formatObjcMethodSignature(
-      "-[FPManager updateResponse:Event:]", "v28@0:8@16I24", "void",
+      "-[SessionManager updateResponse:Event:]", "v28@0:8@16I24", "void",
       {{"uint64_t", "self"}, {"uint64_t", "_cmd"}, {"uint64_t", "arg3"}, {"uint64_t", "arg4"}});
   CHECK(encSig.find("- (void)updateResponse:(id)arg3 Event:(uint32_t)arg4") !=
         std::string::npos);

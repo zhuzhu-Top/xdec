@@ -31,6 +31,13 @@ if(XDEC_BUILD_DECOMPILE)
   add_subdirectory(plugins)
 endif()
 
+if(XDEC_BUILD_PYTHON)
+  if(NOT XDEC_BUILD_DECOMPILE)
+    message(FATAL_ERROR "XDEC_BUILD_PYTHON requires XDEC_BUILD_DECOMPILE")
+  endif()
+  add_subdirectory(bindings/python)
+endif()
+
 if(XDEC_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

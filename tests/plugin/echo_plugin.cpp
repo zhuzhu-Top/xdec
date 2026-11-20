@@ -45,8 +45,11 @@ extern "C" XDEC_EXPORT std::uint32_t xdec_plugin_abi_version() {
 }
 
 extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init(xdec::pass::Registry* registry) {
-  const xdec::Result<void> added = registry->add(std::make_unique<PluginNop>());
+xdec_plugin_init(const XdecPluginHost* host) {
+  if (host == nullptr || host->passes == nullptr) {
+    return {false, "invalid host"};
+  }
+  const xdec::Result<void> added = host->passes->add(std::make_unique<PluginNop>());
   if (!added) {
     return {false, "registration failed"};
   }

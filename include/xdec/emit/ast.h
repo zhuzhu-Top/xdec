@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "xdec/il/op.h"
+
 namespace xdec::il {
 class Function;
 }
@@ -35,13 +37,15 @@ enum class HlExprKind : uint8_t {
   Raw,          // Pre-rendered low-level expression (arithmetic/MBA/cast)
   Var,          // Identifier: local, argument, temp, or CSE variable
   Const,        // Integer constant (rendered as hex)
+  FloatLit,     // Floating-point literal (`text` holds formatted spelling)
   StringLit,    // Quoted C string literal (raw unescaped characters in `text`)
   CFStringLit,  // Apple CFString reference (`name` + decoded `text`)
   Unary,        // `op operand`
   Binary,       // `lhs op rhs`
   Cast,         // `(type)operand`
-  Deref,        // `*address` or `*(type*)(address)`
+  Deref,        // `*address` or `*(type*)(address)` (`extra` holds type)
   AddressOf,    // `&inner`
+  Select,       // `cond ? lhs : rhs`
   Call,         // Structured function/indirect call
   ObjcMsg,      // Objective-C message send `[receiver sel:args...]`
 };
@@ -49,8 +53,14 @@ enum class HlExprKind : uint8_t {
 struct HlExpr {
   HlExprKind kind = HlExprKind::Raw;
   std::string text;       // Raw text, Var name, StringLit/CFStringLit text, op, or type
-  std::string extra;      // CFString symbol name, cast prefix, or callee prototype
+  std::string extra;      // CFString symbol name, deref type, cast prefix, or callee prototype
   uint64_t constant = 0;  // Const value or callee VA
+  double fconstant = 0.0; // FloatLit value
+  uint32_t widthBits = 0; // Bit width when known (0 = unspecified)
+
+  // Optional IL provenance (populated when lowered from il::Function)
+  il::ExprId ilExpr{};
+  il::OpId ilOp{};
 
   // Call / ObjcMsg metadata
   bool isDirectCall = false;
@@ -60,6 +70,7 @@ struct HlExpr {
   std::string callSuffix;
   std::string callNote;
 
+  HlExprPtr cond;  // Select condition
   HlExprPtr lhs;
   HlExprPtr rhs;
   std::vector<HlExprPtr> args;
@@ -125,6 +136,41 @@ struct HlExpr {
     return e;
   }
 
+  [[nodiscard]] static HlExprPtr makeFloatLit(std::string literalText, double value,
+                                              uint32_t bits) {
+    auto e = std::make_unique<HlExpr>();
+    e->kind = HlExprKind::FloatLit;
+    e->text = std::move(literalText);
+    e->fconstant = value;
+    e->widthBits = bits;
+    return e;
+  }
+
+  [[nodiscard]] static HlExprPtr makeDeref(std::string typeName, HlExprPtr address) {
+    auto e = std::make_unique<HlExpr>();
+    e->kind = HlExprKind::Deref;
+    e->extra = std::move(typeName);
+    e->lhs = std::move(address);
+    return e;
+  }
+
+  [[nodiscard]] static HlExprPtr makeAddressOf(HlExprPtr inner) {
+    auto e = std::make_unique<HlExpr>();
+    e->kind = HlExprKind::AddressOf;
+    e->lhs = std::move(inner);
+    return e;
+  }
+
+  [[nodiscard]] static HlExprPtr makeSelect(HlExprPtr condition, HlExprPtr thenVal,
+                                            HlExprPtr elseVal) {
+    auto e = std::make_unique<HlExpr>();
+    e->kind = HlExprKind::Select;
+    e->cond = std::move(condition);
+    e->lhs = std::move(thenVal);
+    e->rhs = std::move(elseVal);
+    return e;
+  }
+
   [[nodiscard]] static HlExprPtr makeCall(HlExprPtr calleeExpr,
                                           std::vector<HlExprPtr> arguments) {
     auto e = std::make_unique<HlExpr>();
@@ -161,6 +207,7 @@ struct HlSwitchCase {
   uint64_t value = 0;
   std::string comment;
   HlStmtPtr body;
+  std::vector<il::BlockId> ilBlocks;
 };
 
 struct HlStmt {
@@ -169,6 +216,11 @@ struct HlStmt {
   std::string typeText;   // VarDecl type
   bool isConst = false;
   bool lineComment = false;  // Comment: `//` when true, `/* ... */` when false
+
+  // Optional IL provenance (populated when lowered from il::Function)
+  il::BlockId ilBlock{};
+  il::OpId ilOp{};
+  uint64_t va = 0;
 
   HlExprPtr cond;
   HlExprPtr lhs;
@@ -288,6 +340,41 @@ struct HlFunction {
   EmitLanguage language = EmitLanguage::C;
   HlStmtPtr body;
 };
+
+/// Collects every unique `il::BlockId` referenced anywhere under `stmt`.
+inline void collectIlBlocks(const HlStmt& stmt, std::vector<il::BlockId>& out) {
+  const auto pushUnique = [&out](il::BlockId id) {
+    if (!id.valid()) {
+      return;
+    }
+    for (const il::BlockId existing : out) {
+      if (existing == id) {
+        return;
+      }
+    }
+    out.push_back(id);
+  };
+  pushUnique(stmt.ilBlock);
+  for (const HlStmtPtr& item : stmt.items) {
+    if (item) {
+      collectIlBlocks(*item, out);
+    }
+  }
+  if (stmt.thenArm) {
+    collectIlBlocks(*stmt.thenArm, out);
+  }
+  if (stmt.elseArm) {
+    collectIlBlocks(*stmt.elseArm, out);
+  }
+  for (const HlSwitchCase& c : stmt.cases) {
+    for (const il::BlockId b : c.ilBlocks) {
+      pushUnique(b);
+    }
+    if (c.body) {
+      collectIlBlocks(*c.body, out);
+    }
+  }
+}
 
 /// Post-lowering high-level AST transform hook (runs after `lowerToHlAst` and
 /// before the target language backend renders `HlFunction` to text).

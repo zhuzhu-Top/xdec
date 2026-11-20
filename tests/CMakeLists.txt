@@ -29,6 +29,7 @@ add_executable(xdec_tests
   analysis/test_dispatch_region.cpp
   analysis/test_dispatch_values.cpp
   analysis/test_dispatcher_shape.cpp
+  analysis/test_effect_summary.cpp
   analysis/test_emit_redundancy.cpp
   analysis/test_entry_reg.cpp
   analysis/test_execution_coverage.cpp
@@ -59,8 +60,10 @@ add_executable(xdec_tests
   analysis/test_xrefs.cpp
   decompile/test_driver.cpp
   decompile/test_decompile_to_c.cpp
+  decompile/test_from_il.cpp
   decompile/test_api.cpp
   decompile/test_analysis_cache_observer.cpp
+  devirt/test_devirt.cpp
   emit/test_structure.cpp
   emit/test_structure_dispatch_region.cpp
   emit/test_structure_join_epilogue.cpp
@@ -108,8 +111,9 @@ add_executable(xdec_tests
     passes/test_local_simplify.cpp
     passes/test_apply_types.cpp
     passes/test_recover_syscall.cpp
-    passes/test_recover_tailcall.cpp
-    passes/test_resolve_call.cpp
+  passes/test_recover_tailcall.cpp
+  passes/test_region_mem2reg.cpp
+  passes/test_resolve_call.cpp
     passes/test_resolve_indirect.cpp
     passes/test_resolve_indirect_path_eval.cpp
     passes/test_algebra.cpp
@@ -173,6 +177,7 @@ target_link_libraries(xdec_tests PRIVATE
   xdec_analysis
   xdec_binary
   xdec_decompile
+  xdec_devirt
   xdec_emit
   xdec_exec
   xdec_il

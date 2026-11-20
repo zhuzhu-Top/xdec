@@ -126,6 +126,16 @@ void ExprPrinter::extendScope(const std::vector<il::ExprId>& moreRoots) {
 
 std::vector<std::string> ExprPrinter::takePendingDecls() {
   std::vector<std::string> decls;
+  decls.reserve(pendingDecls_.size());
+  for (PendingCseDecl& d : pendingDecls_) {
+    decls.push_back(std::move(d.text));
+  }
+  pendingDecls_.clear();
+  return decls;
+}
+
+std::vector<PendingCseDecl> ExprPrinter::takePendingHlDecls() {
+  std::vector<PendingCseDecl> decls;
   decls.swap(pendingDecls_);
   return decls;
 }
@@ -283,7 +293,8 @@ ExprPrinter::Text ExprPrinter::materialized(il::ExprId id) {
         isRedundantRootZext(expr) ? integerOperand(expr.operand(0)) : inner(id);
   }
   ctx_.cseTemps.push_back(CseTemp{name, expr.type.bits(), pointer});
-  pendingDecls_.push_back(std::format("{} = {};", name, initializer));
+  pendingDecls_.push_back(
+      PendingCseDecl{name, std::format("{} = {};", name, initializer), nullptr});
   const Text result{name, pointer};
   materializedText_.emplace(id.index(), result);
   return result;
@@ -586,7 +597,10 @@ std::string ExprPrinter::inner(il::ExprId id) {
     case il::ExprOp::FSub:
     case il::ExprOp::FMul:
     case il::ExprOp::FDiv:
-    case il::ExprOp::FNeg: {
+    case il::ExprOp::FNeg:
+    case il::ExprOp::FAbs:
+    case il::ExprOp::FSqrt:
+    case il::ExprOp::FCeil: {
       const std::string name = std::format("{}{}", il::toString(e.op), e.type.bits());
       ctx_.helpers.insert(name);
       std::string call = std::format("xdec_{}(", name);
@@ -596,6 +610,33 @@ std::string ExprPrinter::inner(il::ExprId id) {
       }
       return call + ")";
     }
+    case il::ExprOp::FCmpEq:
+      return std::format("({} == {})", text(e.operand(0)), text(e.operand(1)));
+    case il::ExprOp::FCmpLt:
+      return std::format("({} < {})", text(e.operand(0)), text(e.operand(1)));
+    case il::ExprOp::FCmpLe:
+      return std::format("({} <= {})", text(e.operand(0)), text(e.operand(1)));
+    case il::ExprOp::FCmpUnordered: {
+      const uint32_t bits = ctx_.function.expr(e.operand(0)).type.bits();
+      const std::string name = std::format("fcmp_uno{}", bits);
+      ctx_.helpers.insert(name);
+      return std::format("xdec_{}({}, {})", name, text(e.operand(0)), text(e.operand(1)));
+    }
+    case il::ExprOp::FpConvert:
+      return std::format("(({})({}))", e.type.bits() == 32 ? "float" : "double",
+                         text(e.operand(0)));
+    case il::ExprOp::FpToIntS:
+      return std::format("(({})({}))", intType(e.type.bits(), true), text(e.operand(0)));
+    case il::ExprOp::FpToIntU:
+      return std::format("(({})({}))", intType(e.type.bits(), false), text(e.operand(0)));
+    case il::ExprOp::IntToFpS: {
+      const uint32_t srcBits = ctx_.function.expr(e.operand(0)).type.bits();
+      return std::format("(({})({}))", e.type.bits() == 32 ? "float" : "double",
+                         signedOperand(e.operand(0), srcBits));
+    }
+    case il::ExprOp::IntToFpU:
+      return std::format("(({})({}))", e.type.bits() == 32 ? "float" : "double",
+                         integerOperand(e.operand(0)));
     default:
       return std::format("/*{}?*/0x0", il::toString(e.op));
   }
@@ -745,6 +786,670 @@ std::string ExprPrinter::widthWrap(const il::Expr& expr, std::string text,
     return text;
   }
   return std::format("({}){}", intType(width, sign), text);
+}
+
+// ---------------------------------------------------------------------------
+// Structured HlExpr lowering (Dual-View AST mode)
+// ---------------------------------------------------------------------------
+
+HlExprPtr ExprPrinter::hlStamp(il::ExprId id, HlExprPtr node) const {
+  if (!node) {
+    return nullptr;
+  }
+  if (!node->ilExpr.valid()) {
+    node->ilExpr = id;
+  }
+  if (node->widthBits == 0) {
+    const il::Type t = ctx_.function.expr(id).type;
+    if (t.isScalarInteger() || t.isFloat()) {
+      node->widthBits = t.bits();
+    }
+  }
+  return node;
+}
+
+HlExprPtr ExprPrinter::toHlExpr(il::ExprId id) { return hlValue(id).expr; }
+
+HlExprPtr ExprPrinter::integerToHlExpr(il::ExprId id) {
+  HlNode operand = hlValue(id);
+  if (operand.pointer) {
+    return hlStamp(id, HlExpr::makeCast("uint64_t", std::move(operand.expr)));
+  }
+  return std::move(operand.expr);
+}
+
+HlExprPtr ExprPrinter::pointerToHlExpr(il::ExprId id, uint32_t width) {
+  if (const auto rendered =
+          AddressRenderer(ctx_).render(id, AddressRole::PointerValue, width)) {
+    if (rendered->pointer) {
+      if (rendered->text.size() > 1 && rendered->text[0] == '&') {
+        return hlStamp(id, HlExpr::makeAddressOf(HlExpr::makeVar(rendered->text.substr(1))));
+      }
+      return hlStamp(id, HlExpr::makeRaw(rendered->text));
+    }
+    return hlStamp(id, HlExpr::makeCast(std::format("{}*", intType(width)),
+                                        HlExpr::makeRaw(rendered->text)));
+  }
+  HlNode operand = hlValue(id);
+  if (operand.pointer) {
+    return std::move(operand.expr);
+  }
+  return hlStamp(id, HlExpr::makeCast(std::format("{}*", intType(width)),
+                                      std::move(operand.expr)));
+}
+
+HlExprPtr ExprPrinter::rootToHlExpr(il::ExprId id) {
+  if (const auto cached = materializedText_.find(id.index());
+      cached != materializedText_.end()) {
+    return hlStamp(id, HlExpr::makeVar(cached->second.text));
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (!isShared(id, expr) && isRedundantRootZext(expr)) {
+    return integerToHlExpr(expr.operand(0));
+  }
+  return toHlExpr(id);
+}
+
+HlExprPtr ExprPrinter::rootIntegerToHlExpr(il::ExprId id) {
+  if (const auto cached = materializedText_.find(id.index());
+      cached != materializedText_.end()) {
+    auto node = HlExpr::makeVar(cached->second.text);
+    if (cached->second.pointer) {
+      return hlStamp(id, HlExpr::makeCast("uint64_t", std::move(node)));
+    }
+    return hlStamp(id, std::move(node));
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (!isShared(id, expr) && isRedundantRootZext(expr)) {
+    return integerToHlExpr(expr.operand(0));
+  }
+  return integerToHlExpr(id);
+}
+
+HlExprPtr ExprPrinter::conditionToHlExpr(il::ExprId id, bool invert) {
+  if (!invert) {
+    return rootToHlExpr(id);
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  switch (expr.op) {
+    case il::ExprOp::CmpEq:
+      return hlCompare(id, "!=", false);
+    case il::ExprOp::CmpNe:
+      return hlCompare(id, "==", false);
+    case il::ExprOp::CmpLtU:
+      return hlCompare(id, ">=", false);
+    case il::ExprOp::CmpLeU:
+      return hlCompare(id, ">", false);
+    case il::ExprOp::CmpLtS:
+      return hlCompare(id, ">=", true);
+    case il::ExprOp::CmpLeS:
+      return hlCompare(id, ">", true);
+    case il::ExprOp::Not:
+      if (expr.type.bits() == 1) {
+        return rootToHlExpr(expr.operand(0));
+      }
+      break;
+    default:
+      break;
+  }
+  return hlStamp(id, HlExpr::makeUnary("!", rootToHlExpr(id)));
+}
+
+ExprPrinter::HlNode ExprPrinter::hlValue(il::ExprId id) {
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (expr.op == il::ExprOp::Value) {
+    const il::ValueId valueId{static_cast<uint32_t>(expr.immediate)};
+    const il::OpId defId =
+        ctx_.function.hasValue(valueId) ? ctx_.function.value(valueId).definition : il::OpId{};
+    if (const auto snapshot = ctx_.snapshots.find(valueId.index());
+        snapshot != ctx_.snapshots.end()) {
+      auto node = hlStamp(id, HlExpr::makeVar(snapshot->second));
+      node->ilOp = defId;
+      return {std::move(node), false};
+    }
+    if (const auto inlined = ctx_.inlinedStackLoads.find(valueId.index());
+        inlined != ctx_.inlinedStackLoads.end()) {
+      auto node = hlStamp(id, HlExpr::makeRaw(inlined->second.text));
+      node->ilOp = defId;
+      return {std::move(node), inlined->second.pointer};
+    }
+    if (const auto inlined = ctx_.inlinedMemoryLoads.find(valueId.index());
+        inlined != ctx_.inlinedMemoryLoads.end()) {
+      const il::ExprId address = inlined->second.address;
+      const uint32_t width = inlined->second.width;
+      if (std::string field = ctx_.fieldAccess(address, width, valueId); !field.empty()) {
+        auto node = hlStamp(id, HlExpr::makeRaw(std::move(field)));
+        node->ilOp = defId;
+        return {std::move(node), false};
+      }
+      uint64_t absolute = 0;
+      if (ctx_.function.asConstant(address, absolute)) {
+        if (const std::string* global = ctx_.globalName(absolute)) {
+          auto node = hlStamp(id, HlExpr::makeDeref(intType(width), HlExpr::makeVar(*global)));
+          node->ilOp = defId;
+          return {std::move(node), false};
+        }
+      }
+      auto node = hlStamp(id, HlExpr::makeDeref(intType(width), pointerToHlExpr(address, width)));
+      node->ilOp = defId;
+      return {std::move(node), false};
+    }
+    if (const std::string* named = ctx_.tempFor(valueId);
+        named != nullptr && ctx_.valueIsPointer(valueId)) {
+      auto node = hlStamp(id, HlExpr::makeVar(*named));
+      node->ilOp = defId;
+      return {std::move(node), true};
+    }
+    if (const analysis::Variable* temp = ctx_.variables.tempFor(valueId)) {
+      auto node = hlStamp(id, HlExpr::makeVar(temp->name));
+      node->ilOp = defId;
+      return {std::move(node), temp->type.pointerDepth > 0 || ctx_.valueIsPointer(valueId)};
+    }
+  }
+  if (expr.op == il::ExprOp::EntryReg) {
+    const il::RegId root{static_cast<uint32_t>(expr.immediate)};
+    if (const analysis::Variable* arg = ctx_.variables.argumentFor(root)) {
+      return {hlStamp(id, HlExpr::makeVar(ctx_.argumentName(*arg))),
+              ctx_.argumentIsPointer(*arg)};
+    }
+  }
+  if ((expr.op == il::ExprOp::Add || expr.op == il::ExprOp::Sub) &&
+      expr.type.bits() == 64) {
+    if (std::string localAddr = ctx_.addressOfLocal(id); !localAddr.empty()) {
+      if (localAddr.size() > 1 && localAddr[0] == '&') {
+        return {hlStamp(id, HlExpr::makeAddressOf(HlExpr::makeVar(localAddr.substr(1)))),
+                true};
+      }
+      return {hlStamp(id, HlExpr::makeVar(std::move(localAddr))), true};
+    }
+  }
+  return hlMaterialized(id);
+}
+
+ExprPrinter::HlNode ExprPrinter::hlMaterialized(il::ExprId id) {
+  if (const auto cached = materializedText_.find(id.index());
+      cached != materializedText_.end()) {
+    return {hlStamp(id, HlExpr::makeVar(cached->second.text)), cached->second.pointer};
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (expr.operandCount != 0 && !referenceCounts_.contains(id.index())) {
+    countReferences(id);
+  }
+  if (!isShared(id, expr)) {
+    return {hlInner(id), false};
+  }
+  const std::string name = std::format("_cse{}", cseCounter_++);
+  bool pointer = false;
+  HlExprPtr initAst;
+  std::string initText;
+  if (const auto rendered =
+          AddressRenderer(ctx_).render(id, AddressRole::PointerValue, 8);
+      rendered.has_value() && rendered->pointer) {
+    pointer = true;
+    initText = rendered->text;
+    initAst = (initText.size() > 1 && initText[0] == '&')
+                  ? hlStamp(id, HlExpr::makeAddressOf(HlExpr::makeVar(initText.substr(1))))
+                  : hlStamp(id, HlExpr::makeRaw(initText));
+  } else {
+    initAst = isRedundantRootZext(expr) ? integerToHlExpr(expr.operand(0)) : hlInner(id);
+    // Keep text fallback consistent for legacy readers.
+    initText = initAst ? initAst->text : std::string{};
+  }
+  ctx_.cseTemps.push_back(CseTemp{name, expr.type.bits(), pointer});
+  pendingDecls_.push_back(PendingCseDecl{
+      name, initText.empty() ? std::string{} : std::format("{} = {};", name, initText),
+      std::move(initAst)});
+  const Text result{name, pointer};
+  materializedText_.emplace(id.index(), result);
+  return {hlStamp(id, HlExpr::makeVar(name)), pointer};
+}
+
+HlExprPtr ExprPrinter::hlWidthWrap(const il::Expr& expr, HlExprPtr node, bool sign) {
+  const uint32_t width = expr.type.bits();
+  if (width >= 32 || !expr.type.isScalarInteger()) {
+    return node;
+  }
+  return HlExpr::makeCast(intType(width, sign), std::move(node));
+}
+
+HlExprPtr ExprPrinter::hlSignedOperand(il::ExprId id, uint32_t width) {
+  uint64_t constant = 0;
+  if (width <= 32 && ctx_.function.asConstant(id, constant)) {
+    const uint64_t signBit = uint64_t{1} << (width - 1);
+    if (constant < signBit) {
+      return hlStamp(id, HlExpr::makeConst(constant));
+    }
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (expr.op == il::ExprOp::Value) {
+    const il::ValueId valueId{static_cast<uint32_t>(expr.immediate)};
+    if (const analysis::Variable* temp = ctx_.variables.tempFor(valueId);
+        temp != nullptr && temp->type.pointerDepth == 0 &&
+        temp->type.isSigned && temp->type.width == width &&
+        !ctx_.typeOfValue(valueId).valid()) {
+      auto node = hlStamp(id, HlExpr::makeVar(temp->name));
+      node->ilOp = ctx_.function.value(valueId).definition;
+      return node;
+    }
+  }
+  return hlStamp(id, HlExpr::makeCast(intType(width, true), integerToHlExpr(id)));
+}
+
+HlExprPtr ExprPrinter::hlInfix(il::ExprId id, std::string_view op, bool sign) {
+  const il::Expr& e = ctx_.function.expr(id);
+  const uint32_t width = e.type.bits();
+  HlExprPtr left =
+      sign ? hlSignedOperand(e.operand(0), width) : integerToHlExpr(e.operand(0));
+  if (op == "+" && !sign) {
+    uint64_t rhsConst = 0;
+    if (ctx_.function.asConstant(e.operand(1), rhsConst)) {
+      if (width == 32 && rhsConst >= 0x80000000ull && rhsConst <= 0xffffffffull) {
+        const uint64_t neg = 0x100000000ull - rhsConst;
+        return hlStamp(id, hlWidthWrap(
+                               e, HlExpr::makeBinary("-", std::move(left), HlExpr::makeConst(neg)),
+                               sign));
+      }
+      if (width == 64 && static_cast<int64_t>(rhsConst) < 0 &&
+          static_cast<int64_t>(rhsConst) >= -0x10000000LL) {
+        const uint64_t neg = static_cast<uint64_t>(-static_cast<int64_t>(rhsConst));
+        return hlStamp(id, hlWidthWrap(
+                               e, HlExpr::makeBinary("-", std::move(left), HlExpr::makeConst(neg)),
+                               sign));
+      }
+    }
+  }
+  HlExprPtr right =
+      sign ? hlSignedOperand(e.operand(1), width) : integerToHlExpr(e.operand(1));
+  return hlStamp(id, hlWidthWrap(
+                         e, HlExpr::makeBinary(std::string{op}, std::move(left), std::move(right)),
+                         sign));
+}
+
+HlExprPtr ExprPrinter::hlShift(il::ExprId id, std::string_view op) {
+  const il::Expr& e = ctx_.function.expr(id);
+  const uint32_t width = e.type.bits();
+  const il::Expr& source = ctx_.function.expr(e.operand(0));
+  HlExprPtr left =
+      (source.type.isScalarInteger() && source.type.bits() == width)
+          ? integerToHlExpr(e.operand(0))
+          : hlStamp(e.operand(0), HlExpr::makeCast(intType(width), integerToHlExpr(e.operand(0))));
+  return hlStamp(id, hlWidthWrap(e,
+                                 HlExpr::makeBinary(std::string{op}, std::move(left),
+                                                    integerToHlExpr(e.operand(1))),
+                                 false));
+}
+
+HlExprPtr ExprPrinter::hlEqualityOperand(
+    il::ExprId id, std::optional<uint64_t> comparedConstant) {
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (comparedConstant.has_value() && expr.op == il::ExprOp::ZExt) {
+    const il::Expr& source = ctx_.function.expr(expr.operand(0));
+    const uint32_t bits = source.type.isScalarInteger() ? source.type.bits() : 0;
+    const bool fits = bits >= 64 || (bits != 0 && *comparedConstant < (uint64_t{1} << bits));
+    if (fits) {
+      return integerToHlExpr(expr.operand(0));
+    }
+  }
+  return integerToHlExpr(id);
+}
+
+HlExprPtr ExprPrinter::hlCompare(il::ExprId id, std::string_view op, bool sign) {
+  const il::Expr& e = ctx_.function.expr(id);
+  const il::Expr& lhs = ctx_.function.expr(e.operand(0));
+  const uint32_t width = lhs.type.isScalarInteger() ? lhs.type.bits() : 64;
+  if (!sign) {
+    if (op == "==" || op == "!=") {
+      uint64_t leftConstant = 0;
+      uint64_t rightConstant = 0;
+      const bool leftIsConstant = ctx_.function.asConstant(e.operand(0), leftConstant);
+      const bool rightIsConstant = ctx_.function.asConstant(e.operand(1), rightConstant);
+      return hlStamp(
+          id,
+          HlExpr::makeBinary(
+              std::string{op},
+              hlEqualityOperand(e.operand(0),
+                                rightIsConstant ? std::optional<uint64_t>{rightConstant}
+                                                : std::nullopt),
+              hlEqualityOperand(e.operand(1),
+                                leftIsConstant ? std::optional<uint64_t>{leftConstant}
+                                               : std::nullopt)));
+    }
+    return hlStamp(id, HlExpr::makeBinary(std::string{op}, integerToHlExpr(e.operand(0)),
+                                          integerToHlExpr(e.operand(1))));
+  }
+  return hlStamp(id, HlExpr::makeBinary(std::string{op}, hlSignedOperand(e.operand(0), width),
+                                        hlSignedOperand(e.operand(1), width)));
+}
+
+HlExprPtr ExprPrinter::hlSignExtend(il::ExprId id) {
+  const il::Expr& e = ctx_.function.expr(id);
+  const il::Expr& source = ctx_.function.expr(e.operand(0));
+  const std::string destination = intType(e.type.bits(), true);
+  const uint32_t sourceWidth =
+      source.type.isScalarInteger() ? source.type.bits() : 64;
+  if (sourceWidth == 1) {
+    return hlStamp(id, HlExpr::makeUnary("-", HlExpr::makeCast(destination, toHlExpr(e.operand(0)))));
+  }
+  if (sourceWidth >= e.type.bits()) {
+    return hlStamp(id, HlExpr::makeCast(destination, integerToHlExpr(e.operand(0))));
+  }
+  bool alreadySigned = false;
+  if (source.op == il::ExprOp::Value) {
+    const il::ValueId valueId{static_cast<uint32_t>(source.immediate)};
+    if (const analysis::Variable* temp = ctx_.variables.tempFor(valueId);
+        temp != nullptr && temp->type.pointerDepth == 0 &&
+        temp->type.isSigned && temp->type.width == sourceWidth &&
+        !ctx_.typeOfValue(valueId).valid()) {
+      alreadySigned = true;
+    }
+  } else if (source.op == il::ExprOp::EntryReg) {
+    const il::RegId root{static_cast<uint32_t>(source.immediate)};
+    if (const analysis::Variable* arg = ctx_.variables.argumentFor(root);
+        arg != nullptr && arg->type.pointerDepth == 0 &&
+        arg->type.isSigned && arg->type.width == sourceWidth &&
+        !ctx_.argumentType(*arg).valid()) {
+      alreadySigned = true;
+    }
+  }
+  if (alreadySigned) {
+    return hlStamp(id, HlExpr::makeCast(destination, integerToHlExpr(e.operand(0))));
+  }
+  return hlStamp(
+      id, HlExpr::makeCast(destination,
+                           HlExpr::makeCast(intType(sourceWidth, true),
+                                            integerToHlExpr(e.operand(0)))));
+}
+
+HlExprPtr ExprPrinter::hlInner(il::ExprId id) {
+  const il::Expr& e = ctx_.function.expr(id);
+  switch (e.op) {
+    case il::ExprOp::Const:
+      if (e.type.bits() == 64 && e.immediate >= 0x10000 && ctx_.options.addresses) {
+        const AddressFacts facts = ctx_.options.addresses(e.immediate);
+        if (facts.cstringSection) {
+          if (const std::optional<analysis::ImageLiteral> literal =
+                  ctx_.literals.at(e.immediate, /*allowEmpty=*/true)) {
+            return hlStamp(id, HlExpr::makeStringLit(literal->text));
+          }
+        }
+        if (facts.cfstringLiteral.has_value()) {
+          const std::string* global = ctx_.globalName(e.immediate);
+          const std::string base =
+              global != nullptr ? *global : std::format("0x{:x}", e.immediate);
+          return hlStamp(id, HlExpr::makeCFStringLit(base, *facts.cfstringLiteral));
+        }
+      }
+      return hlStamp(id, HlExpr::makeConst(e.immediate));
+    case il::ExprOp::Value: {
+      const il::ValueId valueId{static_cast<uint32_t>(e.immediate)};
+      if (const std::string* temp = ctx_.tempFor(valueId)) {
+        auto node = hlStamp(id, HlExpr::makeVar(*temp));
+        if (ctx_.function.hasValue(valueId)) {
+          node->ilOp = ctx_.function.value(valueId).definition;
+        }
+        return node;
+      }
+      return hlStamp(id, HlExpr::makeRaw(std::format("/*unnamed-value-%{}*/0x0", valueId.index())));
+    }
+    case il::ExprOp::Undef:
+      return hlStamp(id, HlExpr::makeRaw("/*undef*/0x0"));
+    case il::ExprOp::EntryReg: {
+      const il::RegId root{static_cast<uint32_t>(e.immediate)};
+      if (const analysis::Variable* arg = ctx_.variables.argumentFor(root)) {
+        return hlStamp(id, HlExpr::makeVar(ctx_.argumentName(*arg)));
+      }
+      const il::RegisterInfo& info = ctx_.function.registers()[root];
+      if (info.name == "x8") {
+        ctx_.hasSret = true;
+        return hlStamp(id, HlExpr::makeVar("_sret"));
+      }
+      const std::string name = std::format("__entry_{}", info.name);
+      ctx_.entryLeaves.emplace(name, info.bits == 0 ? 64 : info.bits);
+      if (ctx_.options.entryRegs != nullptr) {
+        if (const std::optional<uint64_t> resolved =
+                ctx_.options.entryRegs->resolve(info.name)) {
+          ctx_.anchoredEntryLeaves.emplace(name, *resolved);
+        }
+      }
+      return hlStamp(id, HlExpr::makeVar(name));
+    }
+    case il::ExprOp::Add: return hlInfix(id, "+", false);
+    case il::ExprOp::Sub: return hlInfix(id, "-", false);
+    case il::ExprOp::Mul: return hlInfix(id, "*", false);
+    case il::ExprOp::And: return hlInfix(id, "&", false);
+    case il::ExprOp::Or: return hlInfix(id, "|", false);
+    case il::ExprOp::Xor: return hlInfix(id, "^", false);
+    case il::ExprOp::Shl: return hlShift(id, "<<");
+    case il::ExprOp::ShrU: return hlShift(id, ">>");
+    case il::ExprOp::ShrS:
+      return hlStamp(
+          id, hlWidthWrap(e,
+                          HlExpr::makeBinary(">>", hlSignedOperand(e.operand(0), e.type.bits()),
+                                             integerToHlExpr(e.operand(1))),
+                          true));
+    case il::ExprOp::DivU: return hlInfix(id, "/", false);
+    case il::ExprOp::RemU: return hlInfix(id, "%", false);
+    case il::ExprOp::DivS: return hlInfix(id, "/", true);
+    case il::ExprOp::RemS: return hlInfix(id, "%", true);
+    case il::ExprOp::MulHiU:
+    case il::ExprOp::MulHiS: {
+      const bool sign = e.op == il::ExprOp::MulHiS;
+      const uint32_t width = e.type.bits();
+      ctx_.helpers.insert(std::format("mulhi{}{}", sign ? "s" : "u", width));
+      std::vector<HlExprPtr> args;
+      args.push_back(integerToHlExpr(e.operand(0)));
+      args.push_back(integerToHlExpr(e.operand(1)));
+      auto call = HlExpr::makeCall(
+          HlExpr::makeVar(std::format("xdec_mulhi{}{}", sign ? "s" : "u", width)),
+          std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::RotR:
+    case il::ExprOp::RotL: {
+      const bool right = e.op == il::ExprOp::RotR;
+      const uint32_t width = e.type.bits();
+      ctx_.helpers.insert(std::format("rot{}{}", right ? "r" : "l", width));
+      std::vector<HlExprPtr> args;
+      args.push_back(integerToHlExpr(e.operand(0)));
+      args.push_back(integerToHlExpr(e.operand(1)));
+      auto call = HlExpr::makeCall(
+          HlExpr::makeVar(std::format("rot{}{}", right ? "r" : "l", width)),
+          std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::Ctz: {
+      ctx_.helpers.insert(std::format("ctz{}", e.type.bits()));
+      std::vector<HlExprPtr> args;
+      args.push_back(integerToHlExpr(e.operand(0)));
+      auto call = HlExpr::makeCall(
+          HlExpr::makeVar(std::format("xdec_ctz{}", e.type.bits())), std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::Bitcast: {
+      if (e.type.isFloat()) {
+        uint64_t bits = 0;
+        if (ctx_.function.asConstant(e.operand(0), bits)) {
+          if (e.type.bits() == 64) {
+            const double d = std::bit_cast<double>(bits);
+            if (std::isfinite(d)) {
+              std::string s = std::format("{}", d);
+              if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+                  s.find('E') == std::string::npos) {
+                s += ".0";
+              }
+              return hlStamp(id, HlExpr::makeFloatLit(std::move(s), d, 64));
+            }
+          } else if (e.type.bits() == 32) {
+            const float f = std::bit_cast<float>(static_cast<uint32_t>(bits));
+            if (std::isfinite(f)) {
+              std::string s = std::format("{}", f);
+              if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+                  s.find('E') == std::string::npos) {
+                s += ".0";
+              }
+              return hlStamp(id, HlExpr::makeFloatLit(s + "f", static_cast<double>(f), 32));
+            }
+          }
+        }
+        return hlStamp(id, HlExpr::makeCast(e.type.bits() == 32 ? "float" : "double",
+                                            integerToHlExpr(e.operand(0))));
+      }
+      return hlStamp(id, HlExpr::makeCast(intType(e.type.bits()), integerToHlExpr(e.operand(0))));
+    }
+    case il::ExprOp::Concat: {
+      const uint32_t lowWidth = ctx_.function.expr(e.operand(1)).type.bits();
+      const std::string tname = intType(e.type.bits());
+      auto hi = HlExpr::makeBinary(
+          "<<", HlExpr::makeCast(tname, integerToHlExpr(e.operand(0))),
+          HlExpr::makeConst(lowWidth));
+      auto lo = HlExpr::makeCast(tname, integerToHlExpr(e.operand(1)));
+      return hlStamp(id, HlExpr::makeBinary("|", std::move(hi), std::move(lo)));
+    }
+    case il::ExprOp::Neg:
+      return hlStamp(
+          id, hlWidthWrap(e, HlExpr::makeUnary("-", integerToHlExpr(e.operand(0))), false));
+    case il::ExprOp::Not:
+      if (e.type.bits() == 1) {
+        return hlStamp(id, HlExpr::makeUnary("!", toHlExpr(e.operand(0))));
+      }
+      return hlStamp(
+          id, hlWidthWrap(e, HlExpr::makeUnary("~", integerToHlExpr(e.operand(0))), false));
+    case il::ExprOp::CmpEq: return hlCompare(id, "==", false);
+    case il::ExprOp::CmpNe: return hlCompare(id, "!=", false);
+    case il::ExprOp::CmpLtU: return hlCompare(id, "<", false);
+    case il::ExprOp::CmpLeU: return hlCompare(id, "<=", false);
+    case il::ExprOp::CmpLtS: return hlCompare(id, "<", true);
+    case il::ExprOp::CmpLeS: return hlCompare(id, "<=", true);
+    case il::ExprOp::ZExt:
+    case il::ExprOp::Trunc: {
+      const il::Expr& source = ctx_.function.expr(e.operand(0));
+      if (source.type.isScalarInteger() && source.type.bits() == e.type.bits()) {
+        return integerToHlExpr(e.operand(0));
+      }
+      if (source.op == il::ExprOp::EntryReg) {
+        const il::RegId root{static_cast<uint32_t>(source.immediate)};
+        if (const analysis::Variable* arg = ctx_.variables.argumentFor(root);
+            arg != nullptr && arg->type.pointerDepth == 0 &&
+            arg->type.width == e.type.bits() && !ctx_.argumentType(*arg).valid()) {
+          return integerToHlExpr(e.operand(0));
+        }
+      }
+      return hlStamp(id, HlExpr::makeCast(intType(e.type.bits()), integerToHlExpr(e.operand(0))));
+    }
+    case il::ExprOp::SExt:
+      return hlSignExtend(id);
+    case il::ExprOp::Select:
+      return hlStamp(id, HlExpr::makeSelect(toHlExpr(e.operand(0)), toHlExpr(e.operand(1)),
+                                            toHlExpr(e.operand(2))));
+    case il::ExprOp::Extract: {
+      const uint32_t width = e.type.bits();
+      if (e.immediate == 0) {
+        return hlStamp(id, HlExpr::makeCast(intType(width), integerToHlExpr(e.operand(0))));
+      }
+      return hlStamp(
+          id, HlExpr::makeCast(
+                  intType(width),
+                  HlExpr::makeBinary(">>", integerToHlExpr(e.operand(0)),
+                                     HlExpr::makeConst(e.immediate))));
+    }
+    case il::ExprOp::ByteSwap:
+    case il::ExprOp::BitReverse:
+    case il::ExprOp::PopCount:
+    case il::ExprOp::Clz: {
+      std::string key;
+      std::string fn;
+      if (e.op == il::ExprOp::ByteSwap) {
+        key = std::format("bswap{}", e.type.bits());
+        fn = key;
+      } else if (e.op == il::ExprOp::BitReverse) {
+        key = std::format("brev{}", e.type.bits());
+        fn = "xdec_" + key;
+      } else if (e.op == il::ExprOp::PopCount) {
+        key = "popcount64";
+        fn = key;
+      } else {
+        key = std::format("clz{}", e.type.bits());
+        fn = "xdec_" + key;
+      }
+      ctx_.helpers.insert(std::move(key));
+      std::vector<HlExprPtr> args;
+      args.push_back(integerToHlExpr(e.operand(0)));
+      auto call = HlExpr::makeCall(HlExpr::makeVar(std::move(fn)), std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::FlagCond:
+      return hlStamp(id, HlExpr::makeRaw(printFlagCond(ctx_, *this, id)));
+    case il::ExprOp::FlagBit: {
+      ctx_.helpers.insert("flagbit");
+      std::vector<HlExprPtr> args;
+      args.push_back(toHlExpr(e.operand(0)));
+      args.push_back(HlExpr::makeConst(e.immediate));
+      auto call = HlExpr::makeCall(HlExpr::makeVar("xdec_flagbit"), std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::FlagDef:
+      return hlStamp(id, HlExpr::makeRaw("/*flagdef*/0x0"));
+    case il::ExprOp::FAdd:
+    case il::ExprOp::FSub:
+    case il::ExprOp::FMul:
+    case il::ExprOp::FDiv:
+    case il::ExprOp::FNeg:
+    case il::ExprOp::FAbs:
+    case il::ExprOp::FSqrt:
+    case il::ExprOp::FCeil: {
+      const std::string name = std::format("{}{}", il::toString(e.op), e.type.bits());
+      ctx_.helpers.insert(name);
+      std::vector<HlExprPtr> args;
+      args.reserve(e.operandCount);
+      for (unsigned index = 0; index < e.operandCount; ++index) {
+        args.push_back(toHlExpr(e.operand(index)));
+      }
+      auto call =
+          HlExpr::makeCall(HlExpr::makeVar(std::format("xdec_{}", name)), std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::FCmpEq:
+      return hlStamp(id, HlExpr::makeBinary("==", toHlExpr(e.operand(0)), toHlExpr(e.operand(1))));
+    case il::ExprOp::FCmpLt:
+      return hlStamp(id, HlExpr::makeBinary("<", toHlExpr(e.operand(0)), toHlExpr(e.operand(1))));
+    case il::ExprOp::FCmpLe:
+      return hlStamp(id, HlExpr::makeBinary("<=", toHlExpr(e.operand(0)), toHlExpr(e.operand(1))));
+    case il::ExprOp::FCmpUnordered: {
+      const uint32_t bits = ctx_.function.expr(e.operand(0)).type.bits();
+      const std::string name = std::format("fcmp_uno{}", bits);
+      ctx_.helpers.insert(name);
+      std::vector<HlExprPtr> args;
+      args.push_back(toHlExpr(e.operand(0)));
+      args.push_back(toHlExpr(e.operand(1)));
+      auto call =
+          HlExpr::makeCall(HlExpr::makeVar(std::format("xdec_{}", name)), std::move(args));
+      call->isDirectCall = true;
+      return hlStamp(id, std::move(call));
+    }
+    case il::ExprOp::FpConvert:
+      return hlStamp(id, HlExpr::makeCast(e.type.bits() == 32 ? "float" : "double",
+                                          toHlExpr(e.operand(0))));
+    case il::ExprOp::FpToIntS:
+      return hlStamp(id, HlExpr::makeCast(intType(e.type.bits(), true), toHlExpr(e.operand(0))));
+    case il::ExprOp::FpToIntU:
+      return hlStamp(id, HlExpr::makeCast(intType(e.type.bits(), false), toHlExpr(e.operand(0))));
+    case il::ExprOp::IntToFpS: {
+      const uint32_t srcBits = ctx_.function.expr(e.operand(0)).type.bits();
+      return hlStamp(id, HlExpr::makeCast(e.type.bits() == 32 ? "float" : "double",
+                                          hlSignedOperand(e.operand(0), srcBits)));
+    }
+    case il::ExprOp::IntToFpU:
+      return hlStamp(id, HlExpr::makeCast(e.type.bits() == 32 ? "float" : "double",
+                                          integerToHlExpr(e.operand(0))));
+    default:
+      return hlStamp(id, HlExpr::makeRaw(std::format("/*{}?*/0x0", il::toString(e.op))));
+  }
 }
 
 }  // namespace xdec::emit

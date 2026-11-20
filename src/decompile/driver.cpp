@@ -192,8 +192,21 @@ struct Probe {
     context.setEntryRegFacts(options.entryRegs);
     context.setPathExploreOptions(&options.pathExplore);
     context.setDiscoverySink([this, &options](const pass::Discovery& found) {
+      std::vector<uint64_t> filteredTargets = found.targets;
+      std::vector<uint64_t> filteredMissing = found.missing;
+      if (options.discoveryFilter) {
+        filteredTargets = options.discoveryFilter(found.branch, found.targets);
+        std::set<uint64_t> keep(filteredTargets.begin(), filteredTargets.end());
+        filteredMissing.erase(
+            std::remove_if(filteredMissing.begin(), filteredMissing.end(),
+                           [&keep](uint64_t va) { return !keep.contains(va); }),
+            filteredMissing.end());
+        if (filteredTargets.empty()) {
+          return;
+        }
+      }
       if (options.maxDiscoveryPerBranch != 0 &&
-          found.missing.size() > options.maxDiscoveryPerBranch) {
+          filteredMissing.size() > options.maxDiscoveryPerBranch) {
         // See DriverOptions::maxDiscoveryPerBranch. Neither the addresses nor
         // the edge is taken: the candidate set is what would have been put
         // back before SSA, and putting back a set this pass is being told not
@@ -202,11 +215,11 @@ struct Probe {
         XDEC_LOG_DEBUG(driverLog(),
                        "branch {:#x} offers {} unlifted target(s), past the {}-per-branch "
                        "cap; none are taken and the branch is left unresolved",
-                       found.branch, found.missing.size(), options.maxDiscoveryPerBranch);
+                       found.branch, filteredMissing.size(), options.maxDiscoveryPerBranch);
         return;
       }
-      discoveries.insert(found.missing.begin(), found.missing.end());
-      pending[found.branch] = found.targets;
+      discoveries.insert(filteredMissing.begin(), filteredMissing.end());
+      pending[found.branch] = std::move(filteredTargets);
     });
     XDEC_TRY_VOID(pass->run(context));
     return {};

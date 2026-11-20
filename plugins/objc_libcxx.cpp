@@ -549,7 +549,7 @@ class ObjcArcElidePass final : public xdec::pass::FunctionPass {
 }
 
 [[nodiscard]] std::optional<std::string> extractIvarField(std::string_view ivarSym) {
-  // `ivar_<Class>_<field>` (e.g. `ivar_FPManager_devToken` or `ivar_A8KeyResultCookieWriter__webView`)
+  // `ivar_<Class>_<field>` (e.g. `ivar_SessionManager_devToken` or `ivar_CookieWriter__webView`)
   if (!ivarSym.starts_with("ivar_")) {
     return std::nullopt;
   }
@@ -1121,29 +1121,17 @@ extern "C" XDEC_EXPORT std::uint32_t xdec_plugin_abi_version() {
 }
 
 extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init(xdec::pass::Registry* registry) {
-  if (registry == nullptr) {
-    return {false, "null registry"};
-  }
-  if (!registry->add(std::make_unique<ObjcArityTrimPass>())) {
-    return {false, "failed to register objc-arity-trim"};
-  }
-  if (!registry->add(std::make_unique<ObjcArcElidePass>())) {
-    return {false, "failed to register objc-retain-elide"};
-  }
-  return {true, nullptr};
-}
-
-extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init_v2(const XdecPluginHost* host) {
+xdec_plugin_init(const XdecPluginHost* host) {
   if (host == nullptr || host->passes == nullptr) {
     return {false, "null host or registry"};
   }
-  const XdecPluginInitResult base = xdec_plugin_init(host->passes);
-  if (!base.ok) {
-    return base;
+  if (!host->passes->add(std::make_unique<ObjcArityTrimPass>())) {
+    return {false, "failed to register objc-arity-trim"};
   }
-  if (host->structSize >= sizeof(XdecPluginHost) && host->hlTransforms != nullptr) {
+  if (!host->passes->add(std::make_unique<ObjcArcElidePass>())) {
+    return {false, "failed to register objc-retain-elide"};
+  }
+  if (host->hlTransforms != nullptr) {
     host->hlTransforms->push_back(objcHlAstTransform);
   }
   return {true, nullptr};

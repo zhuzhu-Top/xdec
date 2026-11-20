@@ -172,6 +172,13 @@ struct DriverOptions {
   /// Optional predicate answering whether an unconditional direct `b <target>`
   /// is a sibling tail call leaving this function rather than an internal block.
   spec::TailCallTargetTest isTailCall;
+  /// Optional hook (`IDiscoveryHook`) invoked for every indirect-branch
+  /// discovery batch before admission. Returns the filtered subset of targets
+  /// to admit (e.g. rejecting shared binary-wide jump tables or keeping only
+  /// Tracedb-observed targets).
+  using DiscoveryFilterFn = std::function<std::vector<uint64_t>(
+      uint64_t branchVa, std::span<const uint64_t> candidates)>;
+  DiscoveryFilterFn discoveryFilter;
   /// The hard backstop behind the per-round discovery-size warnings (see
   /// driver.cpp): however many addresses a round keeps discovering, the total
   /// entries a run will ever add is capped here. A real dispatcher chain

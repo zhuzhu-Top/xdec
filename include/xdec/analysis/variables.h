@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "xdec/analysis/abi.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/il/function.h"
 #include "xdec/types/binder.h"
@@ -40,6 +41,7 @@ struct CType {
   uint32_t pointerDepth = 0;
   uint32_t pointeeWidth = 0;
   bool isSigned = false;
+  bool isFloat = false;
 
   [[nodiscard]] std::string format() const;
 };
@@ -78,7 +80,8 @@ class VariableTable {
   /// Recovers the three variable kinds from a function at Ssa maturity or
   /// beyond (EntryReg leaves and stack-slot shapes must already exist).
   [[nodiscard]] static VariableTable recover(const il::Function& function,
-                                             const StackFrame& frame);
+                                             const StackFrame& frame,
+                                             const AbiSpec* abi = nullptr);
 
   /// Layers TypedVariables evidence over the CType-inferred variables: an
   /// argument, local or temp with type evidence from a call/syscall site (see

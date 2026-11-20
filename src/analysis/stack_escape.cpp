@@ -24,13 +24,23 @@ namespace {
   il::ExprId cur = value;
   for (unsigned depth = 0; depth < 4 && cur.valid(); ++depth) {
     const il::Expr& expr = function.expr(cur);
-    if ((expr.op == il::ExprOp::Trunc || expr.op == il::ExprOp::Bitcast) &&
+    if ((expr.op == il::ExprOp::Trunc || expr.op == il::ExprOp::Bitcast ||
+         expr.op == il::ExprOp::Extract) &&
         expr.operandCount == 1) {
       cur = expr.operands[0];
       continue;
     }
     break;
   }
+  const auto isCalleeSavedVecName = [](std::string_view rname) {
+    if ((rname.size() == 2 || rname.size() == 3) &&
+        (rname[0] == 'q' || rname[0] == 'd' || rname[0] == 'v')) {
+      const std::string_view num = rname.substr(1);
+      return num == "8" || num == "9" || num == "10" || num == "11" ||
+             num == "12" || num == "13" || num == "14" || num == "15";
+    }
+    return false;
+  };
   const il::Expr& expr = function.expr(cur);
   if (expr.op == il::ExprOp::Value) {
     const il::ValueId val{static_cast<uint32_t>(expr.immediate)};
@@ -39,15 +49,7 @@ namespace {
       if (defId.valid() && function.hasOp(defId) &&
           function.op(defId).code == il::OpCode::ReadReg) {
         const il::RegId root = function.registers().rootOf(function.op(defId).reg());
-        const std::string_view rname = function.registers().nameOf(root);
-        if ((rname.size() == 2 || rname.size() == 3) &&
-            (rname[0] == 'q' || rname[0] == 'd' || rname[0] == 'v')) {
-          const std::string_view num = rname.substr(1);
-          if (num == "8" || num == "9" || num == "10" || num == "11" ||
-              num == "12" || num == "13" || num == "14" || num == "15") {
-            return true;
-          }
-        }
+        return isCalleeSavedVecName(function.registers().nameOf(root));
       }
     }
     return false;
@@ -60,6 +62,9 @@ namespace {
     return false;
   }
   const std::string_view name = function.registers().nameOf(reg);
+  if (isCalleeSavedVecName(name)) {
+    return true;
+  }
   return name.size() == 3 && name[0] == 'x' &&
          ((name[1] == '1' && name[2] == '9') ||
           (name[1] == '2' && name[2] >= '0' && name[2] <= '9') ||

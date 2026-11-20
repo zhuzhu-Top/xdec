@@ -123,6 +123,11 @@ struct DecompileToCOptions {
   /// reason: profiling walks every block and every hash-consed expression
   /// once, which is only worth paying for when something reads the result.
   bool computeObfuscationProfile = false;
+  /// Optional ABI override (null uses the default AArch64 register names).
+  const analysis::AbiSpec* abi = nullptr;
+  /// When true (or when `emit.structuredExprs` is true), populate `ast` on
+  /// `DecompileToCResult` / `RenderToCResult` with the Dual-View `HlFunction`.
+  bool captureAst = false;
 };
 
 struct DecompileToCResult {
@@ -132,6 +137,7 @@ struct DecompileToCResult {
   analysis::StackFrame frame;
   emit::StructuredFunction structured;
   std::string cSource;
+  std::optional<emit::HlFunction> ast;
   DecompileReport report;
 };
 
@@ -160,6 +166,7 @@ struct RenderToCResult {
   analysis::StackFrame frame;
   emit::StructuredFunction structured;
   std::string cSource;
+  std::optional<emit::HlFunction> ast;
   DecompileReport report;
 };
 

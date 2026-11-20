@@ -1,5 +1,6 @@
 xdec_add_library(xdec_analysis
   SOURCES
+    abi.cpp
     address_expr.cpp
     analysis_cache.cpp
     atomic_exclusive.cpp
@@ -9,6 +10,7 @@ xdec_add_library(xdec_analysis
     dispatch_values.cpp
     dispatcher_shape.cpp
     dominators.cpp
+    effect_summary.cpp
     entry_reg.cpp
     execution_coverage.cpp
     expr_reuse.cpp

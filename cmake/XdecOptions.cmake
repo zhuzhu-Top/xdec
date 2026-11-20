@@ -3,6 +3,7 @@
 option(XDEC_BUILD_TESTS "Build the xdec test suite" ON)
 option(XDEC_BUILD_TOOLS "Build xdec command-line tools" ON)
 option(XDEC_BUILD_DECOMPILE "Build the decompiler and analysis stack" ON)
+option(XDEC_BUILD_PYTHON "Build the pyxdec Python extension module" OFF)
 option(XDEC_WERROR "Treat compiler warnings as errors" OFF)
 option(XDEC_ENABLE_LTO "Enable link-time optimization for release builds" OFF)
 

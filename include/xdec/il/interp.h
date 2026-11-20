@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -153,6 +154,7 @@ struct ExecOutcome {
   uint64_t target = 0;
   uint64_t fallthrough = 0;
   bool condition = false;
+  std::optional<ConcreteValue> returnValue;
   std::string detail;
 };
 
@@ -212,9 +214,28 @@ class Interpreter {
   /// Executes one block from its first op through its terminator.
   [[nodiscard]] ExecOutcome runBlock(BlockId block);
 
+  /// Decision delegate for `Call` ops during `runFunction`. Return true when
+  /// the callee was modelled (setting `result` for non-void calls).
+  using CallHook = std::function<bool(uint64_t targetVa,
+                                      std::span<const ConcreteValue> arguments,
+                                      ConcreteValue& result)>;
+
+  /// Executes an entire function starting at `entry` across CFG edges (and
+  /// evaluating Phi nodes on SSA/Vars functions). Stops at `Return`, an
+  /// unhandled `Call` / `IndirectBranch` (unless `target == returnSentinelVa`),
+  /// or `maxSteps` blocks.
+  [[nodiscard]] ExecOutcome runFunction(BlockId entry, CallHook callHook = {},
+                                        uint64_t returnSentinelVa = 0,
+                                        std::size_t maxSteps = 1'000'000);
+
  private:
   [[nodiscard]] Result<ConcreteValue> eval(ExprId id, unsigned depth);
-  [[nodiscard]] Result<ConcreteValue> evalFlagsOperand(ExprId id, unsigned depth);
+  [[nodiscard]] Result<ConcreteValue> evalImpl(
+      ExprId id, unsigned depth,
+      std::unordered_map<uint32_t, ConcreteValue>& memo);
+  [[nodiscard]] Result<ConcreteValue> evalFlagsOperand(
+      ExprId id, unsigned depth,
+      std::unordered_map<uint32_t, ConcreteValue>& memo);
   [[nodiscard]] ExecOutcome fail(std::string message, uint64_t va);
 
   const Function* function_;
@@ -229,6 +250,8 @@ class Interpreter {
   /// One cell per root register. Sub-register reads and writes resolve through
   /// the view chain; flags registers keep their four materialised bits in `lo`.
   std::vector<ConcreteValue> registers_;
+  std::vector<ConcreteValue> entryRegisters_;
+  bool useEntrySnapshot_ = false;
   std::vector<ConcreteValue> values_;
   std::vector<bool> defined_;
 };

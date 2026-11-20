@@ -1,5 +1,6 @@
 xdec_add_library(xdec_il
   SOURCES
+    builder.cpp
     ceval.cpp
     expr.cpp
     expr_roots.cpp

@@ -427,4 +427,30 @@ TEST_CASE("unsigned-negative 32-bit add prints as subtraction and float bitcast 
   CHECK(contains(text, "sub_20000(3.0)"));
 }
 
+TEST_CASE("float comparisons and casts emit cleanly without stub comments",
+          "[emit][expr][float]") {
+  Fixture f;
+  const ExprId a = f.function.cast(ExprOp::Bitcast, Type::floating(64), f.entryReg("x0"));
+  const ExprId b = f.function.cast(ExprOp::Bitcast, Type::floating(64), f.entryReg("x1"));
+  f.observe(f.function.binary(ExprOp::FCmpEq, a, b));
+  f.observe(f.function.binary(ExprOp::FCmpLt, a, b));
+  f.observe(f.function.binary(ExprOp::FCmpLe, a, b));
+  f.observe(f.function.binary(ExprOp::FCmpUnordered, a, b));
+  f.observe(f.function.cast(ExprOp::FpConvert, Type::floating(32), a));
+  f.observe(f.function.cast(ExprOp::FpToIntS, Type::integer(32), a));
+  f.observe(f.function.cast(ExprOp::IntToFpS, Type::floating(64), f.entryReg("x2")));
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(!contains(text, "fcmp.uno?"));
+  CHECK(!contains(text, "?*/"));
+  CHECK(contains(text, "xdec_fcmp_uno64("));
+  CHECK(contains(text, "(((double)(arg1)) == ((double)(arg2)))"));
+  CHECK(contains(text, "(((double)(arg1)) < ((double)(arg2)))"));
+  CHECK(contains(text, "(((double)(arg1)) <= ((double)(arg2)))"));
+  CHECK(contains(text, "((float)(((double)(arg1))))"));
+  CHECK(contains(text, "((int32_t)(((double)(arg1))))"));
+  CHECK(contains(text, "((double)((int64_t)(arg3)))"));
+}
+
 }  // namespace

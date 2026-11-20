@@ -37,11 +37,12 @@
 #include "xdec/emit/ast.h"
 #include "xdec/emit/structure.h"
 #include "xdec/pass/registry.h"
+#include "xdec/passes/algebra_rules.h"
 #include "xdec/support/compiler.h"
 
 /// Bumped on any change to what a plugin sees: PassInfo layout, Maturity
 /// values, registration protocol.
-inline constexpr std::uint32_t XDEC_PLUGIN_ABI_VERSION = 1;
+inline constexpr std::uint32_t XDEC_PLUGIN_ABI_VERSION = 2;
 
 extern "C" {
 
@@ -49,7 +50,6 @@ extern "C" {
 /// drift apart by a typo that compiles fine on both sides.
 inline constexpr const char* XDEC_PLUGIN_VERSION_SYMBOL = "xdec_plugin_abi_version";
 inline constexpr const char* XDEC_PLUGIN_INIT_SYMBOL = "xdec_plugin_init";
-inline constexpr const char* XDEC_PLUGIN_INIT_V2_SYMBOL = "xdec_plugin_init_v2";
 
 /// Result of the init call. `message` must point to static storage inside the
 /// plugin (a string literal); it is read only when `ok` is false.
@@ -58,18 +58,19 @@ struct XdecPluginInitResult {
   const char* message;
 };
 
-/// Extended plugin registration context: allows a plugin to register both IL
-/// passes and post-structuring AST transforms without modifying core code.
+/// Plugin registration context: allows a plugin to register IL passes,
+/// post-structuring AST transforms, HL AST transforms, and oracle-verified
+/// algebra rules without modifying core code.
 struct XdecPluginHost {
   std::uint32_t structSize;
   xdec::pass::Registry* passes;
   std::vector<xdec::emit::AstTransformFn>* astTransforms;
   std::vector<xdec::emit::HlAstTransformFn>* hlTransforms;
+  xdec::passes::AlgebraRuleRegistry* algebraRules;
 };
 
 using XdecPluginAbiVersionFn = std::uint32_t (*)();
-using XdecPluginInitFn = XdecPluginInitResult (*)(xdec::pass::Registry* registry);
-using XdecPluginInitV2Fn = XdecPluginInitResult (*)(const XdecPluginHost* host);
+using XdecPluginInitFn = XdecPluginInitResult (*)(const XdecPluginHost* host);
 
 }  // extern "C"
 
@@ -79,7 +80,7 @@ using XdecPluginInitV2Fn = XdecPluginInitResult (*)(const XdecPluginHost* host);
 ///     return XDEC_PLUGIN_ABI_VERSION;
 ///   }
 ///   extern "C" XDEC_EXPORT XdecPluginInitResult
-///   xdec_plugin_init(xdec::pass::Registry* registry) {
-///     ... register passes ...
+///   xdec_plugin_init(const XdecPluginHost* host) {
+///     ... register passes / transforms / algebra rules ...
 ///     return {true, nullptr};
 ///   }

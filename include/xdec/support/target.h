@@ -30,6 +30,8 @@ enum class Arch : uint8_t {
   Mips64,
   PowerPc64,
   LoongArch64,
+  Custom32,
+  Custom64,
 };
 
 /// Canonical lowercase name, also the directory name under `spec/`.

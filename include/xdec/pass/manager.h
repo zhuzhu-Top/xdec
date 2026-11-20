@@ -108,6 +108,12 @@ class Manager {
     pathExplore_ = options;
   }
 
+  /// See Context::setAbi. Must outlive the pipeline.
+  void setAbi(const analysis::AbiSpec* abi) noexcept { abi_ = abi; }
+
+  /// See Context::setRegions. Must outlive the pipeline.
+  void setRegions(const devirt::MemoryRegionMap* regions) noexcept { regions_ = regions; }
+
   /// The image's symbol table, as passes ask about it (see Context::setNames).
   void setNames(NameAt names) { names_ = std::move(names); }
 
@@ -148,6 +154,8 @@ class Manager {
   std::function<void(const Discovery&)> discoverySink_;
   const analysis::EntryRegFacts* entryRegs_ = nullptr;
   const analysis::PathExploreOptions* pathExplore_ = nullptr;
+  const analysis::AbiSpec* abi_ = nullptr;
+  const devirt::MemoryRegionMap* regions_ = nullptr;
 };
 
 }  // namespace xdec::pass

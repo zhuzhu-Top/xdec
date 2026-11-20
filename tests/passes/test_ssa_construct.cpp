@@ -377,4 +377,73 @@ TEST_CASE(
   CHECK(data.immediate == x1Read.index());
 }
 
+TEST_CASE("vector and float registers participate in SSA phis and callee-saved survival",
+          "[passes][ssa][vector]") {
+  il::RegisterFile regs = xdec::test::arm64Registers();
+  const RegId q8 = regs.add("q8", 128, il::RegClass::Vector);
+  regs.addSubRegister("d8", q8, 0, 64, true);
+
+  Function fn(Arch::AArch64, regs, 0x1000);
+  const BlockId entry = fn.createBlock(0x1000);
+  fn.setEntryBlock(entry);
+  const BlockId left = fn.createBlock(0x2000);
+  const BlockId right = fn.createBlock(0x3000);
+  const BlockId join = fn.createBlock(0x4000);
+
+  const ExprId cond = fn.binary(
+      ExprOp::CmpEq, fn.valueRef(fn.appendReadReg(entry, 0x1000, regs.find("x0"))),
+      fn.constant(Type::integer(64), 0));
+  fn.appendCondBranch(entry, 0x1004, cond, left, right);
+
+  // left: s0 = 1.0f; q8 survives call
+  fn.appendWriteReg(left, 0x2000, regs.find("s0"),
+                    fn.constant(Type::integer(32), 0x3f800000u));
+  fn.appendCall(left, 0x2004, fn.constant(Type::integer(64), 0x9000), Type::integer(64));
+  fn.appendBranch(left, 0x2008, join);
+
+  // right: s0 = 2.0f
+  fn.appendWriteReg(right, 0x3000, regs.find("s0"),
+                    fn.constant(Type::integer(32), 0x40000000u));
+  fn.appendBranch(right, 0x3004, join);
+
+  // join: read s0 -> store; read q8 -> store; ret
+  const il::ValueId s0Join = fn.appendReadReg(join, 0x4000, regs.find("s0"));
+  fn.appendStore(join, 0x4004, Type::integer(32), fn.constant(Type::integer(64), 0xa000),
+                 fn.valueRef(s0Join));
+  const il::ValueId q8Join = fn.appendReadReg(join, 0x4008, q8);
+  fn.appendStore(join, 0x400c, Type::integer(128), fn.constant(Type::integer(64), 0xa010),
+                 fn.valueRef(q8Join));
+  fn.appendReturn(join, 0x4010);
+
+  fn.rebuildEdges();
+  fn.setMaturity(Maturity::Cfg);
+  runSsa(fn);
+  REQUIRE(verifiesCleanAt(fn, Maturity::Ssa));
+
+  // No ReadReg/WriteReg on q0/s0/q8 should survive SSA construction.
+  for (const BlockId bid : fn.blockHandles()) {
+    for (const il::OpId oid : fn.block(bid).ops) {
+      const il::Op& op = fn.op(oid);
+      CHECK(op.code != OpCode::ReadReg);
+      CHECK(op.code != OpCode::WriteReg);
+    }
+  }
+  // join must have a 128-bit Phi merging q0 from left and right, and q8 must
+  // remain EntryReg(q8) across the call in `left`.
+  const il::Block& joinBlock = fn.block(join);
+  bool sawQ0Phi = false;
+  for (const il::OpId oid : joinBlock.ops) {
+    const il::Op& op = fn.op(oid);
+    if (op.code == OpCode::Phi && op.type == Type::integer(128)) {
+      sawQ0Phi = true;
+    }
+    if (op.code == OpCode::Store && op.type == Type::integer(128)) {
+      const il::Expr& data = fn.expr(fn.operands(op)[1]);
+      CHECK(data.op == ExprOp::EntryReg);
+      CHECK(regs.nameOf(RegId{static_cast<uint32_t>(data.immediate)}) == "q8");
+    }
+  }
+  CHECK(sawQ0Phi);
+}
+
 }  // namespace

@@ -9,6 +9,7 @@
 #include "xdec/passes/local_simplify.h"
 #include "xdec/passes/recover_syscall.h"
 #include "xdec/passes/recover_tailcall.h"
+#include "xdec/passes/region_mem2reg.h"
 #include "xdec/passes/resolve_call.h"
 #include "xdec/passes/resolve_indirect.h"
 #include "xdec/passes/ssa_construct.h"
@@ -33,10 +34,12 @@ void registerBuiltinPasses(pass::Registry& registry) {
   // this folds are the leaves SCCP and the algebra rules need literal before
   // an obfuscated expression tree can collapse at all.
   (void)registry.add(makeConstFoldMemoryPass());
+  (void)registry.add(makeRegionMem2RegPass());
   (void)registry.add(makeSsaOptimizePass());
   // After the optimiser: stack-prop wants folded addresses and entry leaves,
   // and same-level passes run in registration order.
   (void)registry.add(makeStackPropPass());
+  (void)registry.add(makeRegionDsePass());
   // Before resolve-call, because the call this creates out of a tail-calling
   // indirect branch is one resolve-call can then prove direct or name as an
   // import, exactly like a `blr` the lifter produced.

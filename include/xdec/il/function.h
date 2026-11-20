@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -49,6 +50,7 @@ struct Block {
 class Function {
  public:
   Function(Arch arch, const RegisterFile& registers, uint64_t entryVa);
+  Function(Arch arch, std::shared_ptr<const RegisterFile> registers, uint64_t entryVa);
 
   Function(const Function&) = delete;
   Function& operator=(const Function&) = delete;
@@ -289,6 +291,7 @@ class Function {
   ValueId defineValue(Type type, OpId definition, BlockId block);
 
   Arch arch_ = Arch::Unknown;
+  std::shared_ptr<const RegisterFile> ownedRegisters_;
   const RegisterFile* registers_ = nullptr;
   uint64_t entryVa_ = 0;
   std::string name_;

@@ -11,8 +11,10 @@ xdec_add_library(xdec_decompile
     analysis_cache_observer.cpp
     driver.cpp
     emit.cpp
+    from_il.cpp
   DEPS
     xdec_analysis
+    xdec_devirt
     xdec_emit
     xdec_pass
     xdec_passes

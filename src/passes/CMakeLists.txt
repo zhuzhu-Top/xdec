@@ -1,6 +1,7 @@
 xdec_add_library(xdec_passes
   SOURCES
     algebra.cpp
+    algebra_rules.cpp
     annotate_stack_canary.cpp
     apply_types.cpp
     algebra_idioms.cpp
@@ -15,6 +16,7 @@ xdec_add_library(xdec_passes
     local_simplify.cpp
     recover_syscall.cpp
     recover_tailcall.cpp
+    region_mem2reg.cpp
     resolve_call.cpp
     resolve_indirect.cpp
     ssa_construct.cpp
@@ -24,6 +26,7 @@ xdec_add_library(xdec_passes
     vars.cpp
   DEPS
     xdec_analysis
+    xdec_devirt
     xdec_il
     xdec_pass
     xdec_types

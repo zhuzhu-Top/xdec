@@ -15,6 +15,15 @@ Function::Function(Arch arch, const RegisterFile& registers, uint64_t entryVa)
   passIndex_.emplace("lift", kPassLifter);
 }
 
+Function::Function(Arch arch, std::shared_ptr<const RegisterFile> registers, uint64_t entryVa)
+    : arch_(arch),
+      ownedRegisters_(std::move(registers)),
+      registers_(ownedRegisters_.get()),
+      entryVa_(entryVa) {
+  passNames_.emplace_back("lift");
+  passIndex_.emplace("lift", kPassLifter);
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------

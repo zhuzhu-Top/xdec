@@ -15,6 +15,7 @@
 #pragma once
 
 #include "xdec/decompile/emit.h"
+#include "xdec/decompile/from_il.h"
 
 namespace xdec {
 
@@ -45,5 +46,7 @@ using DecompileReport = decompile::DecompileReport;
 /// both cheap to build once and reuse across many `entry` values in the same
 /// binary, which is why neither is owned by `options`.
 using decompile::decompileToC;
+using decompile::DecompileFromILOptions;
+using decompile::decompileFromIL;
 
 }  // namespace xdec

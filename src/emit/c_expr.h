@@ -13,8 +13,15 @@
 #include <vector>
 
 #include "c_context.h"
+#include "xdec/emit/ast.h"
 
 namespace xdec::emit {
+
+struct PendingCseDecl {
+  std::string name;
+  std::string text;
+  HlExprPtr ast;
+};
 
 class ExprPrinter {
  public:
@@ -22,10 +29,12 @@ class ExprPrinter {
 
   /// The expression as C.
   [[nodiscard]] std::string text(il::ExprId id);
+  [[nodiscard]] HlExprPtr toHlExpr(il::ExprId id);
 
   /// The expression in a context that does integer arithmetic on it: a
   /// recovered pointer variable is cast back to an integer first.
   [[nodiscard]] std::string integerOperand(il::ExprId id);
+  [[nodiscard]] HlExprPtr integerToHlExpr(il::ExprId id);
 
   /// The expression as a pointer to `width` bits, for a context that takes
   /// the address itself rather than dereferencing it -- an ACLE atomic call
@@ -37,6 +46,7 @@ class ExprPrinter {
   /// otherwise, the same as `integerOperand`'s plain text would be cast by
   /// whatever dereferences it.
   [[nodiscard]] std::string pointerOperand(il::ExprId id, uint32_t width);
+  [[nodiscard]] HlExprPtr pointerToHlExpr(il::ExprId id, uint32_t width);
 
   // -- root contexts ---------------------------------------------------------
   //
@@ -54,10 +64,13 @@ class ExprPrinter {
   // would otherwise just repeat what the assignment already does.
   [[nodiscard]] std::string rootText(il::ExprId id);
   [[nodiscard]] std::string rootInteger(il::ExprId id);
+  [[nodiscard]] HlExprPtr rootToHlExpr(il::ExprId id);
+  [[nodiscard]] HlExprPtr rootIntegerToHlExpr(il::ExprId id);
 
   /// A branch condition, optionally inverted. Inverting the comparison
   /// operator itself avoids walls of `!((x != y))` in structured guards.
   [[nodiscard]] std::string condition(il::ExprId id, bool invert);
+  [[nodiscard]] HlExprPtr conditionToHlExpr(il::ExprId id, bool invert);
 
   // -- subexpression sharing ------------------------------------------------
   //
@@ -93,6 +106,7 @@ class ExprPrinter {
   /// other run's `assignedText`/`exprText` reaches the same ExprId.
   void extendScope(const std::vector<il::ExprId>& moreRoots);
   [[nodiscard]] std::vector<std::string> takePendingDecls();
+  [[nodiscard]] std::vector<PendingCseDecl> takePendingHlDecls();
 
   /// For a `Store`'s own value operand (see `c_stmt.cpp`'s `Store` case,
   /// docs/09 shape H2): if `id` is about to be named for the first time in
@@ -123,9 +137,27 @@ class ExprPrinter {
     bool pointer = false;
   };
 
+  struct HlNode {
+    HlExprPtr expr;
+    bool pointer = false;
+  };
+
   [[nodiscard]] Text value(il::ExprId id);
   [[nodiscard]] Text materialized(il::ExprId id);
   [[nodiscard]] std::string inner(il::ExprId id);
+
+  [[nodiscard]] HlNode hlValue(il::ExprId id);
+  [[nodiscard]] HlNode hlMaterialized(il::ExprId id);
+  [[nodiscard]] HlExprPtr hlInner(il::ExprId id);
+  [[nodiscard]] HlExprPtr hlInfix(il::ExprId id, std::string_view op, bool sign);
+  [[nodiscard]] HlExprPtr hlShift(il::ExprId id, std::string_view op);
+  [[nodiscard]] HlExprPtr hlCompare(il::ExprId id, std::string_view op, bool sign);
+  [[nodiscard]] HlExprPtr hlSignExtend(il::ExprId id);
+  [[nodiscard]] HlExprPtr hlSignedOperand(il::ExprId id, uint32_t width);
+  [[nodiscard]] HlExprPtr hlEqualityOperand(il::ExprId id,
+                                            std::optional<uint64_t> comparedConstant);
+  [[nodiscard]] HlExprPtr hlWidthWrap(const il::Expr& expr, HlExprPtr node, bool sign);
+  [[nodiscard]] HlExprPtr hlStamp(il::ExprId id, HlExprPtr node) const;
 
   [[nodiscard]] std::string infix(il::ExprId id, std::string_view op, bool sign);
   [[nodiscard]] std::string shift(il::ExprId id, std::string_view op);
@@ -162,7 +194,7 @@ class ExprPrinter {
   unsigned cseCounter_ = 0;
   std::unordered_map<uint32_t, unsigned> referenceCounts_;
   std::unordered_map<uint32_t, Text> materializedText_;
-  std::vector<std::string> pendingDecls_;
+  std::vector<PendingCseDecl> pendingDecls_;
 };
 
 }  // namespace xdec::emit

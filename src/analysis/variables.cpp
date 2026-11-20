@@ -18,6 +18,14 @@ namespace xdec::analysis {
 
 std::string CType::format() const {
   if (pointerDepth == 0) {
+    if (isFloat) {
+      if (width == 32) {
+        return "float";
+      }
+      if (width == 64) {
+        return "double";
+      }
+    }
     if (width == 1) {
       // A one-bit variable is a condition -- a phi merging two comparisons, or a
       // carry carried across blocks. `uint1_t` is not a type in any C, so the
@@ -255,14 +263,6 @@ il::ExprId addressBase(const il::Function& function, il::ExprId address) {
     }
   }
   return cur;
-}
-
-[[nodiscard]] int argumentIndex(const il::Function& function, il::RegId root) {
-  const std::string_view name = function.registers().nameOf(root);
-  if (name.size() == 2 && name[0] == 'x' && name[1] >= '0' && name[1] <= '7') {
-    return name[1] - '0';
-  }
-  return -1;
 }
 
 [[nodiscard]] uint32_t significantBits(uint64_t value) {
@@ -609,7 +609,8 @@ void coalescePhis(const il::Function& function, std::span<const il::OpId> phis,
 
   const auto sameCType = [](const CType& a, const CType& b) {
     return a.width == b.width && a.pointerDepth == b.pointerDepth &&
-           a.pointeeWidth == b.pointeeWidth && a.isSigned == b.isSigned;
+           a.pointeeWidth == b.pointeeWidth && a.isSigned == b.isSigned &&
+           a.isFloat == b.isFloat;
   };
 
   const auto sortedOverlaps = [](const std::vector<uint32_t>& a,
@@ -778,17 +779,21 @@ void coalescePhis(const il::Function& function, std::span<const il::OpId> phis,
 }  // namespace
 
 VariableTable VariableTable::recover(const il::Function& function,
-                                     const StackFrame& frame) {
+                                     const StackFrame& frame,
+                                     const AbiSpec* explicitAbi) {
+  const AbiSpec defaultAbi =
+      explicitAbi == nullptr ? AbiSpec::defaultFor(function) : AbiSpec{};
+  const AbiSpec& activeAbi = explicitAbi != nullptr ? *explicitAbi : defaultAbi;
   VariableTable table;
   Scan scan(function);
   scan.run();
 
-  // Arguments: entry leaves of x0..x7. One variable per register, as wide as the
-  // body reads it rather than as wide as the register is.
+  // Arguments: entry leaves of argument registers. One variable per register,
+  // as wide as the body reads it rather than as wide as the register is.
   for (const il::ExprId leaf : scan.entryLeaves_) {
     const il::Expr& expr = function.expr(leaf);
     const il::RegId root{static_cast<uint32_t>(expr.immediate)};
-    const int index = argumentIndex(function, root);
+    const int index = activeAbi.argIndex(root);
     if (index < 0 || table.argByRoot_.contains(root.index())) {
       continue;
     }
@@ -914,7 +919,9 @@ VariableTable VariableTable::recover(const il::Function& function,
     var.kind = VarKind::Temp;
     var.name = std::format("t{}", ordinal++);
     var.value = op.result;
-    var.type.width = function.value(op.result).type.bits();
+    const il::Type valType = function.value(op.result).type;
+    var.type.width = valType.bits();
+    var.type.isFloat = valType.isFloat();
     table.tempByValue_[op.result.index()] =
         static_cast<uint32_t>(table.temps_.size());
     table.temps_.push_back(std::move(var));
@@ -1086,7 +1093,7 @@ VariableTable VariableTable::recover(const il::Function& function,
       continue;
     }
     for (const LiveRegisterSlot& slot : dispatcherFrame->slots) {
-      const int index = argumentIndex(function, slot.reg);
+      const int index = activeAbi.argIndex(slot.reg);
       if (index < 0) {
         continue;
       }

@@ -32,6 +32,10 @@ std::string_view toString(Arch arch) noexcept {
       return "ppc64";
     case Arch::LoongArch64:
       return "loongarch64";
+    case Arch::Custom32:
+      return "custom32";
+    case Arch::Custom64:
+      return "custom64";
   }
   return "unknown";
 }
@@ -60,6 +64,10 @@ bool parseArch(std::string_view name, Arch& out) noexcept {
     out = Arch::PowerPc64;
   } else if (name == "loongarch64") {
     out = Arch::LoongArch64;
+  } else if (name == "custom32") {
+    out = Arch::Custom32;
+  } else if (name == "custom64") {
+    out = Arch::Custom64;
   } else {
     return false;
   }
@@ -74,12 +82,14 @@ unsigned pointerBits(Arch arch) noexcept {
     case Arch::Mips64:
     case Arch::PowerPc64:
     case Arch::LoongArch64:
+    case Arch::Custom64:
       return 64;
     case Arch::Arm32:
     case Arch::Thumb:
     case Arch::X86:
     case Arch::RiscV32:
     case Arch::Mips32:
+    case Arch::Custom32:
       return 32;
     case Arch::Unknown:
       return 0;
@@ -103,6 +113,8 @@ unsigned fixedInstructionSize(Arch arch) noexcept {
     case Arch::RiscV64:
     case Arch::X86:
     case Arch::X86_64:
+    case Arch::Custom32:
+    case Arch::Custom64:
     case Arch::Unknown:
       return 0;
   }

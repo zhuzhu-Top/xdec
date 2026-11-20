@@ -1,0 +1,13 @@
+xdec_add_library(xdec_devirt
+  SOURCES
+    memory.cpp
+    oracle.cpp
+    specializer.cpp
+    verifier.cpp
+  DEPS
+    xdec_analysis
+    xdec_exec
+    xdec_il
+    xdec_pass
+    xdec_storage
+    xdec_support)

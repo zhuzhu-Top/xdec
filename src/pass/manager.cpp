@@ -69,6 +69,8 @@ Result<std::vector<RunStats>> Manager::run(
     context.setSyscallTable(syscalls_);
     context.setEntryRegFacts(entryRegs_);
     context.setPathExploreOptions(pathExplore_);
+    context.setAbi(abi_);
+    context.setRegions(regions_);
     if (names_) {
       context.setNames(names_);
     }

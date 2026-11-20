@@ -155,6 +155,10 @@ struct COptions {
   bool objcSyntax = true;
   /// Target output dialect (`EmitLanguage::C` or `EmitLanguage::Objc`).
   EmitLanguage language = EmitLanguage::C;
+  /// When true, `lowerToHlAst` builds full structured `HlExpr` trees
+  /// (Binary/Unary/Cast/Deref/AddressOf/Select/...) with `il::ExprId`/`il::OpId`
+  /// provenance instead of collapsing expressions to `HlExprKind::Raw`.
+  bool structuredExprs = false;
   /// High-level AST transforms applied after `lowerToHlAst` and before rendering.
   std::vector<HlAstTransformFn> hlTransforms;
   /// How to name addresses: callees, and the function itself. Absent means
@@ -212,10 +216,21 @@ struct COptions {
   std::string helpersHeader = "xdec_helpers.h";
 };
 
+struct PrintResult {
+  std::string text;
+  HlFunction ast;
+};
+
 [[nodiscard]] std::string printFunction(const il::Function& function,
                                         const analysis::VariableTable& variables,
                                         const analysis::StackFrame& frame,
                                         const StructuredFunction& structured,
                                         const COptions& options = {});
+
+[[nodiscard]] PrintResult printFunctionWithAst(const il::Function& function,
+                                               const analysis::VariableTable& variables,
+                                               const analysis::StackFrame& frame,
+                                               const StructuredFunction& structured,
+                                               const COptions& options = {});
 
 }  // namespace xdec::emit

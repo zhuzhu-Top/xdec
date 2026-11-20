@@ -181,13 +181,38 @@ class AstLowerer {
 
  private:
   struct SelectChain {
-    std::vector<std::pair<std::string, std::string>> arms;
+    struct Arm {
+      il::ExprId condId;
+      il::ExprId takenId;
+      std::string cond;
+      std::string taken;
+    };
+    std::vector<Arm> arms;
+    il::ExprId fallbackId;
     std::string fallback;
   };
 
   using StmtList = std::vector<HlStmtPtr>;
 
   void flushPending(StmtList& out) {
+    if (ctx_.options.structuredExprs) {
+      for (PendingCseDecl& decl : expressions_.takePendingHlDecls()) {
+        if (decl.ast) {
+          out.push_back(HlStmt::makeAssign(HlExpr::makeVar(std::move(decl.name)),
+                                           std::move(decl.ast)));
+        } else if (!decl.text.empty()) {
+          if (decl.text.back() == ';') {
+            decl.text.pop_back();
+          }
+          const std::size_t eq = decl.text.find(" = ");
+          if (eq != std::string::npos) {
+            out.push_back(HlStmt::makeAssign(HlExpr::makeVar(decl.text.substr(0, eq)),
+                                             HlExpr::makeRaw(decl.text.substr(eq + 3))));
+          }
+        }
+      }
+      return;
+    }
     for (std::string& decl : expressions_.takePendingDecls()) {
       if (!decl.empty() && decl.back() == ';') {
         decl.pop_back();
@@ -201,6 +226,93 @@ class AstLowerer {
         out.push_back(HlStmt::makeExprStmt(HlExpr::makeRaw(std::move(decl))));
       }
     }
+  }
+
+  [[nodiscard]] bool structured() const noexcept { return ctx_.options.structuredExprs; }
+
+  [[nodiscard]] HlExprPtr exprHl(il::ExprId id, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.toHlExpr(id);
+      flushPending(out);
+      return e;
+    }
+    return HlExpr::makeRaw(exprText(id, out));
+  }
+
+  [[nodiscard]] HlExprPtr exprIntHl(il::ExprId id, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.integerToHlExpr(id);
+      flushPending(out);
+      return e;
+    }
+    return HlExpr::makeRaw(exprInt(id, out));
+  }
+
+  [[nodiscard]] HlExprPtr exprPointerHl(il::ExprId id, uint32_t width, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.pointerToHlExpr(id, width);
+      flushPending(out);
+      return e;
+    }
+    return HlExpr::makeRaw(exprPointer(id, width, out));
+  }
+
+  [[nodiscard]] HlExprPtr assignedHl(il::ExprId id, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.rootToHlExpr(id);
+      flushPending(out);
+      return e;
+    }
+    return HlExpr::makeRaw(assignedText(id, out));
+  }
+
+  [[nodiscard]] HlExprPtr assignedIntHl(il::ExprId id, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.rootIntegerToHlExpr(id);
+      flushPending(out);
+      return e;
+    }
+    return HlExpr::makeRaw(assignedInt(id, out));
+  }
+
+  [[nodiscard]] HlExprPtr condHl(il::ExprId id, bool invert, StmtList& out) {
+    if (structured()) {
+      HlExprPtr e = expressions_.conditionToHlExpr(id, invert);
+      flushPending(out);
+      return e;
+    }
+    const std::string c = expressions_.condition(id, invert);
+    flushPending(out);
+    return HlExpr::makeRaw(c);
+  }
+
+  static void collectStructIlBlocks(const Stmt* s, std::vector<il::BlockId>& out) {
+    if (s == nullptr) {
+      return;
+    }
+    const auto pushUnique = [&out](il::BlockId id) {
+      if (!id.valid()) {
+        return;
+      }
+      for (const il::BlockId existing : out) {
+        if (existing == id) {
+          return;
+        }
+      }
+      out.push_back(id);
+    };
+    pushUnique(s->block);
+    for (const StmtPtr& item : s->items) {
+      collectStructIlBlocks(item.get(), out);
+    }
+    collectStructIlBlocks(s->thenArm.get(), out);
+    collectStructIlBlocks(s->elseArm.get(), out);
+    collectStructIlBlocks(s->body.get(), out);
+    for (const StmtPtr& arm : s->caseBodies) {
+      collectStructIlBlocks(arm.get(), out);
+    }
+    collectStructIlBlocks(s->defaultBody.get(), out);
+    collectStructIlBlocks(s->epilogue.get(), out);
   }
 
   [[nodiscard]] std::string exprText(il::ExprId id, StmtList& out) {
@@ -345,8 +457,7 @@ class AstLowerer {
   void lowerIf(const Stmt& stmt, StmtList& out) {
     const il::BlockId head = last_;
     expressions_.beginScope({stmt.cond});
-    const std::string condition = expressions_.condition(stmt.cond, stmt.invertCond);
-    flushPending(out);
+    HlExprPtr condition = condHl(stmt.cond, stmt.invertCond, out);
 
     il::BlockId taken;
     il::BlockId untaken;
@@ -391,9 +502,11 @@ class AstLowerer {
       elseBody = makeSeq(std::move(elseItems));
     }
 
-    out.push_back(HlStmt::makeIf(HlExpr::makeRaw(condition),
+    auto ifStmt = HlStmt::makeIf(std::move(condition),
                                  makeSeq(std::move(thenItems)),
-                                 std::move(elseBody)));
+                                 std::move(elseBody));
+    ifStmt->ilBlock = head;
+    out.push_back(std::move(ifStmt));
     pending_ = il::BlockId{};
     last_ = head;
     if (stmt.epilogue) {
@@ -415,13 +528,14 @@ class AstLowerer {
       return;
     }
     expressions_.beginScope({stmt.cond});
-    const std::string condition = expressions_.condition(stmt.cond, stmt.invertCond);
-    flushPending(out);
+    HlExprPtr condition = condHl(stmt.cond, stmt.invertCond, out);
 
     pending_ = header;
     StmtList bodyItems;
     lowerStmt(stmt.body, bodyItems);
-    out.push_back(HlStmt::makeWhile(HlExpr::makeRaw(condition), makeSeq(std::move(bodyItems))));
+    auto whileStmt = HlStmt::makeWhile(std::move(condition), makeSeq(std::move(bodyItems)));
+    whileStmt->ilBlock = header;
+    out.push_back(std::move(whileStmt));
     pending_ = header;
     last_ = header;
   }
@@ -445,6 +559,28 @@ class AstLowerer {
     return negate ? std::format("!({})", text) : text;
   }
 
+  [[nodiscard]] HlExprPtr doWhileConditionHl(il::ExprId cond, bool invertCond, StmtList& out) {
+    if (!structured()) {
+      return HlExpr::makeRaw(doWhileCondition(cond, invertCond, out));
+    }
+    const il::Expr& e = ctx_.function.expr(cond);
+    bool negate = invertCond;
+    il::ExprId operand{};
+    uint64_t constant = 0;
+    if (e.op == il::ExprOp::CmpNe || e.op == il::ExprOp::CmpEq) {
+      if (ctx_.function.asConstant(e.operand(1), constant) && constant == 0) {
+        operand = e.operand(0);
+      } else if (ctx_.function.asConstant(e.operand(0), constant) && constant == 0) {
+        operand = e.operand(1);
+      }
+      if (operand.valid() && e.op == il::ExprOp::CmpEq) {
+        negate = !negate;
+      }
+    }
+    HlExprPtr inner = operand.valid() ? exprIntHl(operand, out) : assignedHl(cond, out);
+    return negate ? HlExpr::makeUnary("!", std::move(inner)) : std::move(inner);
+  }
+
   void lowerDoWhile(const Stmt& stmt, StmtList& out) {
     const il::BlockId header = stmt.block;
     consumePending(header, out);
@@ -455,14 +591,29 @@ class AstLowerer {
     lowerStmt(stmt.body, bodyItems);
     const il::BlockId latch = last_;
     expressions_.beginScope({stmt.cond});
-    const std::string condition = doWhileCondition(stmt.cond, stmt.invertCond, bodyItems);
-    if (header.valid() && !collectEdgeCopies(ctx_, latch, header).empty()) {
-      StmtList backEdgeItems;
-      lowerEdge(latch, header, backEdgeItems);
-      bodyItems.push_back(HlStmt::makeIf(HlExpr::makeRaw(condition),
-                                         makeSeq(std::move(backEdgeItems))));
+    if (structured()) {
+      if (header.valid() && !collectEdgeCopies(ctx_, latch, header).empty()) {
+        StmtList backEdgeItems;
+        lowerEdge(latch, header, backEdgeItems);
+        bodyItems.push_back(HlStmt::makeIf(doWhileConditionHl(stmt.cond, stmt.invertCond, bodyItems),
+                                           makeSeq(std::move(backEdgeItems))));
+      }
+      auto dw = HlStmt::makeDoWhile(makeSeq(std::move(bodyItems)),
+                                    doWhileConditionHl(stmt.cond, stmt.invertCond, bodyItems));
+      dw->ilBlock = header;
+      out.push_back(std::move(dw));
+    } else {
+      const std::string condition = doWhileCondition(stmt.cond, stmt.invertCond, bodyItems);
+      if (header.valid() && !collectEdgeCopies(ctx_, latch, header).empty()) {
+        StmtList backEdgeItems;
+        lowerEdge(latch, header, backEdgeItems);
+        bodyItems.push_back(HlStmt::makeIf(HlExpr::makeRaw(condition),
+                                           makeSeq(std::move(backEdgeItems))));
+      }
+      auto dw = HlStmt::makeDoWhile(makeSeq(std::move(bodyItems)), HlExpr::makeRaw(condition));
+      dw->ilBlock = header;
+      out.push_back(std::move(dw));
     }
-    out.push_back(HlStmt::makeDoWhile(makeSeq(std::move(bodyItems)), HlExpr::makeRaw(condition)));
     pending_ = latch;
     last_ = latch;
   }
@@ -553,13 +704,17 @@ class AstLowerer {
     if (openScope) {
       expressions_.beginScope({stmt.cond});
     }
-    const std::string discriminant = assignedText(stmt.cond, out);
+    HlExprPtr discExpr = assignedHl(stmt.cond, out);
     auto sw = std::make_unique<HlStmt>();
     sw->kind = HlStmtKind::Switch;
+    sw->ilBlock = stmt.block;
+    if (stmt.block.valid()) {
+      sw->va = ctx_.function.block(stmt.block).va;
+    }
     sw->cond = assignDiscriminantTo.empty()
-                   ? HlExpr::makeRaw(discriminant)
+                   ? std::move(discExpr)
                    : HlExpr::makeBinary("=", HlExpr::makeVar(assignDiscriminantTo),
-                                        HlExpr::makeRaw(discriminant));
+                                        std::move(discExpr));
 
     for (std::size_t index = 0; index < stmt.cases.size(); ++index) {
       HlSwitchCase c;
@@ -569,11 +724,15 @@ class AstLowerer {
       } else {
         c.value = stmt.caseValues[index];
       }
+      if (stmt.cases[index].valid()) {
+        c.ilBlocks.push_back(stmt.cases[index]);
+      }
       StmtList bodyItems;
       if (index < stmt.casePreds.size() && stmt.casePreds[index].valid()) {
         lowerEdge(stmt.casePreds[index], stmt.cases[index], bodyItems);
       }
       if (index < stmt.caseBodies.size() && stmt.caseBodies[index]) {
+        collectStructIlBlocks(stmt.caseBodies[index].get(), c.ilBlocks);
         pending_ = il::BlockId{};
         lowerStmt(stmt.caseBodies[index], bodyItems);
       } else {
@@ -586,11 +745,13 @@ class AstLowerer {
     if (stmt.defaultCase.valid()) {
       HlSwitchCase def;
       def.isDefault = true;
+      def.ilBlocks.push_back(stmt.defaultCase);
       StmtList bodyItems;
       if (stmt.defaultPred.valid()) {
         lowerEdge(stmt.defaultPred, stmt.defaultCase, bodyItems);
       }
       if (stmt.defaultBody) {
+        collectStructIlBlocks(stmt.defaultBody.get(), def.ilBlocks);
         pending_ = il::BlockId{};
         lowerStmt(stmt.defaultBody, bodyItems);
       } else {
@@ -619,8 +780,11 @@ class AstLowerer {
       out.push_back(HlStmt::makeLabel(labelName(stmt.block)));
     }
     if (ctx_.options.annotateBlocks) {
-      out.push_back(HlStmt::makeComment(std::format("b{} @0x{:x}", stmt.block.index(), block.va),
-                                        /*slashSlash=*/true));
+      auto c = HlStmt::makeComment(std::format("b{} @0x{:x}", stmt.block.index(), block.va),
+                                   /*slashSlash=*/true);
+      c->ilBlock = stmt.block;
+      c->va = block.va;
+      out.push_back(std::move(c));
     }
 
     std::vector<il::ExprId> roots;
@@ -638,7 +802,22 @@ class AstLowerer {
       if (ctx_.deadOps.contains(opId.index())) {
         continue;
       }
+      const std::size_t before = out.size();
       lowerOp(opId, out);
+      const uint64_t opVa = ctx_.function.op(opId).va;
+      for (std::size_t idx = before; idx < out.size(); ++idx) {
+        if (out[idx]) {
+          if (!out[idx]->ilBlock.valid()) {
+            out[idx]->ilBlock = stmt.block;
+          }
+          if (!out[idx]->ilOp.valid()) {
+            out[idx]->ilOp = opId;
+          }
+          if (out[idx]->va == 0) {
+            out[idx]->va = opVa;
+          }
+        }
+      }
     }
     last_ = stmt.block;
     if (const il::Op* terminator = terminatorOf(ctx_.function, stmt.block);
@@ -702,17 +881,30 @@ class AstLowerer {
     switch (op.code) {
       case il::OpCode::Load: {
         const std::string* temp = ctx_.tempFor(op.result);
-        std::string lvalue;
+        auto lhs = HlExpr::makeVar(temp == nullptr ? "/*lost*/" : *temp);
+        lhs->ilOp = opId;
         if (ctx_.exclusiveLoads.contains(opId.index())) {
           const uint32_t width = op.type.bits();
           ctx_.helpers.insert(std::format("ldaxr{}", width));
-          lvalue = std::format("__ldaxr{}({})", width, exprPointer(operands[0], width, out));
+          if (structured()) {
+            std::vector<HlExprPtr> args;
+            args.push_back(exprPointerHl(operands[0], width, out));
+            auto call = HlExpr::makeCall(
+                HlExpr::makeVar(std::format("__ldaxr{}", width)), std::move(args));
+            call->isDirectCall = true;
+            call->ilOp = opId;
+            out.push_back(HlStmt::makeAssign(std::move(lhs), std::move(call)));
+          } else {
+            out.push_back(HlStmt::makeAssign(
+                std::move(lhs),
+                HlExpr::makeRaw(std::format("__ldaxr{}({})", width,
+                                            exprPointer(operands[0], width, out)))));
+          }
         } else {
-          lvalue = memoryLvalue(operands[0], op.type.bits(), out, op.result);
+          HlExprPtr rvalue = memoryLvalueHl(operands[0], op.type.bits(), out, op.result);
+          rvalue->ilOp = opId;
+          out.push_back(HlStmt::makeAssign(std::move(lhs), std::move(rvalue)));
         }
-        out.push_back(HlStmt::makeAssign(
-            HlExpr::makeVar(temp == nullptr ? "/*lost*/" : *temp),
-            HlExpr::makeRaw(std::move(lvalue))));
         break;
       }
       case il::OpCode::Store: {
@@ -721,6 +913,7 @@ class AstLowerer {
         }
         const std::string lvalue = memoryLvalue(operands[0], op.type.bits(), out);
         std::string castPrefix;
+        std::string castType;
         const analysis::AddressInfo storeAddress = ctx_.frame.classify(operands[0]);
         const analysis::Variable* storeLocal =
             storeAddress.kind == analysis::AddressKind::StackSlot
@@ -728,8 +921,18 @@ class AstLowerer {
                 : nullptr;
         if (storeLocal != nullptr && storeLocal->type.pointerDepth > 0 &&
             storeLocal->type.width == op.type.bits()) {
-          castPrefix = std::format("({})", storeLocal->type.format());
+          castType = storeLocal->type.format();
+          castPrefix = std::format("({})", castType);
         }
+        const auto assignArmExpr = [&](HlExprPtr arm) {
+          HlExprPtr target = structured()
+                                 ? memoryLvalueHl(operands[0], op.type.bits(), out)
+                                 : HlExpr::makeRaw(lvalue);
+          HlExprPtr rhs = castType.empty()
+                              ? std::move(arm)
+                              : HlExpr::makeCast(castType, std::move(arm));
+          return HlStmt::makeAssign(std::move(target), std::move(rhs));
+        };
         const auto assignArm = [&](const std::string& arm) {
           return HlStmt::makeAssign(
               HlExpr::makeRaw(lvalue),
@@ -742,8 +945,14 @@ class AstLowerer {
             folded = true;
           }
         }
-        if (!folded && !lowerSelectAssign(operands[1], out, assignArm)) {
-          out.push_back(assignArm(assignedText(operands[1], out)));
+        if (!folded) {
+          if (structured()) {
+            if (!lowerSelectAssignHl(operands[1], out, assignArmExpr)) {
+              out.push_back(assignArmExpr(assignedHl(operands[1], out)));
+            }
+          } else if (!lowerSelectAssign(operands[1], out, assignArm)) {
+            out.push_back(assignArm(assignedText(operands[1], out)));
+          }
         }
         break;
       }
@@ -793,7 +1002,7 @@ class AstLowerer {
         if (isVoid || operands.empty()) {
           out.push_back(HlStmt::makeReturn());
         } else if (!lowerSelectReturn(operands[0], out)) {
-          out.push_back(HlStmt::makeReturn(HlExpr::makeRaw(assignedText(operands[0], out))));
+          out.push_back(HlStmt::makeReturn(assignedHl(operands[0], out)));
         }
         break;
       }
@@ -838,10 +1047,17 @@ class AstLowerer {
     SelectChain chain;
     chain.arms.reserve(guards.size());
     for (const auto& [cond, taken] : guards) {
-      const std::string condText = assignedText(cond, out);
-      chain.arms.emplace_back(condText, assignedText(taken, out));
+      if (structured()) {
+        chain.arms.push_back({cond, taken, {}, {}});
+      } else {
+        const std::string condText = assignedText(cond, out);
+        chain.arms.push_back({cond, taken, condText, assignedText(taken, out)});
+      }
     }
-    chain.fallback = assignedText(rest, out);
+    chain.fallbackId = rest;
+    if (!structured()) {
+      chain.fallback = assignedText(rest, out);
+    }
     return chain;
   }
 
@@ -850,12 +1066,16 @@ class AstLowerer {
     if (!chain.has_value()) {
       return false;
     }
-    for (const auto& [cond, taken] : chain->arms) {
+    for (const auto& arm : chain->arms) {
       StmtList body;
-      body.push_back(HlStmt::makeReturn(HlExpr::makeRaw(taken)));
-      out.push_back(HlStmt::makeIf(HlExpr::makeRaw(cond), makeSeq(std::move(body))));
+      body.push_back(HlStmt::makeReturn(
+          structured() ? assignedHl(arm.takenId, body) : HlExpr::makeRaw(arm.taken)));
+      out.push_back(HlStmt::makeIf(
+          structured() ? assignedHl(arm.condId, out) : HlExpr::makeRaw(arm.cond),
+          makeSeq(std::move(body))));
     }
-    out.push_back(HlStmt::makeReturn(HlExpr::makeRaw(chain->fallback)));
+    out.push_back(HlStmt::makeReturn(
+        structured() ? assignedHl(chain->fallbackId, out) : HlExpr::makeRaw(chain->fallback)));
     return true;
   }
 
@@ -868,10 +1088,10 @@ class AstLowerer {
     }
     HlStmtPtr rootIf;
     HlStmt* tailIf = nullptr;
-    for (const auto& [cond, taken] : chain->arms) {
+    for (const auto& arm : chain->arms) {
       StmtList armBody;
-      armBody.push_back(buildAssign(taken));
-      HlStmtPtr armIf = HlStmt::makeIf(HlExpr::makeRaw(cond), makeSeq(std::move(armBody)));
+      armBody.push_back(buildAssign(arm.taken));
+      HlStmtPtr armIf = HlStmt::makeIf(HlExpr::makeRaw(arm.cond), makeSeq(std::move(armBody)));
       if (!rootIf) {
         rootIf = std::move(armIf);
         tailIf = rootIf.get();
@@ -882,6 +1102,35 @@ class AstLowerer {
     }
     StmtList elseBody;
     elseBody.push_back(buildAssign(chain->fallback));
+    tailIf->elseArm = makeSeq(std::move(elseBody));
+    out.push_back(std::move(rootIf));
+    return true;
+  }
+
+  [[nodiscard]] bool lowerSelectAssignHl(
+      il::ExprId value, StmtList& out,
+      const std::function<HlStmtPtr(HlExprPtr)>& buildAssign) {
+    const std::optional<SelectChain> chain = flattenSelect(value, out);
+    if (!chain.has_value()) {
+      return false;
+    }
+    HlStmtPtr rootIf;
+    HlStmt* tailIf = nullptr;
+    for (const auto& arm : chain->arms) {
+      StmtList armBody;
+      armBody.push_back(buildAssign(assignedHl(arm.takenId, armBody)));
+      HlStmtPtr armIf =
+          HlStmt::makeIf(assignedHl(arm.condId, out), makeSeq(std::move(armBody)));
+      if (!rootIf) {
+        rootIf = std::move(armIf);
+        tailIf = rootIf.get();
+      } else {
+        tailIf->elseArm = std::move(armIf);
+        tailIf = tailIf->elseArm.get();
+      }
+    }
+    StmtList elseBody;
+    elseBody.push_back(buildAssign(assignedHl(chain->fallbackId, elseBody)));
     tailIf->elseArm = makeSeq(std::move(elseBody));
     out.push_back(std::move(rootIf));
     return true;
@@ -922,9 +1171,9 @@ class AstLowerer {
       }
     }
     if (implicitUnsignedCallWidening(ctx_, callee, paramIndex, operand)) {
-      return HlExpr::makeRaw(assignedInt(operand, out));
+      return assignedIntHl(operand, out);
     }
-    return HlExpr::makeRaw(exprText(operand, out));
+    return exprHl(operand, out);
   }
 
   [[nodiscard]] std::string calleeCast(const types::TypeEntry* callee, std::size_t argCount,
@@ -968,8 +1217,11 @@ class AstLowerer {
         callee != nullptr && ctx_.options.types->format(callee->returnType) == "void";
 
     const auto emitCallStmt = [&](HlExprPtr callExpr) {
+      callExpr->ilOp = opId;
       if (temp != nullptr && !returnsVoid) {
-        out.push_back(HlStmt::makeAssign(HlExpr::makeVar(*temp), std::move(callExpr)));
+        auto lhs = HlExpr::makeVar(*temp);
+        lhs->ilOp = opId;
+        out.push_back(HlStmt::makeAssign(std::move(lhs), std::move(callExpr)));
       } else {
         out.push_back(HlStmt::makeExprStmt(std::move(callExpr)));
       }
@@ -1020,14 +1272,15 @@ class AstLowerer {
     }
 
     const std::string prototype = calleeCast(callee, argCount, temp != nullptr);
-    const std::string target = exprInt(operands[0], out);
+    HlExprPtr target = exprIntHl(operands[0], out);
     std::string note = imported.has_value() ? std::format(" /* import: {} */", *imported) : "";
     if (note.empty()) {
       if (const auto found = ctx_.vtableCalls.find(opId.index()); found != ctx_.vtableCalls.end()) {
         note = std::format(" /* vtable slot {:#x} */", found->second.slotOffset);
       }
     }
-    auto callExpr = HlExpr::makeCall(HlExpr::makeRaw(target), std::move(args));
+    auto callExpr = HlExpr::makeCall(std::move(target), std::move(args));
+    callExpr->ilOp = opId;
     callExpr->isDirectCall = false;
     callExpr->extra = prototype;
     callExpr->importedName = imported.value_or("");
@@ -1214,6 +1467,44 @@ class AstLowerer {
     return std::format("(*{})", exprPointer(address, width, out));
   }
 
+  [[nodiscard]] HlExprPtr memoryLvalueHl(il::ExprId address, uint32_t width, StmtList& out,
+                                         il::ValueId result = {}) {
+    if (!structured()) {
+      return HlExpr::makeRaw(memoryLvalue(address, width, out, result));
+    }
+    if (std::string field = ctx_.fieldAccess(address, width, result); !field.empty()) {
+      auto node = HlExpr::makeRaw(std::move(field));
+      node->ilExpr = address;
+      return node;
+    }
+    if (const auto rendered =
+            AddressRenderer(ctx_).render(address, AddressRole::MemoryLvalue, width)) {
+      const analysis::AddressInfo info = ctx_.frame.classify(address);
+      if (info.kind == analysis::AddressKind::StackSlot) {
+        if (const analysis::Variable* local = ctx_.variables.localAt(info.delta)) {
+          if (rendered->text == local->name) {
+            auto node = HlExpr::makeVar(local->name);
+            node->ilExpr = address;
+            return node;
+          }
+        }
+      }
+      if (info.kind == analysis::AddressKind::Global) {
+        if (const std::string* global = ctx_.globalName(info.address)) {
+          auto node = HlExpr::makeDeref(intType(width), HlExpr::makeVar(*global));
+          node->ilExpr = address;
+          return node;
+        }
+      }
+      auto node = HlExpr::makeRaw(rendered->text);
+      node->ilExpr = address;
+      return node;
+    }
+    auto deref = HlExpr::makeDeref(intType(width), exprPointerHl(address, width, out));
+    deref->ilExpr = address;
+    return deref;
+  }
+
   [[nodiscard]] std::string registerRead(il::RegId reg) {
     const il::RegId root = ctx_.function.registers().rootOf(reg);
     const RegVar& variable = ctx_.registerVariable(root);
@@ -1306,11 +1597,20 @@ class AstLowerer {
         continue;
       }
       const EdgeCopy& copy = plan.copies[index];
-      const auto assignArm = [&copy](const std::string& arm) {
-        return HlStmt::makeAssign(HlExpr::makeVar(copy.name), HlExpr::makeRaw(arm));
-      };
-      if (!lowerSelectAssign(copy.source, *targetOut, assignArm)) {
-        targetOut->push_back(assignArm(assignedText(copy.source, *targetOut)));
+      if (structured()) {
+        const auto assignArmHl = [&copy](HlExprPtr arm) {
+          return HlStmt::makeAssign(HlExpr::makeVar(copy.name), std::move(arm));
+        };
+        if (!lowerSelectAssignHl(copy.source, *targetOut, assignArmHl)) {
+          targetOut->push_back(assignArmHl(assignedHl(copy.source, *targetOut)));
+        }
+      } else {
+        const auto assignArm = [&copy](const std::string& arm) {
+          return HlStmt::makeAssign(HlExpr::makeVar(copy.name), HlExpr::makeRaw(arm));
+        };
+        if (!lowerSelectAssign(copy.source, *targetOut, assignArm)) {
+          targetOut->push_back(assignArm(assignedText(copy.source, *targetOut)));
+        }
       }
       ++index;
     }

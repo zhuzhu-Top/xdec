@@ -31,7 +31,7 @@ Result<DecompileToCResult> decompileToC(const spec::SpecEngine& engine, const By
     return DecompileToCResult{std::move(driven.function),     std::move(driven.report),
                               std::move(rendered.variables),  rendered.frame,
                               std::move(rendered.structured), std::move(rendered.cSource),
-                              std::move(rendered.report)};
+                              std::move(rendered.ast),        std::move(rendered.report)};
   });
 }
 
@@ -63,7 +63,7 @@ RenderToCResult renderToC(const il::Function& function, const DecompileToCOption
   const analysis::StackFrame frame =
       timed("stack-frame", [&] { return cache.stackFrame(); });
   analysis::VariableTable variables =
-      timed("vars", [&] { return analysis::VariableTable::recover(function, frame); });
+      timed("vars", [&] { return analysis::VariableTable::recover(function, frame, options.abi); });
 
   // Bridges pass::NameAt (what the driver's discovery and type-directed
   // folding read symbols through) to types::NameAt (what a header binder
@@ -109,7 +109,15 @@ RenderToCResult renderToC(const il::Function& function, const DecompileToCOption
   cOptions.typedVariables = &typedVariables;
   cOptions.names = namesForTypes;
   cOptions.memory = options.driver.memory;
+  const bool wantAst = options.captureAst || options.emit.structuredExprs;
+  std::optional<emit::HlFunction> ast;
   std::string text = timed("print", [&] {
+    if (wantAst) {
+      emit::PrintResult res =
+          emit::printFunctionWithAst(function, variables, frame, structured, cOptions);
+      ast = std::move(res.ast);
+      return res.text;
+    }
     return emit::printFunction(function, variables, frame, structured, cOptions);
   });
 
@@ -123,7 +131,7 @@ RenderToCResult renderToC(const il::Function& function, const DecompileToCOption
   }
 
   return RenderToCResult{std::move(variables), frame, std::move(structured), std::move(text),
-                         std::move(report)};
+                         std::move(ast), std::move(report)};
 }
 
 }  // namespace xdec::decompile

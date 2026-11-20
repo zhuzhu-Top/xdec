@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "xdec/analysis/abi.h"
 #include "xdec/analysis/call_abi.h"
 #include "xdec/analysis/dominators.h"
 #include "xdec/il/function.h"
@@ -22,12 +23,11 @@ namespace xdec::passes {
 
 namespace {
 
-/// Whether a register class participates in register SSA. Float, vector and
-/// special registers keep their op form: the IL does not model their view
-/// structure well enough yet, and an honest op beats an invented version.
+/// Whether a register class participates in register SSA.
 [[nodiscard]] bool tracked(il::RegClass regClass) {
   return regClass == il::RegClass::General || regClass == il::RegClass::Flags ||
-         regClass == il::RegClass::StackPointer;
+         regClass == il::RegClass::StackPointer || regClass == il::RegClass::Float ||
+         regClass == il::RegClass::Vector;
 }
 
 /// What the renaming walk needs about one phi site: which register it merges
@@ -40,8 +40,11 @@ struct PhiSite {
 class SsaBuilder {
  public:
   SsaBuilder(il::Function& function, const analysis::Dominators& dominators,
-             analysis::CallNameSources callNames)
-      : function_(function), dominators_(dominators), callNames_(std::move(callNames)) {
+             analysis::CallNameSources callNames, const analysis::AbiSpec* explicitAbi = nullptr)
+      : function_(function),
+        dominators_(dominators),
+        callNames_(std::move(callNames)),
+        abi_(explicitAbi != nullptr ? *explicitAbi : analysis::AbiSpec::defaultFor(function)) {
     callNames_.rewrite = [this](il::ExprId id) { return subst_.apply(function_, id); };
     for (il::RegId root{0}; root.asSize() < function_.registers().size();
          root = il::RegId{root.index() + 1}) {
@@ -52,22 +55,24 @@ class SsaBuilder {
       roots_.push_back(root);
       versions_.emplace(root, std::vector<il::ExprId>{});
     }
-    // Calling-convention registers by name (AAPCS64 today): x0..x7 pass
-    // arguments, x0 carries the result. Absent those names, no annotation.
-    for (unsigned index = 0; index < 8; ++index) {
-      const il::RegId reg =
-          function_.registers().find(std::format("x{}", index));
-      if (reg.valid()) {
+    for (const il::RegId reg : abi_.intArgRegs) {
+      if (reg.valid() && function_.registers().contains(reg)) {
         argRoots_.push_back(function_.registers().rootOf(reg));
       }
     }
-    if (const il::RegId x0 = function_.registers().find("x0"); x0.valid()) {
-      resultRoots_.push_back(function_.registers().rootOf(x0));
+    for (const il::RegId reg : abi_.intRetRegs) {
+      if (reg.valid() && function_.registers().contains(reg)) {
+        resultRoots_.push_back(function_.registers().rootOf(reg));
+      }
     }
-    for (const il::RegId root : roots_) {
-      if (function_.registers()[root].regClass == il::RegClass::StackPointer) {
-        spRoot_ = root;
-        break;
+    if (abi_.stackPointer.valid() && function_.registers().contains(abi_.stackPointer)) {
+      spRoot_ = function_.registers().rootOf(abi_.stackPointer);
+    } else {
+      for (const il::RegId root : roots_) {
+        if (function_.registers()[root].regClass == il::RegClass::StackPointer) {
+          spRoot_ = root;
+          break;
+        }
       }
     }
   }
@@ -139,20 +144,7 @@ class SsaBuilder {
         info.regClass == il::RegClass::Zero) {
       return false;
     }
-    const std::string_view name = function_.registers().nameOf(root);
-    if (name.size() >= 2 && (name[0] == 'x' || name[0] == 'q' || name[0] == 'v')) {
-      unsigned number = 0;
-      const char* begin = name.data() + 1;
-      const char* end = name.data() + name.size();
-      if (const auto [ptr, ec] = std::from_chars(begin, end, number);
-          ec == std::errc{} && ptr == end) {
-        if (name[0] == 'x') {
-          return number <= 18 || number == 30;
-        }
-        return number <= 7;
-      }
-    }
-    return true;
+    return abi_.isCallerSaved(root);
   }
 
   /// Asked mid-rename, so the target is read through the versions recorded so
@@ -237,19 +229,19 @@ class SsaBuilder {
         case il::OpCode::WriteReg: {
           const il::RegId reg = op.reg();
           const il::RegId root = function_.registers().rootOf(reg);
-          if (!versions_.contains(root)) {
-            if (const auto slot = fpArgSlot(reg); slot.has_value()) {
-              const auto operands = function_.operands(op);
-              const il::RegisterInfo& regInfo = function_.registers()[reg];
-              if (!operands.empty() &&
-                  (!regInfo.isSubRegister() || regInfo.zeroExtendsParent) &&
-                  (regInfo.bits == 32 || regInfo.bits == 64)) {
-                recentFpArgs[*slot] =
-                    il::Function::CallFpArg{subst_.apply(function_, operands[0]), regInfo.bits};
-              } else {
-                recentFpArgs[*slot].reset();
-              }
+          if (const auto slot = fpArgSlot(reg); slot.has_value()) {
+            const auto operands = function_.operands(op);
+            const il::RegisterInfo& regInfo = function_.registers()[reg];
+            if (!operands.empty() &&
+                (!regInfo.isSubRegister() || regInfo.zeroExtendsParent) &&
+                (regInfo.bits == 32 || regInfo.bits == 64)) {
+              recentFpArgs[*slot] =
+                  il::Function::CallFpArg{subst_.apply(function_, operands[0]), regInfo.bits};
+            } else {
+              recentFpArgs[*slot].reset();
             }
+          }
+          if (!versions_.contains(root)) {
             break;
           }
           // The written expression becomes the register's new version, merged
@@ -562,6 +554,7 @@ class SsaBuilder {
   il::Function& function_;
   const analysis::Dominators& dominators_;
   analysis::CallNameSources callNames_;
+  analysis::AbiSpec abi_;
   il::RegId spRoot_;
   std::vector<il::RegId> roots_;
   /// Calling-convention registers, looked up by the usual names; an exotic
@@ -597,7 +590,7 @@ class SsaConstruct final : public pass::FunctionPass {
   Result<bool> run(pass::Context& context) override {
     il::Function& function = context.function();
     const analysis::Dominators dominators = analysis::Dominators::compute(function);
-    SsaBuilder(function, dominators, callNameSources(context)).build();
+    SsaBuilder(function, dominators, callNameSources(context), context.abi()).build();
     return true;
   }
 };

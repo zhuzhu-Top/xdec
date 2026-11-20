@@ -5,6 +5,7 @@
 #include <unordered_map>
 
 #include "xdec/il/ceval.h"
+#include "xdec/passes/algebra_rules.h"
 #include "xdec/support/bits.h"
 #include "xdec/obs/log.h"
 
@@ -125,33 +126,35 @@ class Algebra {
     }
 
     switch (expr.op) {
-      case il::ExprOp::Add: return rewriteAdd(expr);
-      case il::ExprOp::Sub: return rewriteSub(expr);
-      case il::ExprOp::Mul: return rewriteMul(expr);
-      case il::ExprOp::And: return rewriteAnd(expr);
-      case il::ExprOp::Or: return rewriteOr(expr);
-      case il::ExprOp::Xor: return rewriteXor(expr);
-      case il::ExprOp::Not: return rewriteNot(expr);
-      case il::ExprOp::Neg: return rewriteNeg(expr);
+      case il::ExprOp::Add: id = rewriteAdd(expr); break;
+      case il::ExprOp::Sub: id = rewriteSub(expr); break;
+      case il::ExprOp::Mul: id = rewriteMul(expr); break;
+      case il::ExprOp::And: id = rewriteAnd(expr); break;
+      case il::ExprOp::Or: id = rewriteOr(expr); break;
+      case il::ExprOp::Xor: id = rewriteXor(expr); break;
+      case il::ExprOp::Not: id = rewriteNot(expr); break;
+      case il::ExprOp::Neg: id = rewriteNeg(expr); break;
       case il::ExprOp::Shl:
       case il::ExprOp::ShrU:
       case il::ExprOp::ShrS:
       case il::ExprOp::RotR:
-      case il::ExprOp::RotL: return rewriteShift(expr);
+      case il::ExprOp::RotL: id = rewriteShift(expr); break;
       case il::ExprOp::CmpEq:
       case il::ExprOp::CmpNe:
       case il::ExprOp::CmpLtU:
       case il::ExprOp::CmpLeU:
       case il::ExprOp::CmpLtS:
-      case il::ExprOp::CmpLeS: return rewriteCompare(expr, id);
-      case il::ExprOp::Select: return rewriteSelect(expr);
-      case il::ExprOp::FlagCond: return rewriteFlagCond(expr);
+      case il::ExprOp::CmpLeS: id = rewriteCompare(expr, id); break;
+      case il::ExprOp::Select: id = rewriteSelect(expr); break;
+      case il::ExprOp::FlagCond: id = rewriteFlagCond(expr); break;
       case il::ExprOp::ZExt:
       case il::ExprOp::SExt:
       case il::ExprOp::Trunc:
-      case il::ExprOp::Extract: return rewriteCast(expr, id);
-      default: return id;
+      case il::ExprOp::Extract:
+      case il::ExprOp::Bitcast: id = rewriteCast(expr, id); break;
+      default: break;
     }
+    return AlgebraRuleRegistry::global().applyAll(function_, id);
   }
 
   [[nodiscard]] il::ExprId unchanged(const il::Expr& expr) const {
@@ -452,6 +455,15 @@ class Algebra {
     if (expr.operands[1] == expr.operands[2]) {
       return expr.operands[1];
     }
+    if (expr.type.isScalarInteger() && expr.type.bits() == 1 &&
+        function_.expr(expr.operands[0]).type == expr.type) {
+      if (pred_.isConst(expr.operands[1], 1) && pred_.isConst(expr.operands[2], 0)) {
+        return expr.operands[0];
+      }
+      if (pred_.isConst(expr.operands[1], 0) && pred_.isConst(expr.operands[2], 1)) {
+        return function_.unary(il::ExprOp::Not, expr.operands[0]);
+      }
+    }
     return unchanged(expr);
   }
 
@@ -593,12 +605,30 @@ class Algebra {
         break;
       }
       case il::ExprOp::Extract:
+        if (expr.immediate == 0 && expr.type == sourceType) {
+          return source;
+        }
         // extract(x, 0) at a narrower width is a trunc by another name, and
         // naming it so lets the trunc rules above see it.
-        if (expr.immediate == 0 && expr.type.bits() < sourceType.bits()) {
+        if (expr.immediate == 0 && expr.type.bits() < sourceType.bits() &&
+            expr.type.isScalarInteger() && sourceType.isScalarInteger()) {
           return function_.cast(il::ExprOp::Trunc, expr.type, source);
         }
         break;
+      case il::ExprOp::Bitcast: {
+        if (sourceType == expr.type) {
+          return source;
+        }
+        const il::Expr& srcExpr = function_.expr(source);
+        if (srcExpr.op == il::ExprOp::Bitcast && srcExpr.operandCount == 1) {
+          const il::ExprId inner = srcExpr.operands[0];
+          const il::Type innerType = function_.expr(inner).type;
+          if (innerType == expr.type && sourceType.bits() == expr.type.bits()) {
+            return inner;
+          }
+        }
+        break;
+      }
       default:
         break;
     }

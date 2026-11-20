@@ -32,11 +32,12 @@ class Assembler {
             const COptions& options)
       : ctx_(function, variables, frame, structured, options), expressions_(ctx_) {}
 
-  std::string run() {
+  PrintResult run() {
     nameResultTemps();
+    HlFunction hl;
     const std::string body = [&] {
       XDEC_SPAN(span, "emit", "statements");
-      HlFunction hl = lowerToHlAst(ctx_, expressions_);
+      hl = lowerToHlAst(ctx_, expressions_);
       hl.name = name();
       hl.language = ctx_.options.language;
       for (const auto& transform : ctx_.options.hlTransforms) {
@@ -67,7 +68,7 @@ class Assembler {
     out += locals;
     out += body;
     out += "}\n";
-    return out;
+    return PrintResult{std::move(out), std::move(hl)};
   }
 
  private:
@@ -582,6 +583,14 @@ std::string printFunction(const il::Function& function,
                           const analysis::StackFrame& frame,
                           const StructuredFunction& structured,
                           const COptions& options) {
+  return printFunctionWithAst(function, variables, frame, structured, options).text;
+}
+
+PrintResult printFunctionWithAst(const il::Function& function,
+                                 const analysis::VariableTable& variables,
+                                 const analysis::StackFrame& frame,
+                                 const StructuredFunction& structured,
+                                 const COptions& options) {
   std::optional<Assembler> assembler;
   {
     XDEC_SPAN(span, "emit", "context");

@@ -536,20 +536,7 @@ extern "C" XDEC_EXPORT std::uint32_t xdec_plugin_abi_version() {
 }
 
 extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init(xdec::pass::Registry* registry) {
-  if (registry == nullptr) {
-    return {false, "null registry"};
-  }
-  const xdec::Result<void> added =
-      registry->add(std::make_unique<OllvmStateThreadPass>());
-  if (!added) {
-    return {false, "failed to register ollvm-state-thread"};
-  }
-  return {true, nullptr};
-}
-
-extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init_v2(const XdecPluginHost* host) {
+xdec_plugin_init(const XdecPluginHost* host) {
   if (host == nullptr || host->passes == nullptr) {
     return {false, "invalid plugin host"};
   }

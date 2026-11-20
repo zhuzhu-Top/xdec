@@ -37,9 +37,14 @@ class TypeDatabase;
 }  // namespace xdec::types
 
 namespace xdec::analysis {
+struct AbiSpec;
 class EntryRegFacts;
 struct PathExploreOptions;
 }  // namespace xdec::analysis
+
+namespace xdec::devirt {
+class MemoryRegionMap;
+}  // namespace xdec::devirt
 
 namespace xdec::pass {
 
@@ -177,6 +182,17 @@ class Context {
     return pathExplore_;
   }
 
+  /// Target or virtual ABI specification (calling-convention registers,
+  /// stack pointer, callee/caller-saved sets). Null uses the default
+  /// AArch64 convention. Must outlive the pass run.
+  void setAbi(const analysis::AbiSpec* abi) noexcept { abi_ = abi; }
+  [[nodiscard]] const analysis::AbiSpec* abi() const noexcept { return abi_; }
+
+  /// Declared memory regions (`PrivateRegFile`, `PrivateStack`, etc.) used by
+  /// `RegionMem2Reg` and `RegionDSE`. Must outlive the pass run.
+  void setRegions(const devirt::MemoryRegionMap* regions) noexcept { regions_ = regions; }
+  [[nodiscard]] const devirt::MemoryRegionMap* regions() const noexcept { return regions_; }
+
   /// The image's symbol table, for the one thing a pass can do with a name that
   /// it cannot do with an address: look up what a header declared under it.
   /// Unset resolves nothing, which is what a pipeline with no image gets.
@@ -225,6 +241,8 @@ class Context {
   std::function<void(const Discovery&)> discoverySink_;
   const analysis::EntryRegFacts* entryRegs_ = nullptr;
   const analysis::PathExploreOptions* pathExplore_ = nullptr;
+  const analysis::AbiSpec* abi_ = nullptr;
+  const devirt::MemoryRegionMap* regions_ = nullptr;
 };
 
 class Pass {

@@ -43,10 +43,12 @@ class ObjcBackend {
     appendLine(out, indent_, text);
   }
 
-  [[nodiscard]] std::string renderExpr(const HlExpr& expr) const {
+  [[nodiscard]] std::string renderExpr(const HlExpr& expr,
+                                       bool parenthesizeBinary = false) const {
     switch (expr.kind) {
       case HlExprKind::Raw:
       case HlExprKind::Var:
+      case HlExprKind::FloatLit:
         return expr.text;
       case HlExprKind::Const:
         return std::format("0x{:x}", expr.constant);
@@ -55,16 +57,27 @@ class ObjcBackend {
       case HlExprKind::CFStringLit:
         return std::format("@{}", analysis::quoteCString(expr.text));
       case HlExprKind::Unary:
-        return std::format("{}{}", expr.text, renderExpr(*expr.lhs));
-      case HlExprKind::Binary:
-        return std::format("{} {} {}", renderExpr(*expr.lhs), expr.text,
-                           renderExpr(*expr.rhs));
+        return std::format("{}{}", expr.text, renderExpr(*expr.lhs, true));
+      case HlExprKind::Binary: {
+        const std::string inner = std::format("{} {} {}", renderExpr(*expr.lhs, true),
+                                              expr.text, renderExpr(*expr.rhs, true));
+        return parenthesizeBinary ? std::format("({})", inner) : inner;
+      }
       case HlExprKind::Cast:
-        return std::format("({})({})", expr.text, renderExpr(*expr.lhs));
+        return std::format("({})({})", expr.text, renderExpr(*expr.lhs, true));
       case HlExprKind::Deref:
-        return std::format("(*{})", renderExpr(*expr.lhs));
+        if (!expr.extra.empty()) {
+          return std::format("(*({}*)({}))", expr.extra, renderExpr(*expr.lhs, true));
+        }
+        return std::format("(*{})", renderExpr(*expr.lhs, true));
       case HlExprKind::AddressOf:
-        return std::format("&{}", renderExpr(*expr.lhs));
+        return std::format("&{}", renderExpr(*expr.lhs, true));
+      case HlExprKind::Select: {
+        const std::string inner =
+            std::format("{} ? {} : {}", renderExpr(*expr.cond, true),
+                        renderExpr(*expr.lhs, true), renderExpr(*expr.rhs, true));
+        return parenthesizeBinary ? std::format("({})", inner) : inner;
+      }
       case HlExprKind::ObjcMsg: {
         const std::string recv = renderExpr(*expr.lhs);
         const std::vector<std::string_view> parts = splitColons(expr.text);
@@ -90,9 +103,9 @@ class ObjcBackend {
           args += renderExpr(*expr.args[i]);
         }
         if (expr.isDirectCall) {
-          return std::format("{}({}){}", renderExpr(*expr.lhs), args, expr.callSuffix);
+          return std::format("{}({}){}", renderExpr(*expr.lhs, true), args, expr.callSuffix);
         }
-        return std::format("(({}){})({}){}", expr.extra, renderExpr(*expr.lhs), args,
+        return std::format("(({}){})({}){}", expr.extra, renderExpr(*expr.lhs, true), args,
                            expr.callSuffix);
       }
     }

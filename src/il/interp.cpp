@@ -253,23 +253,33 @@ ExecOutcome Interpreter::fail(std::string message, uint64_t va) {
   return outcome;
 }
 
-Result<ConcreteValue> Interpreter::evalFlagsOperand(ExprId id, unsigned depth) {
+Result<ConcreteValue> Interpreter::evalFlagsOperand(
+    ExprId id, unsigned depth, std::unordered_map<uint32_t, ConcreteValue>& memo) {
   const Expr& expr = function_->expr(id);
   if (expr.op == ExprOp::FlagDef) {
     ConcreteValue args[3];
     for (unsigned index = 0; index < expr.operandCount; ++index) {
-      XDEC_TRY(args[index], eval(expr.operands[index], depth + 1));
+      XDEC_TRY(args[index], evalImpl(expr.operands[index], depth + 1, memo));
     }
     return ConcreteValue{evalFlagDef(flagDefOp(expr.immediate),
                                    flagDefWidth(expr.immediate),
                                    std::span<const ConcreteValue>{args, expr.operandCount}),
                          0};
   }
-  XDEC_TRY(const ConcreteValue value, eval(id, depth + 1));
+  XDEC_TRY(const ConcreteValue value, evalImpl(id, depth + 1, memo));
   return ConcreteValue{value.lo & 0xF, 0};
 }
 
 Result<ConcreteValue> Interpreter::eval(ExprId id, unsigned depth) {
+  std::unordered_map<uint32_t, ConcreteValue> memo;
+  return evalImpl(id, depth, memo);
+}
+
+Result<ConcreteValue> Interpreter::evalImpl(
+    ExprId id, unsigned depth, std::unordered_map<uint32_t, ConcreteValue>& memo) {
+  if (const auto it = memo.find(id.index()); it != memo.end()) {
+    return it->second;
+  }
   if (depth > 512) {
     return err(DiagCode::AnalysisLimit, "expression nesting too deep");
   }
@@ -284,16 +294,22 @@ Result<ConcreteValue> Interpreter::eval(ExprId id, unsigned depth) {
   ConcreteValue args[3];
   for (unsigned index = 0; index < expr.operandCount; ++index) {
     if (expr.op == ExprOp::FlagCond || expr.op == ExprOp::FlagBit) {
-      XDEC_TRY(args[index], evalFlagsOperand(expr.operands[index], depth + 1));
+      XDEC_TRY(args[index], evalFlagsOperand(expr.operands[index], depth + 1, memo));
     } else {
-      XDEC_TRY(args[index], eval(expr.operands[index], depth + 1));
+      XDEC_TRY(args[index], evalImpl(expr.operands[index], depth + 1, memo));
     }
   }
   const U128 a{args[0].lo, args[0].hi};
   const U128 b{args[1].lo, args[1].hi};
-  const auto pack = [](U128 v) { return ConcreteValue{v.lo, v.hi}; };
-  const auto boolean = [](bool value) {
-    return ConcreteValue{value ? uint64_t{1} : uint64_t{0}, 0};
+  const auto pack = [&](U128 v) {
+    const ConcreteValue res{v.lo, v.hi};
+    memo.emplace(id.index(), res);
+    return res;
+  };
+  const auto boolean = [&](bool value) {
+    const ConcreteValue res{value ? uint64_t{1} : uint64_t{0}, 0};
+    memo.emplace(id.index(), res);
+    return res;
   };
 
   switch (expr.op) {
@@ -308,10 +324,24 @@ Result<ConcreteValue> Interpreter::eval(ExprId id, unsigned depth) {
     }
     case ExprOp::Undef:
       return err(DiagCode::LiftFailure, "an undef value was evaluated");
-    case ExprOp::EntryReg:
-      // The register state the block was seeded with is the function-entry
-      // value as far as this execution knows.
-      return readRegister(RegId{static_cast<uint32_t>(expr.immediate)});
+    case ExprOp::EntryReg: {
+      const RegId reg{static_cast<uint32_t>(expr.immediate)};
+      if (!useEntrySnapshot_) {
+        return readRegister(reg);
+      }
+      if (!function_->registers().contains(reg)) {
+        return ConcreteValue{};
+      }
+      const RegId root = function_->registers().rootOf(reg);
+      const RegisterInfo& info = function_->registers()[reg];
+      const ConcreteValue rootVal = entryRegisters_[root.asSize()];
+      if (!info.isSubRegister()) {
+        return rootVal;
+      }
+      const U128 shifted = shrU(U128{rootVal.lo, rootVal.hi}, info.offsetInParent, 128);
+      const U128 masked = mask(shifted, info.bits);
+      return ConcreteValue{masked.lo, masked.hi};
+    }
 
     case ExprOp::Add: { bool carry = false; return pack(add(a, b, width, carry)); }
     case ExprOp::Sub:
@@ -776,6 +806,277 @@ ExecOutcome Interpreter::runBlock(BlockId blockId) {
     }
   }
   return fail("block has no terminator", block.endVa);
+}
+
+ExecOutcome Interpreter::runFunction(BlockId entry, CallHook callHook,
+                                     uint64_t returnSentinelVa,
+                                     std::size_t maxSteps) {
+  if (!entry.valid() || !function_->hasBlock(entry)) {
+    return fail("invalid entry block", 0);
+  }
+  if (values_.size() != function_->valueCount()) {
+    values_.assign(function_->valueCount(), ConcreteValue{});
+    defined_.assign(function_->valueCount(), false);
+  }
+  std::fill(defined_.begin(), defined_.end(), false);
+  entryRegisters_ = registers_;
+  useEntrySnapshot_ = true;
+  struct Guard {
+    bool& flag;
+    ~Guard() { flag = false; }
+  } guard{useEntrySnapshot_};
+
+  const auto define = [&](ValueId value, ConcreteValue contents) {
+    values_[value.asSize()] = contents;
+    defined_[value.asSize()] = true;
+  };
+
+  BlockId prevBlock{};
+  BlockId curBlock = entry;
+  for (std::size_t step = 0; step < maxSteps; ++step) {
+    const Block& block = function_->block(curBlock);
+
+    // Evaluate all Phi nodes in parallel on incoming edge `prevBlock -> curBlock`.
+    std::vector<std::pair<ValueId, std::optional<ConcreteValue>>> phiUpdates;
+    if (prevBlock.valid()) {
+      int predIndex = -1;
+      for (std::size_t i = 0; i < block.predecessors.size(); ++i) {
+        if (block.predecessors[i] == prevBlock) {
+          predIndex = static_cast<int>(i);
+          break;
+        }
+      }
+      if (predIndex < 0) {
+        return fail("control-flow edge missing from predecessor list", block.va);
+      }
+      for (const OpId opId : block.ops) {
+        const Op& op = function_->op(opId);
+        if (op.code != OpCode::Phi) {
+          break;
+        }
+        const auto incoming = function_->operands(op);
+        if (static_cast<std::size_t>(predIndex) >= incoming.size()) {
+          return fail("phi arity smaller than predecessor index", op.va);
+        }
+        const ExprId inExpr = incoming[static_cast<std::size_t>(predIndex)];
+        if (function_->expr(inExpr).op == ExprOp::Undef) {
+          if (op.result.valid()) {
+            phiUpdates.emplace_back(op.result, std::nullopt);
+          }
+          continue;
+        }
+        auto val = eval(inExpr, 0);
+        if (!val) {
+          if (val.error().code() == DiagCode::LiftFailure ||
+              val.error().code() == DiagCode::VerifyFailure) {
+            if (op.result.valid()) {
+              phiUpdates.emplace_back(op.result, std::nullopt);
+            }
+            continue;
+          }
+          return fail(val.error().format(), op.va);
+        }
+        if (op.result.valid()) {
+          phiUpdates.emplace_back(op.result, *val);
+        }
+      }
+      for (const auto& [vid, cval] : phiUpdates) {
+        if (cval.has_value()) {
+          define(vid, *cval);
+        } else {
+          defined_[vid.asSize()] = false;
+        }
+      }
+    }
+
+    bool stepped = false;
+    for (const OpId opId : block.ops) {
+      const Op& op = function_->op(opId);
+      if (op.code == OpCode::Phi || op.code == OpCode::Nop) {
+        continue;
+      }
+      if (interruptHook_ && interruptHook_(op)) {
+        ExecOutcome outcome;
+        outcome.stop = ExecStop::Interrupted;
+        outcome.va = op.va;
+        return outcome;
+      }
+      if (opHook_) {
+        opHook_(op);
+      }
+      const std::span<const ExprId> operands = function_->operands(op);
+      switch (op.code) {
+        case OpCode::ReadReg:
+          define(op.result, readRegister(op.reg()));
+          break;
+        case OpCode::WriteReg: {
+          auto value = eval(operands[0], 0);
+          if (!value) {
+            return fail(value.error().format(), op.va);
+          }
+          writeRegister(op.reg(), *value);
+          break;
+        }
+        case OpCode::Load: {
+          auto address = eval(operands[0], 0);
+          if (!address) {
+            return fail(address.error().format(), op.va);
+          }
+          auto contents = memoryBackend_->read(address->lo, op.type.bits() / 8);
+          if (!contents) {
+            return fail(contents.error().format(), op.va);
+          }
+          define(op.result, *contents);
+          break;
+        }
+        case OpCode::Store: {
+          auto address = eval(operands[0], 0);
+          auto value = eval(operands[1], 0);
+          if (!address) {
+            return fail(address.error().format(), op.va);
+          }
+          if (!value) {
+            return fail(value.error().format(), op.va);
+          }
+          if (auto written = memoryBackend_->write(address->lo, op.type.bits() / 8, *value);
+              !written) {
+            return fail(written.error().format(), op.va);
+          }
+          break;
+        }
+        case OpCode::Call: {
+          auto target = eval(operands[0], 0);
+          if (!target) {
+            return fail(target.error().format(), op.va);
+          }
+          if (callHook) {
+            std::vector<ConcreteValue> callArgs;
+            callArgs.reserve(operands.size() > 0 ? operands.size() - 1 : 0);
+            for (std::size_t i = 1; i < operands.size(); ++i) {
+              auto argVal = eval(operands[i], 0);
+              if (!argVal) {
+                return fail(argVal.error().format(), op.va);
+              }
+              callArgs.push_back(*argVal);
+            }
+            ConcreteValue result{};
+            if (callHook(target->lo, callArgs, result)) {
+              if (op.result.valid()) {
+                define(op.result, result);
+              }
+              break;
+            }
+          }
+          ExecOutcome outcome;
+          outcome.stop = ExecStop::Call;
+          outcome.va = op.va;
+          outcome.target = target->lo;
+          return outcome;
+        }
+        case OpCode::Intrinsic: {
+          const std::string_view name = function_->nameOf(op.payload);
+          std::vector<ConcreteValue> arguments(operands.size());
+          for (std::size_t index = 0; index < operands.size(); ++index) {
+            auto argument = eval(operands[index], 0);
+            if (!argument) {
+              return fail(argument.error().format(), op.va);
+            }
+            arguments[index] = *argument;
+          }
+          ConcreteValue result{};
+          if (!hook_ || !hook_(name, op.type, arguments, result)) {
+            ExecOutcome outcome;
+            outcome.stop = ExecStop::Intrinsic;
+            outcome.va = op.va;
+            outcome.detail = std::string{name};
+            return outcome;
+          }
+          if (op.result.valid()) {
+            define(op.result, result);
+          }
+          break;
+        }
+        case OpCode::Branch: {
+          prevBlock = curBlock;
+          curBlock = function_->targets(op)[0];
+          stepped = true;
+          break;
+        }
+        case OpCode::CondBranch: {
+          auto condition = eval(operands[0], 0);
+          if (!condition) {
+            return fail(condition.error().format(), op.va);
+          }
+          const std::span<const BlockId> targets = function_->targets(op);
+          prevBlock = curBlock;
+          curBlock = (condition->lo & 1) != 0 ? targets[0] : targets[1];
+          stepped = true;
+          break;
+        }
+        case OpCode::IndirectBranch: {
+          auto target = eval(operands[0], 0);
+          if (!target) {
+            return fail(target.error().format(), op.va);
+          }
+          if (returnSentinelVa != 0 && target->lo == returnSentinelVa) {
+            ExecOutcome outcome;
+            outcome.stop = ExecStop::Return;
+            outcome.va = op.va;
+            return outcome;
+          }
+          const BlockId next = function_->blockAt(target->lo);
+          if (next.valid()) {
+            prevBlock = curBlock;
+            curBlock = next;
+            stepped = true;
+            break;
+          }
+          ExecOutcome outcome;
+          outcome.stop = ExecStop::IndirectBranch;
+          outcome.va = op.va;
+          outcome.target = target->lo;
+          return outcome;
+        }
+        case OpCode::Return: {
+          ExecOutcome outcome;
+          outcome.stop = ExecStop::Return;
+          outcome.va = op.va;
+          if (!operands.empty()) {
+            auto retVal = eval(operands[0], 0);
+            if (!retVal) {
+              return fail(retVal.error().format(), op.va);
+            }
+            outcome.returnValue = *retVal;
+          }
+          return outcome;
+        }
+        case OpCode::Unreachable: {
+          ExecOutcome outcome;
+          outcome.stop = ExecStop::Unreachable;
+          outcome.va = op.va;
+          return outcome;
+        }
+        case OpCode::Unimplemented: {
+          ExecOutcome outcome;
+          outcome.stop = ExecStop::Unimplemented;
+          outcome.va = op.va;
+          outcome.detail = std::string{function_->nameOf(op.payload)};
+          return outcome;
+        }
+        case OpCode::Phi:
+        case OpCode::Nop:
+        case OpCode::Count:
+          break;
+      }
+      if (stepped) {
+        break;
+      }
+    }
+    if (!stepped) {
+      return fail("block has no terminator", block.endVa);
+    }
+  }
+  return fail("runFunction step limit exceeded", function_->block(curBlock).va);
 }
 
 }  // namespace xdec::il

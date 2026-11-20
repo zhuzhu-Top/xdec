@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "xdec/analysis/abi.h"
 #include "xdec/analysis/import_callee.h"
 #include "xdec/analysis/stack_escape.h"
 #include "xdec/analysis/stack_frame.h"
@@ -79,35 +80,47 @@ class Vars final : public pass::FunctionPass {
         changed |= recoverArity(function, opId, declared, untouched, readElsewhere);
       }
     }
+    const analysis::AbiSpec* explicitAbi = context.abi();
+    const analysis::AbiSpec defaultAbi =
+        explicitAbi == nullptr ? analysis::AbiSpec::defaultFor(function)
+                               : analysis::AbiSpec{};
+    const analysis::AbiSpec& abi = explicitAbi != nullptr ? *explicitAbi : defaultAbi;
     changed |= attachOutgoingStackArgs(function, context.memoryFacts(),
-                                       binder ? &*binder : nullptr, self);
+                                       binder ? &*binder : nullptr, self, abi);
     return changed;
   }
 
  private:
   [[nodiscard]] static bool isCalleeSavedEntrySpill(const il::Function& function,
-                                                    il::ExprId value) {
-    const il::Expr& expr = function.expr(value);
+                                                    il::ExprId value,
+                                                    const analysis::AbiSpec& abi) {
+    il::ExprId cur = value;
+    for (unsigned depth = 0; depth < 4 && cur.valid(); ++depth) {
+      const il::Expr& e = function.expr(cur);
+      if ((e.op == il::ExprOp::Trunc || e.op == il::ExprOp::Bitcast ||
+           e.op == il::ExprOp::Extract) &&
+          e.operandCount == 1) {
+        cur = e.operands[0];
+        continue;
+      }
+      break;
+    }
+    const il::Expr& expr = function.expr(cur);
     if (expr.op != il::ExprOp::EntryReg) {
       return false;
     }
     const il::RegId reg{static_cast<uint32_t>(expr.immediate)};
-    if (!function.registers().contains(reg)) {
-      return false;
-    }
-    const std::string_view name = function.registers().nameOf(reg);
-    return name.size() == 3 && name[0] == 'x' &&
-           ((name[1] == '1' && name[2] == '9') ||
-            (name[1] == '2' && name[2] >= '0' && name[2] <= '9') ||
-            (name[1] == '3' && name[2] == '0'));
+    return function.registers().contains(reg) && abi.isCalleeSaved(reg);
   }
 
   /// Attaches contiguous outgoing stack arguments `[sp+0], [sp+8], ...` when
-  /// a call has all 8 register slots active and unread, unescaped stores sit
+  /// a call has all register slots active and unread, unescaped stores sit
   /// immediately at the call's SP offset in the same basic block.
   static bool attachOutgoingStackArgs(il::Function& function, const MemoryFacts& memory,
                                       const types::TypeBinder* binder,
-                                      const types::TypeEntry* self) {
+                                      const types::TypeEntry* self,
+                                      const analysis::AbiSpec& abi) {
+    const std::size_t regArgCount = abi.intArgRegs.size();
     const analysis::StackFrame frame = analysis::StackFrame::compute(function);
     std::unordered_set<int64_t> readDeltas;
     for (const il::BlockId blockId : function.blockHandles()) {
@@ -137,7 +150,7 @@ class Vars final : public pass::FunctionPass {
           if (ops.size() >= 2) {
             const analysis::AddressInfo info = frame.classify(ops[0]);
             if (info.kind == analysis::AddressKind::StackSlot) {
-              if (!isCalleeSavedEntrySpill(function, ops[1]) &&
+              if (!isCalleeSavedEntrySpill(function, ops[1], abi) &&
                   !readDeltas.contains(info.delta) && !escapes.isEscaped(info.delta)) {
                 recentStores[info.delta] = ops[1];
               } else {
@@ -156,7 +169,7 @@ class Vars final : public pass::FunctionPass {
         }
         const std::optional<int64_t> spDelta = function.callSpDelta(opId);
         const auto operands = function.operands(op);
-        if (spDelta.has_value() && operands.size() == 9) {
+        if (spDelta.has_value() && regArgCount > 0 && operands.size() == 1 + regArgCount) {
           bool allRegsSet = true;
           for (std::size_t i = kFirstArgOperand; i < operands.size(); ++i) {
             if (function.expr(operands[i]).op == il::ExprOp::Undef) {
@@ -169,7 +182,7 @@ class Vars final : public pass::FunctionPass {
                   ? analysis::resolveCallee(function, *binder, self, memory, operands[0])
                   : nullptr;
           const bool allowedByType =
-              callee == nullptr || callee->variadic || callee->params.size() > 8;
+              callee == nullptr || callee->variadic || callee->params.size() > regArgCount;
           if (allRegsSet && allowedByType && recentStores.contains(*spDelta)) {
             std::vector<il::ExprId> extended(operands.begin(), operands.end());
             for (int64_t offset = 0; offset < 256; offset += 8) {

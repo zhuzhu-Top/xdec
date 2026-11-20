@@ -10,6 +10,6 @@ extern "C" XDEC_EXPORT std::uint32_t xdec_plugin_abi_version() {
 }
 
 extern "C" XDEC_EXPORT XdecPluginInitResult
-xdec_plugin_init(xdec::pass::Registry*) {
+xdec_plugin_init(const XdecPluginHost*) {
   throw std::runtime_error("a plugin bug, deliberately uncaught");
 }

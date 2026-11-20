@@ -123,9 +123,8 @@ Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& r
                path.generic_string(), abiVersion, XDEC_PLUGIN_ABI_VERSION);
   }
 
-  void* initV2Symbol = library.symbol(XDEC_PLUGIN_INIT_V2_SYMBOL);
   void* initSymbol = library.symbol(XDEC_PLUGIN_INIT_SYMBOL);
-  if (initV2Symbol == nullptr && initSymbol == nullptr) {
+  if (initSymbol == nullptr) {
     return err(DiagCode::PluginError, "plugin '{}' exports no {}", path.generic_string(),
                XDEC_PLUGIN_INIT_SYMBOL);
   }
@@ -136,17 +135,14 @@ Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& r
   const std::size_t astBefore = astTransforms != nullptr ? astTransforms->size() : 0;
   XdecPluginInitResult init{false, "init never returned"};
   try {
-    if (initV2Symbol != nullptr) {
-      const XdecPluginHost host{
-          .structSize = sizeof(XdecPluginHost),
-          .passes = &registry,
-          .astTransforms = astTransforms,
-          .hlTransforms = hlTransforms,
-      };
-      init = reinterpret_cast<XdecPluginInitV2Fn>(initV2Symbol)(&host);
-    } else {
-      init = reinterpret_cast<XdecPluginInitFn>(initSymbol)(&registry);
-    }
+    const XdecPluginHost host{
+        .structSize = sizeof(XdecPluginHost),
+        .passes = &registry,
+        .astTransforms = astTransforms,
+        .hlTransforms = hlTransforms,
+        .algebraRules = &passes::AlgebraRuleRegistry::global(),
+    };
+    init = reinterpret_cast<XdecPluginInitFn>(initSymbol)(&host);
   } catch (const std::exception& exception) {
     return err(DiagCode::PluginError, "plugin '{}' init threw: {}", path.generic_string(),
                exception.what());
