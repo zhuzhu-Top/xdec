@@ -135,3 +135,19 @@ TEST_CASE("two different objects each seen at only one slot contribute nothing, 
 
   CHECK(findConfirmedVtableCalls(f.function).empty());
 }
+
+TEST_CASE("a stack-local function pointer load is never classified as a vtable call",
+          "[analysis][vtable-call]") {
+  Fixture f;
+  const ExprId sp = f.entryReg("sp");
+  const il::ValueId slot1 = f.function.appendLoad(
+      f.entry, 0x1000, Type::integer(64),
+      f.function.binary(ExprOp::Add, sp, f.i64(static_cast<uint64_t>(-0xa8))));
+  f.function.appendCall(f.entry, 0x1004, f.function.valueRef(slot1));
+  const il::ValueId slot2 = f.function.appendLoad(
+      f.entry, 0x1008, Type::integer(64),
+      f.function.binary(ExprOp::Add, sp, f.i64(static_cast<uint64_t>(-0x98))));
+  f.function.appendCall(f.entry, 0x100c, f.function.valueRef(slot2));
+
+  CHECK(findConfirmedVtableCalls(f.function).empty());
+}

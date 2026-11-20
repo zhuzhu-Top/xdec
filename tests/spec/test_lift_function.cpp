@@ -209,4 +209,21 @@ TEST_CASE("a branch into the unmapped resolves to a stub block", "[lift][functio
   CHECK(stub.empty());
 }
 
+TEST_CASE("an unconditional branch marked as a tail call lifts as Call + Return instead of inlining",
+          "[lift][function]") {
+  WordMemory memory;
+  memory.put(0x5000, kB_p8);  // b 0x5008
+  memory.put(0x5008, kRet);   // external callee body
+
+  auto result = liftFunction(
+      engine(), memory.reader(), 0x5000, {}, nullptr, {},
+      [](uint64_t, uint64_t target) { return target == 0x5008; });
+  REQUIRE(result);
+  CHECK(result->function->blockCount() == 1);
+  const auto& ops = result->function->block(result->entry).ops;
+  REQUIRE(ops.size() >= 2);
+  CHECK(result->function->op(ops[ops.size() - 2]).code == xdec::il::OpCode::Call);
+  CHECK(result->function->op(ops.back()).code == xdec::il::OpCode::Return);
+}
+
 }  // namespace

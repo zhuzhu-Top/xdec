@@ -23,11 +23,13 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 
 #include "xdec/analysis/entry_reg.h"
 #include "xdec/analysis/stack_frame.h"
 #include "xdec/analysis/variables.h"
+#include "xdec/emit/ast.h"
 #include "xdec/emit/structure.h"
 #include "xdec/il/function.h"
 #include "xdec/support/reader.h"
@@ -55,6 +57,11 @@ namespace xdec::emit {
 struct SymbolRef {
   /// Empty when no defined symbol covers the address.
   std::string name;
+  /// Optional human-readable display name (e.g. `-[Class method:]` for ObjC
+  /// methods whose C identifier `name` uses underscores).
+  std::string displayName;
+  /// Optional Objective-C `@encode` signature string (`v28@0:8@16I24`).
+  std::string typeEncoding;
   uint64_t offset = 0;
   bool isFunction = false;
 
@@ -92,6 +99,13 @@ struct AddressFacts {
   /// too, and it maps from address zero, so every small integer the code happens
   /// to dereference is "mapped" without being a variable.
   bool variable = false;
+  /// Whether this section holds dedicated C-string literals (`__cstring`,
+  /// `__oslogstring`, etc.), where a constant address above the first page is
+  /// reliably a string pointer even on variadic or untyped calls.
+  bool cstringSection = false;
+  /// Decoded string content when the address points to a Mach-O `__cfstring`
+  /// literal entry, empty otherwise.
+  std::optional<std::string> cfstringLiteral;
   /// The imported symbol a pointer slot here binds to, when a relocation says.
   /// Empty otherwise. This is the difference between a reader learning that the
   /// code calls through a table and learning that it calls `dlsym`.
@@ -133,6 +147,16 @@ struct COptions {
   /// statement in a reader's way; `false` is for a caller that wants every
   /// intrinsic to look the same.
   bool securityHintsAsComments = true;
+  /// When false (default), omit repetitive ABI-drop and GOT-writability prose
+  /// notes on calls so emitted C stays focused on program logic.
+  bool verboseNotes = false;
+  /// When true (default), Objective-C methods (`objc_inst_*` / `objc_cls_*`)
+  /// name `arg1`/`arg2` as `self`/`_cmd` (or `cls`/`_cmd`).
+  bool objcSyntax = true;
+  /// Target output dialect (`EmitLanguage::C` or `EmitLanguage::Objc`).
+  EmitLanguage language = EmitLanguage::C;
+  /// High-level AST transforms applied after `lowerToHlAst` and before rendering.
+  std::vector<HlAstTransformFn> hlTransforms;
   /// How to name addresses: callees, and the function itself. Absent means
   /// every address prints as a bare number, which is where this started.
   SymbolResolver symbols;

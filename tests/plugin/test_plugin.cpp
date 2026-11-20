@@ -93,3 +93,43 @@ TEST_CASE("a file that is not there fails cleanly", "[plugin]") {
   REQUIRE_FALSE(plugin);
   CHECK(plugin.error().code() == xdec::DiagCode::PluginError);
 }
+
+TEST_CASE("v2 bundled plugins load passes and AST transforms cleanly", "[plugin]") {
+  Plugin ollvm;
+  Plugin objc;
+  Registry registry;
+  std::vector<xdec::emit::AstTransformFn> astTransforms;
+  std::vector<xdec::emit::HlAstTransformFn> hlTransforms;
+
+  auto loadedOllvm = Plugin::load(XDEC_PLUGIN_OLLVM, registry, &astTransforms, &hlTransforms);
+  REQUIRE(loadedOllvm);
+  ollvm = std::move(*loadedOllvm);
+  CHECK(ollvm.registeredPasses() == 1);
+  CHECK(ollvm.registeredAstTransforms() == 1);
+  CHECK(registry.find("ollvm-state-thread") != nullptr);
+
+  auto loadedObjc = Plugin::load(XDEC_PLUGIN_OBJC, registry, &astTransforms, &hlTransforms);
+  REQUIRE(loadedObjc);
+  objc = std::move(*loadedObjc);
+  CHECK(objc.registeredPasses() == 2);
+  CHECK(registry.find("objc-arity-trim") != nullptr);
+  CHECK(registry.find("objc-retain-elide") != nullptr);
+  CHECK(hlTransforms.size() == 1);
+
+  // Verify the AST transform unwraps a vacuous while(true) cleanly.
+  Function f = makeFunction();
+  xdec::emit::StructuredFunction sf;
+  auto loop = xdec::emit::Stmt::make(xdec::emit::StmtKind::While);
+  auto inner = xdec::emit::Stmt::make(xdec::emit::StmtKind::Block);
+  inner->block = f.entryBlock();
+  loop->body = std::move(inner);
+  auto root = xdec::emit::Stmt::make(xdec::emit::StmtKind::Sequence);
+  root->items.push_back(std::move(loop));
+  sf.root = std::move(root);
+
+  REQUIRE(astTransforms.size() == 1);
+  astTransforms[0](f, sf);
+  REQUIRE(sf.root->kind == xdec::emit::StmtKind::Sequence);
+  REQUIRE(sf.root->items.size() == 1);
+  CHECK(sf.root->items[0]->kind == xdec::emit::StmtKind::Block);
+}

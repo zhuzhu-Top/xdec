@@ -6,10 +6,15 @@
 #include "xdec/emit/c_printer.h"
 
 #include <algorithm>
+#include <cctype>
 #include <format>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
+#include "ast_lower.h"
+#include "backend_c.h"
+#include "backend_objc.h"
 #include "c_context.h"
 #include "c_expr.h"
 #include "c_helpers.h"
@@ -31,22 +36,34 @@ class Assembler {
     nameResultTemps();
     const std::string body = [&] {
       XDEC_SPAN(span, "emit", "statements");
-      StmtPrinter statements(ctx_, expressions_);
-      return statements.run();
+      HlFunction hl = lowerToHlAst(ctx_, expressions_);
+      hl.name = name();
+      hl.language = ctx_.options.language;
+      for (const auto& transform : ctx_.options.hlTransforms) {
+        if (transform) {
+          transform(ctx_.function, hl);
+        }
+      }
+      return ctx_.options.language == EmitLanguage::Objc
+                 ? renderObjcBody(*hl.body, 1)
+                 : renderCBody(*hl.body, 1);
     }();
     // Declarations before the preamble: naming a register variable is what
     // introduces the entry extern the preamble has to declare. The signature
     // comes before it for the same reason -- an imported parameter type is a
     // type the preamble then has to define.
     XDEC_SPAN(declSpan, "emit", "declarations");
-    const std::string locals = declarations();
+    const std::string locals = declarations(body);
     const std::string head = signature();
 
-    std::string out = preamble();
+    std::string out = preamble(body);
     declSpan.end();
     out += location();
     out += head;
     out += " {\n";
+    if (ctx_.hasSret && ctx_.options.language == EmitLanguage::Objc) {
+      out += "  void* _sret /* in x8 */;\n";
+    }
     out += locals;
     out += body;
     out += "}\n";
@@ -54,6 +71,30 @@ class Assembler {
   }
 
  private:
+  [[nodiscard]] bool filterUnusedDecls() const noexcept {
+    return ctx_.options.language == EmitLanguage::Objc || !ctx_.options.hlTransforms.empty();
+  }
+
+  [[nodiscard]] static bool isIdentifierUsed(std::string_view hay, std::string_view ident) noexcept {
+    if (ident.empty()) {
+      return false;
+    }
+    std::size_t pos = 0;
+    while ((pos = hay.find(ident, pos)) != std::string_view::npos) {
+      const bool leftOk =
+          pos == 0 || (!std::isalnum(static_cast<unsigned char>(hay[pos - 1])) &&
+                       hay[pos - 1] != '_');
+      const std::size_t end = pos + ident.size();
+      const bool rightOk =
+          end >= hay.size() || (!std::isalnum(static_cast<unsigned char>(hay[end])) &&
+                                hay[end] != '_');
+      if (leftOk && rightOk) {
+        return true;
+      }
+      pos = end;
+    }
+    return false;
+  }
   /// Every op result that must not be re-evaluated at its uses gets a name.
   /// For a load this is semantics, not style: SSA fixed the value at the
   /// definition, so re-printing the dereference at a later use would re-read
@@ -91,7 +132,11 @@ class Assembler {
     if (!ctx_.options.name.empty()) {
       return ctx_.options.name;
     }
-    return ctx_.calleeName(entryVa());
+    const SymbolRef symbol = ctx_.symbolAt(entryVa());
+    if (symbol.exact() && symbol.isFunction) {
+      return symbol.name;
+    }
+    return std::format("sub_{:x}", entryVa());
   }
 
   /// Where in the binary this function sits, when the symbol table can say
@@ -143,8 +188,34 @@ class Assembler {
 
     const std::optional<analysis::CType>& returned = ctx_.variables.returnType();
     const types::TypeId typedReturn = ctx_.functionReturnType();
+    const SymbolRef entrySym = ctx_.symbolAt(entryVa());
+    const bool objcVoid =
+        entrySym.exact() && !entrySym.typeEncoding.empty() &&
+        entrySym.typeEncoding.front() == 'v';
     const std::string returnSpelling =
-        typedReturn.valid() ? ctx_.spell(typedReturn) : (returned ? returned->format() : "void");
+        objcVoid ? std::string{"void"}
+                 : (typedReturn.valid() ? ctx_.spell(typedReturn)
+                                        : (returned ? returned->format() : "void"));
+    if (ctx_.options.language == EmitLanguage::Objc) {
+      if (entrySym.exact() && !entrySym.displayName.empty()) {
+        std::vector<std::pair<std::string, std::string>> paramList;
+        paramList.reserve(byIndex.size());
+        for (std::size_t index = 0; index < byIndex.size(); ++index) {
+          if (byIndex[index] == nullptr) {
+            paramList.emplace_back("uint64_t",
+                                   ctx_.positionalArgumentName(static_cast<int>(index)));
+          } else {
+            paramList.emplace_back(byIndex[index]->type.format(),
+                                   ctx_.argumentName(*byIndex[index]));
+          }
+        }
+        const std::string objcHead = formatObjcMethodSignature(
+            entrySym.displayName, entrySym.typeEncoding, returnSpelling, paramList);
+        if (!objcHead.empty()) {
+          return ctx_.hasSret ? (objcHead + " /* sret: void* _sret */") : objcHead;
+        }
+      }
+    }
     std::string out = std::format("{} {}(", returnSpelling, name());
     for (std::size_t index = 0; index < byIndex.size(); ++index) {
       out += index == 0 ? "" : ", ";
@@ -156,7 +227,10 @@ class Assembler {
       out += std::format("{} {}", byIndex[index]->type.format(),
                          ctx_.argumentName(*byIndex[index]));
     }
-    if (byIndex.empty()) {
+    if (ctx_.hasSret) {
+      out += byIndex.empty() ? "void* _sret /* x8 sret */"
+                             : ", void* _sret /* x8 sret */";
+    } else if (byIndex.empty()) {
       out += "void";
     }
     return out + ")";
@@ -213,7 +287,8 @@ class Assembler {
     return out + ")";
   }
 
-  [[nodiscard]] std::string declarations() {
+  [[nodiscard]] std::string declarations(std::string_view body) {
+    const bool pruneUnused = filterUnusedDecls();
     std::string out;
     std::vector<const analysis::Variable*> locals;
     for (const analysis::Variable& variable : ctx_.variables.locals()) {
@@ -262,45 +337,40 @@ class Assembler {
                              il::toString(ctx_.function.registers()[root].regClass)));
     }
     // Plain scalar temps -- the overwhelming majority on a large flattened
-    // function -- gain nothing from one declaration per line: the type is
-    // all that would otherwise repeat. A run of adjacent temps sharing a type
-    // is comma-joined onto one line instead; order is untouched, so this
-    // changes how many lines the declarations take and nothing else. Typed
+    // function -- gain nothing from one declaration per line: bucket them by
+    // C type (preserving first-seen type order) and comma-join up to
+    // kMaxPerLine per line so alternating pointer/integer types do not explode
+    // into tens of thousands of one-variable declaration lines. Typed
     // (imported/aliased) declarations keep their own line, each spelled
-    // differently by `spellDeclaration` and rare enough not to matter.
-    std::string pendingType;
-    std::vector<std::string> pendingNames;
-    const auto flushGroup = [&] {
-      if (pendingNames.empty()) {
-        return;
-      }
-      std::string names = pendingNames.front();
-      for (std::size_t index = 1; index < pendingNames.size(); ++index) {
-        names += ", " + pendingNames[index];
-      }
-      appendLine(out, 1, std::format("{} {};", pendingType, names));
-      pendingNames.clear();
-    };
+    // differently by `spellDeclaration`.
     constexpr std::size_t kMaxPerLine = 12;
+    std::vector<std::string> typeOrder;
+    std::unordered_map<std::string, std::vector<std::string>> byType;
+    std::string typedDecls;
     const auto addPlain = [&](std::string type, std::string name) {
-      if (type != pendingType || pendingNames.size() >= kMaxPerLine) {
-        flushGroup();
-        pendingType = std::move(type);
+      auto [it, inserted] = byType.try_emplace(type);
+      if (inserted) {
+        typeOrder.push_back(std::move(type));
       }
-      pendingNames.push_back(std::move(name));
+      it->second.push_back(std::move(name));
     };
     for (const analysis::Variable& temp : ctx_.variables.temps()) {
+      if (pruneUnused && !isIdentifierUsed(body, temp.name)) {
+        continue;
+      }
       addPlain(temp.type.format(), temp.name);
     }
     for (const auto& [valueIndex, temp] : ctx_.tempNames) {
+      if (pruneUnused && !isIdentifierUsed(body, temp)) {
+        continue;
+      }
       // An imported type wins over the measured width here, and only here: the
       // body already printed this value as a field access through that type,
       // so declaring it as the eight bytes the load read would be declaring
       // something the body then uses as a pointer.
       if (const types::TypeId declared = ctx_.typeOfValue(il::ValueId{valueIndex});
           declared.valid()) {
-        flushGroup();
-        appendLine(out, 1, std::format("{};", ctx_.spellDeclaration(declared, temp)));
+        appendLine(typedDecls, 1, std::format("{};", ctx_.spellDeclaration(declared, temp)));
         continue;
       }
       const uint32_t width = ctx_.function.value(il::ValueId{valueIndex}).type.bits();
@@ -315,7 +385,18 @@ class Assembler {
                    : intType(temporary.width == 0 ? 64 : temporary.width),
                temporary.name);
     }
-    flushGroup();
+    for (const std::string& type : typeOrder) {
+      const std::vector<std::string>& names = byType.at(type);
+      for (std::size_t start = 0; start < names.size(); start += kMaxPerLine) {
+        const std::size_t end = std::min(names.size(), start + kMaxPerLine);
+        std::string line = names[start];
+        for (std::size_t idx = start + 1; idx < end; ++idx) {
+          line += ", " + names[idx];
+        }
+        appendLine(out, 1, std::format("{} {};", type, line));
+      }
+    }
+    out += typedDecls;
     if (!out.empty()) {
       out += '\n';
     }
@@ -336,9 +417,13 @@ class Assembler {
   /// decoration on a read-only section; it is the statement that every load from
   /// it yields the value in the file, which is the difference between a constant
   /// of the program and an observation of its state.
-  [[nodiscard]] std::string globalDeclarations() {
+  [[nodiscard]] std::string globalDeclarations(std::string_view body) {
+    const bool pruneUnused = filterUnusedDecls();
     std::string out;
     for (const auto& [address, global] : ctx_.globals) {
+      if (pruneUnused && !isIdentifierUsed(body, global.name)) {
+        continue;
+      }
       const char* qualifier = global.facts.writable ? "" : "const ";
       std::string where = global.facts.section.empty()
                               ? std::string{}
@@ -401,7 +486,8 @@ class Assembler {
     return out;
   }
 
-  [[nodiscard]] std::string preamble() {
+  [[nodiscard]] std::string preamble(std::string_view body) {
+    const bool pruneUnused = filterUnusedDecls();
     std::string out =
         "#include <stdint.h>\n"
         "#include <stdbool.h>\n";
@@ -418,6 +504,9 @@ class Assembler {
         "typedef __int128 int128_t;\n";
     std::string externs;
     for (const auto& [address, callee] : ctx_.callees) {
+      if (pruneUnused && !isIdentifierUsed(body, callee)) {
+        continue;
+      }
       // The address stays in a comment even when the name came from the symbol
       // table: the name is what makes the call readable, the address is what
       // makes it checkable against a disassembler.
@@ -444,7 +533,7 @@ class Assembler {
       externs += std::format("extern const {} {};\n", intType(width), leaf);
     }
     externs += syscallDeclarations();
-    externs += globalDeclarations();
+    externs += globalDeclarations(body);
     const std::string helpers = helperDeclarations(ctx_.helpers, ctx_.options.helpersHeader);
     // Definitions last to build and first to print: everything above may have
     // been what mentioned a type, and C needs the definition before the use.

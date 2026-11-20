@@ -187,3 +187,73 @@ TEST_CASE("a store to a global address is left alone", "[analysis][stack-store-f
   CHECK(dead.empty());
   (void)store;
 }
+
+TEST_CASE("callee-saved prologue spills adjacent to an escaped struct are still dead",
+          "[analysis][stack-store-fold]") {
+  il::RegisterFile regs = xdec::test::arm64Registers();
+  const RegId x24 = regs.add("x24", 64, il::RegClass::General);
+  const RegId x29 = regs.add("x29", 64, il::RegClass::General);
+  Function fn(Arch::AArch64, regs, 0x1000);
+  const BlockId entry = fn.createBlock(0x1000);
+  fn.setEntryBlock(entry);
+  const auto slot = [&](int64_t delta) {
+    const ExprId sp = fn.entryReg(regs.find("sp"));
+    return delta < 0
+               ? fn.binary(ExprOp::Sub, sp, fn.constant(Type::integer(64), static_cast<uint64_t>(-delta)))
+               : fn.binary(ExprOp::Add, sp, fn.constant(Type::integer(64), static_cast<uint64_t>(delta)));
+  };
+
+  // An escaped block struct at [-0x78, -0x68) immediately below callee-saved
+  // spills at -0x68..-0x58. The aggregate fields stay live; the prologue
+  // callee-saved spills must not be pulled into the struct's escape footprint.
+  const ExprId blockAddr = slot(-0x78);
+  const OpId field0 =
+      fn.appendStore(entry, 0x1000, Type::integer(64), blockAddr, fn.constant(Type::integer(64), 0x1234));
+  const OpId field1 =
+      fn.appendStore(entry, 0x1004, Type::integer(64), slot(-0x70), fn.constant(Type::integer(64), 0x5678));
+  const OpId spill24 =
+      fn.appendStore(entry, 0x1008, Type::integer(64), slot(-0x68), fn.entryReg(x24));
+  const OpId spill29 =
+      fn.appendStore(entry, 0x100c, Type::integer(64), slot(-0x60), fn.entryReg(x29));
+  const OpId call = fn.appendCall(entry, 0x1010, fn.constant(Type::integer(64), 0x9000));
+  fn.setOperands(call, std::vector<ExprId>{fn.constant(Type::integer(64), 0x9000), blockAddr});
+  fn.appendReturn(entry, 0x1014);
+  fn.rebuildEdges();
+
+  const StackFrame frame = StackFrame::compute(fn);
+  const auto dead = findDeadStackStores(fn, frame, VariableTable{});
+  CHECK(!dead.contains(field0.index()));
+  CHECK(!dead.contains(field1.index()));
+  CHECK(dead.contains(spill24.index()));
+  CHECK(dead.contains(spill29.index()));
+}
+
+TEST_CASE("callee-saved vector prologue spills adjacent to an escaped struct are still dead",
+          "[analysis][stack-store-fold]") {
+  il::RegisterFile regs = xdec::test::arm64Registers();
+  const RegId q8 = regs.add("q8", 128, il::RegClass::Vector);
+  Function fn(Arch::AArch64, regs, 0x1000);
+  const BlockId entry = fn.createBlock(0x1000);
+  fn.setEntryBlock(entry);
+  const auto slot = [&](int64_t delta) {
+    const ExprId sp = fn.entryReg(regs.find("sp"));
+    return fn.binary(ExprOp::Sub, sp, fn.constant(Type::integer(64), static_cast<uint64_t>(-delta)));
+  };
+
+  const ExprId blockAddr = slot(-0x78);
+  const OpId field0 =
+      fn.appendStore(entry, 0x1000, Type::integer(64), blockAddr, fn.constant(Type::integer(64), 0x1234));
+  const il::ValueId readQ8 = fn.appendReadReg(entry, 0x1004, q8);
+  const OpId spillQ8 = fn.appendStore(
+      entry, 0x1008, Type::integer(64), slot(-0x70),
+      fn.cast(ExprOp::Trunc, Type::integer(64), fn.valueRef(readQ8)));
+  const OpId call = fn.appendCall(entry, 0x100c, fn.constant(Type::integer(64), 0x9000));
+  fn.setOperands(call, std::vector<ExprId>{fn.constant(Type::integer(64), 0x9000), blockAddr});
+  fn.appendReturn(entry, 0x1010);
+  fn.rebuildEdges();
+
+  const StackFrame frame = StackFrame::compute(fn);
+  const auto dead = findDeadStackStores(fn, frame, VariableTable{});
+  CHECK(!dead.contains(field0.index()));
+  CHECK(dead.contains(spillQ8.index()));
+}

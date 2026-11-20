@@ -68,7 +68,13 @@ class FlagConditionRewrite {
         return rewriteAdd(code);
       case il::FlagOp::Logical:
         return rewriteLogical(code);
-      case il::FlagOp::Const:
+      case il::FlagOp::Const: {
+        const il::Expr& bundle = function_.expr(flagDef_.operands[0]);
+        if (bundle.op == il::ExprOp::Const) {
+          return function_.boolean(conditionValue(code, bundle.immediate & 0xFu));
+        }
+        return onlyAlways(code);
+      }
       case il::FlagOp::AddCarry:
       case il::FlagOp::SubCarry:
       case il::FlagOp::Count:
@@ -78,6 +84,32 @@ class FlagConditionRewrite {
   }
 
  private:
+  [[nodiscard]] static bool conditionValue(il::ConditionCode code, uint64_t nzcv) noexcept {
+    const bool n = (nzcv >> 3) & 1u;
+    const bool z = (nzcv >> 2) & 1u;
+    const bool c = (nzcv >> 1) & 1u;
+    const bool v = nzcv & 1u;
+    switch (code) {
+      case il::ConditionCode::Equal: return z;
+      case il::ConditionCode::NotEqual: return !z;
+      case il::ConditionCode::CarrySet: return c;
+      case il::ConditionCode::CarryClear: return !c;
+      case il::ConditionCode::Negative: return n;
+      case il::ConditionCode::NonNegative: return !n;
+      case il::ConditionCode::Overflow: return v;
+      case il::ConditionCode::NoOverflow: return !v;
+      case il::ConditionCode::UnsignedGreater: return c && !z;
+      case il::ConditionCode::UnsignedLessEqual: return !c || z;
+      case il::ConditionCode::SignedGreaterEqual: return n == v;
+      case il::ConditionCode::SignedLess: return n != v;
+      case il::ConditionCode::SignedGreater: return !z && n == v;
+      case il::ConditionCode::SignedLessEqual: return z || n != v;
+      case il::ConditionCode::Always: return true;
+      case il::ConditionCode::Never:
+      case il::ConditionCode::Count: return false;
+    }
+    return false;
+  }
   [[nodiscard]] il::ExprId onlyAlways(il::ConditionCode code) {
     switch (code) {
       case il::ConditionCode::Always:
@@ -248,6 +280,15 @@ class FlagPhiDistributor {
     if (expr.op == il::ExprOp::FlagDef) {
       return FlagConditionRewrite(function_, expr).rewrite(code);
     }
+    if (expr.op == il::ExprOp::Select && expr.operandCount == 3 && depth < kMaxDepth) {
+      const il::ExprId cond = expr.operands[0];
+      const il::ExprId t = resolveRec(expr.operands[1], code, depth + 1);
+      const il::ExprId f = resolveRec(expr.operands[2], code, depth + 1);
+      if (t.valid() && f.valid()) {
+        return function_.select(cond, t, f);
+      }
+      return il::ExprId{};
+    }
     if (expr.op != il::ExprOp::Value || depth >= kMaxDepth) {
       return il::ExprId{};
     }
@@ -393,16 +434,37 @@ il::ExprId foldFlagConditionsRec(il::Function& function, il::ExprId id,
   }
   il::ExprId result = changed ? function.intern(rebuilt) : id;
 
-  // The pattern: flagcond(flagdef ...). Anything else stays as rebuilt.
+  // The pattern: flagcond(flagdef ...) or flagcond(select(c, f1, f2)) from ccmp/ccmn.
   if (expr.op == il::ExprOp::FlagCond) {
     const il::Expr& cond = function.expr(result);
-    const il::Expr& flags = function.expr(cond.operands[0]);
+    const il::ConditionCode code = static_cast<il::ConditionCode>(cond.immediate);
+    const il::Expr flags = function.expr(cond.operands[0]);
     if (flags.op == il::ExprOp::FlagDef) {
-      if (const il::ExprId rewritten =
-              FlagConditionRewrite(function, flags)
-                  .rewrite(static_cast<il::ConditionCode>(cond.immediate));
+      if (const il::ExprId rewritten = FlagConditionRewrite(function, flags).rewrite(code);
           rewritten.valid()) {
         result = rewritten;
+      }
+    } else if (flags.op == il::ExprOp::Select && flags.operandCount == 3) {
+      const il::ExprId tCond =
+          foldFlagConditionsRec(function, function.flagCondition(flags.operands[1], code), memo);
+      const il::ExprId fCond =
+          foldFlagConditionsRec(function, function.flagCondition(flags.operands[2], code), memo);
+      if (tCond == fCond) {
+        result = tCond;
+      } else {
+        uint64_t tVal = 0;
+        uint64_t fVal = 0;
+        if (function.asConstant(tCond, tVal) && function.asConstant(fCond, fVal)) {
+          if (tVal != 0 && fVal == 0) {
+            result = flags.operands[0];
+          } else if (tVal == 0 && fVal != 0) {
+            result = function.unary(il::ExprOp::Not, flags.operands[0]);
+          } else {
+            result = function.select(flags.operands[0], tCond, fCond);
+          }
+        } else {
+          result = function.select(flags.operands[0], tCond, fCond);
+        }
       }
     }
   }

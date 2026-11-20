@@ -40,6 +40,7 @@ xdec_add_library(xdec_analysis
     value_uses.cpp
     variables.cpp
     vtable_call.cpp
+    xrefs.cpp
   DEPS
     xdec_il
     xdec_spec

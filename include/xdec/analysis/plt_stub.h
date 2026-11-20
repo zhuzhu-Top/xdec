@@ -19,16 +19,24 @@
 
 namespace xdec::analysis {
 
-/// If `stubVa` is the standard ELF/AArch64 PLT stub shape --
-/// `adrp Xn, page; ldr Xm, [Xn, #off]; ...` -- returns the GOT slot address
-/// the stub loads its real target from. `reader` reads the plain image: PLT
-/// stub bytes are ordinary executable code, not a relocated slot, so no
-/// MemoryFacts::isImmutable check applies to them.
+/// If `stubVa` is a standard AArch64 PLT/Mach-O import stub (either directly or
+/// reached through unconditional `B` branch islands and/or an Apple
+/// `__objc_stubs` selector trampoline) --
+/// `adrp Xn, page; ldr Xm, [Xn, #off]; ...` (or `adrp Xn; add Xn; ldr Xm, [Xn]`)
+/// -- returns the GOT slot address the stub loads its real target from.
+/// `reader` reads the plain image: stub bytes are ordinary executable code,
+/// not a relocated slot, so no MemoryFacts::isImmutable check applies to them.
 ///
 /// Returns nullopt for anything that does not match: a direct call to a
 /// function's own code, which is the overwhelmingly common case, is rejected
 /// by the very first instruction almost always.
 [[nodiscard]] std::optional<uint64_t> pltGotSlot(const ByteReader& reader, uint64_t stubVa);
+
+/// If `stubVa` (directly or through unconditional `B` branch islands) is an
+/// Apple `__objc_stubs` selector trampoline (`adrp x1, page; ldr x1, [x1, #off];
+/// b _objc_msgSend`), returns the `__objc_selrefs` slot address loaded into `x1`.
+[[nodiscard]] std::optional<uint64_t> objcStubSelectorSlot(const ByteReader& reader,
+                                                           uint64_t stubVa);
 
 /// The import `stubVa` ultimately calls, when `stubVa` is a PLT stub (see
 /// pltGotSlot) whose GOT slot `facts` binds to a name. Nullopt for anything

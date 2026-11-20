@@ -16,6 +16,56 @@ namespace {
   return (code == il::OpCode::Load || code == il::OpCode::Store) && index == 0;
 }
 
+/// True when `value` is a raw callee-saved entry register (`x19..x30` or
+/// `q8..q15` / `d8..d15` read) -- an ABI prologue register spill that cannot
+/// be a user-populated aggregate field reached through an adjacent local's
+/// pointer.
+[[nodiscard]] bool isCalleeSavedEntrySpill(const il::Function& function, il::ExprId value) {
+  il::ExprId cur = value;
+  for (unsigned depth = 0; depth < 4 && cur.valid(); ++depth) {
+    const il::Expr& expr = function.expr(cur);
+    if ((expr.op == il::ExprOp::Trunc || expr.op == il::ExprOp::Bitcast) &&
+        expr.operandCount == 1) {
+      cur = expr.operands[0];
+      continue;
+    }
+    break;
+  }
+  const il::Expr& expr = function.expr(cur);
+  if (expr.op == il::ExprOp::Value) {
+    const il::ValueId val{static_cast<uint32_t>(expr.immediate)};
+    if (function.hasValue(val)) {
+      const il::OpId defId = function.value(val).definition;
+      if (defId.valid() && function.hasOp(defId) &&
+          function.op(defId).code == il::OpCode::ReadReg) {
+        const il::RegId root = function.registers().rootOf(function.op(defId).reg());
+        const std::string_view rname = function.registers().nameOf(root);
+        if ((rname.size() == 2 || rname.size() == 3) &&
+            (rname[0] == 'q' || rname[0] == 'd' || rname[0] == 'v')) {
+          const std::string_view num = rname.substr(1);
+          if (num == "8" || num == "9" || num == "10" || num == "11" ||
+              num == "12" || num == "13" || num == "14" || num == "15") {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+  if (expr.op != il::ExprOp::EntryReg) {
+    return false;
+  }
+  const il::RegId reg{static_cast<uint32_t>(expr.immediate)};
+  if (!function.registers().contains(reg)) {
+    return false;
+  }
+  const std::string_view name = function.registers().nameOf(reg);
+  return name.size() == 3 && name[0] == 'x' &&
+         ((name[1] == '1' && name[2] == '9') ||
+          (name[1] == '2' && name[2] >= '0' && name[2] <= '9') ||
+          (name[1] == '3' && name[2] == '0'));
+}
+
 /// One Store's own footprint: the delta it writes through, and how many
 /// bytes wide.
 struct StoreSpan {
@@ -40,6 +90,9 @@ StackEscapeMap StackEscapeMap::compute(const il::Function& function, const Stack
           continue;
         }
         if (op.code == il::OpCode::Store && index == 0) {
+          if (operands.size() >= 2 && isCalleeSavedEntrySpill(function, operands[1])) {
+            continue;
+          }
           const uint64_t widthBytes = std::max<uint64_t>(op.type.bits() / 8, 1);
           storeSpans.push_back({info.delta, widthBytes});
           continue;

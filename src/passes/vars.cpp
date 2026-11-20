@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "xdec/analysis/import_callee.h"
+#include "xdec/analysis/stack_escape.h"
+#include "xdec/analysis/stack_frame.h"
 #include "xdec/il/function.h"
 #include "xdec/types/binder.h"
 #include "xdec/types/database.h"
@@ -77,10 +79,117 @@ class Vars final : public pass::FunctionPass {
         changed |= recoverArity(function, opId, declared, untouched, readElsewhere);
       }
     }
+    changed |= attachOutgoingStackArgs(function, context.memoryFacts(),
+                                       binder ? &*binder : nullptr, self);
     return changed;
   }
 
  private:
+  [[nodiscard]] static bool isCalleeSavedEntrySpill(const il::Function& function,
+                                                    il::ExprId value) {
+    const il::Expr& expr = function.expr(value);
+    if (expr.op != il::ExprOp::EntryReg) {
+      return false;
+    }
+    const il::RegId reg{static_cast<uint32_t>(expr.immediate)};
+    if (!function.registers().contains(reg)) {
+      return false;
+    }
+    const std::string_view name = function.registers().nameOf(reg);
+    return name.size() == 3 && name[0] == 'x' &&
+           ((name[1] == '1' && name[2] == '9') ||
+            (name[1] == '2' && name[2] >= '0' && name[2] <= '9') ||
+            (name[1] == '3' && name[2] == '0'));
+  }
+
+  /// Attaches contiguous outgoing stack arguments `[sp+0], [sp+8], ...` when
+  /// a call has all 8 register slots active and unread, unescaped stores sit
+  /// immediately at the call's SP offset in the same basic block.
+  static bool attachOutgoingStackArgs(il::Function& function, const MemoryFacts& memory,
+                                      const types::TypeBinder* binder,
+                                      const types::TypeEntry* self) {
+    const analysis::StackFrame frame = analysis::StackFrame::compute(function);
+    std::unordered_set<int64_t> readDeltas;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        if (op.code != il::OpCode::Load) {
+          continue;
+        }
+        const auto ops = function.operands(op);
+        if (!ops.empty()) {
+          const analysis::AddressInfo info = frame.classify(ops[0]);
+          if (info.kind == analysis::AddressKind::StackSlot) {
+            readDeltas.insert(info.delta);
+          }
+        }
+      }
+    }
+    const analysis::StackEscapeMap escapes = analysis::StackEscapeMap::compute(function, frame);
+
+    bool changed = false;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      std::unordered_map<int64_t, il::ExprId> recentStores;
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        if (op.code == il::OpCode::Store) {
+          const auto ops = function.operands(op);
+          if (ops.size() >= 2) {
+            const analysis::AddressInfo info = frame.classify(ops[0]);
+            if (info.kind == analysis::AddressKind::StackSlot) {
+              if (!isCalleeSavedEntrySpill(function, ops[1]) &&
+                  !readDeltas.contains(info.delta) && !escapes.isEscaped(info.delta)) {
+                recentStores[info.delta] = ops[1];
+              } else {
+                recentStores.erase(info.delta);
+              }
+            }
+          }
+          continue;
+        }
+        if (op.code == il::OpCode::Intrinsic || op.code == il::OpCode::Unimplemented) {
+          recentStores.clear();
+          continue;
+        }
+        if (op.code != il::OpCode::Call) {
+          continue;
+        }
+        const std::optional<int64_t> spDelta = function.callSpDelta(opId);
+        const auto operands = function.operands(op);
+        if (spDelta.has_value() && operands.size() == 9) {
+          bool allRegsSet = true;
+          for (std::size_t i = kFirstArgOperand; i < operands.size(); ++i) {
+            if (function.expr(operands[i]).op == il::ExprOp::Undef) {
+              allRegsSet = false;
+              break;
+            }
+          }
+          const types::TypeEntry* callee =
+              binder != nullptr
+                  ? analysis::resolveCallee(function, *binder, self, memory, operands[0])
+                  : nullptr;
+          const bool allowedByType =
+              callee == nullptr || callee->variadic || callee->params.size() > 8;
+          if (allRegsSet && allowedByType && recentStores.contains(*spDelta)) {
+            std::vector<il::ExprId> extended(operands.begin(), operands.end());
+            for (int64_t offset = 0; offset < 256; offset += 8) {
+              const auto it = recentStores.find(*spDelta + offset);
+              if (it == recentStores.end()) {
+                break;
+              }
+              extended.push_back(it->second);
+            }
+            if (extended.size() > operands.size()) {
+              function.setOperands(opId, extended);
+              changed = true;
+            }
+          }
+        }
+        recentStores.clear();
+      }
+    }
+    return changed;
+  }
   /// Whether a call can destroy the argument registers, which is every call
   /// but the helpers analysis/call_abi.h lists.
   static bool clobbersArguments(const il::Function& function, const il::Op& call,

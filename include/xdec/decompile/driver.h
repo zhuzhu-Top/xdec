@@ -77,6 +77,7 @@
 #include "xdec/pass/manager.h"
 #include "xdec/pass/registry.h"
 #include "xdec/spec/engine.h"
+#include "xdec/spec/lift.h"
 #include "xdec/support/reader.h"
 #include "xdec/support/result.h"
 
@@ -168,6 +169,9 @@ struct DriverOptions {
   /// (see FunctionFence). Inactive by default: nothing about this loop needs
   /// a fence to behave, it is purely a diagnostic the caller opts into.
   FunctionFence fence;
+  /// Optional predicate answering whether an unconditional direct `b <target>`
+  /// is a sibling tail call leaving this function rather than an internal block.
+  spec::TailCallTargetTest isTailCall;
   /// The hard backstop behind the per-round discovery-size warnings (see
   /// driver.cpp): however many addresses a round keeps discovering, the total
   /// entries a run will ever add is capped here. A real dispatcher chain

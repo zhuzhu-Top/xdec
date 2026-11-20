@@ -871,6 +871,100 @@ TEST_CASE("structural: the rewrite produces the promised shape", "[passes][algeb
     // N depends on the result: must NOT fold.
     CHECK(!f.function.asConstant(xdec::passes::simplifyAlgebra(f.function, mi), k));
   }
+
+  SECTION("MSB-split carry-free addition folds back to plain add") {
+    for (const unsigned width : {32u, 64u}) {
+      const Type wt = Type::integer(width);
+      const uint64_t lowM = (uint64_t{1} << (width - 1)) - 1;
+      const uint64_t msb = uint64_t{1} << (width - 1);
+      const ExprId lx = f.function.entryReg(f.function.registers().find("x0"));
+      const ExprId ly = f.function.entryReg(f.function.registers().find("x1"));
+      const ExprId ax = width == 64 ? lx : f.function.cast(ExprOp::Trunc, wt, lx);
+      const ExprId ay = width == 64 ? ly : f.function.cast(ExprOp::Trunc, wt, ly);
+
+      const auto buildMsbAdd = [&](Function& fn, ExprId a, ExprId b, ExprOp outerOp) {
+        const ExprId lowSum = fn.binary(
+            ExprOp::Add, fn.binary(ExprOp::And, a, fn.constant(wt, lowM)),
+            fn.binary(ExprOp::And, b, fn.constant(wt, lowM)));
+        const ExprId lowHalf = fn.binary(ExprOp::And, lowSum, fn.constant(wt, lowM));
+        const ExprId highHalf = fn.binary(
+            ExprOp::And,
+            fn.binary(ExprOp::Xor, fn.binary(ExprOp::Xor, a, b), lowSum),
+            fn.constant(wt, msb));
+        return fn.binary(outerOp, lowHalf, highHalf);
+      };
+
+      for (const ExprOp outer : {ExprOp::Or, ExprOp::Xor, ExprOp::Add}) {
+        const ExprId tree = buildMsbAdd(f.function, ax, ay, outer);
+        const il::Expr& out =
+            f.function.expr(xdec::passes::simplifyAlgebra(f.function, tree));
+        REQUIRE(out.op == ExprOp::Add);
+        CHECK(((out.operands[0] == ax && out.operands[1] == ay) ||
+               (out.operands[0] == ay && out.operands[1] == ax)));
+
+        checkEquivalent(
+            f,
+            [&](Function& fn, uint64_t xv, uint64_t yv) {
+              return buildMsbAdd(fn, fn.constant(wt, xv), fn.constant(wt, yv), outer);
+            },
+            [&](Function& fn, uint64_t xv, uint64_t yv) {
+              return fn.binary(ExprOp::Add, fn.constant(wt, xv), fn.constant(wt, yv));
+            },
+            width);
+      }
+
+      // Constant-addend variant (including a constant whose MSB is set).
+      for (const uint64_t c : {uint64_t{2}, msb | 0x2a}) {
+        const ExprId tree = buildMsbAdd(f.function, ax, f.function.constant(wt, c), ExprOp::Or);
+        const il::Expr& out =
+            f.function.expr(xdec::passes::simplifyAlgebra(f.function, tree));
+        REQUIRE(out.op == ExprOp::Add);
+        CHECK(out.operands[0] == ax);
+        uint64_t k = 0;
+        REQUIRE(f.function.asConstant(out.operands[1], k));
+        CHECK(k == c);
+      }
+    }
+  }
+
+  SECTION("trunc over sign-extension and nested casts simplify soundly") {
+    const Type t16 = Type::integer(16);
+    const Type t32 = Type::integer(32);
+    const Type t64 = Type::integer(64);
+    const ExprId x32 = f.function.cast(ExprOp::Trunc, t32, x);
+    const ExprId x16 = f.function.cast(ExprOp::Trunc, t16, x);
+
+    // trunc:i32(sext:i64(x32)) -> x32
+    const ExprId roundTrip = f.function.cast(
+        ExprOp::Trunc, t32, f.function.cast(ExprOp::SExt, t64, x32));
+    CHECK(xdec::passes::simplifyAlgebra(f.function, roundTrip) == x32);
+
+    // trunc:i16(sext:i64(x32)) -> trunc:i16(x32) -> trunc:i16(x)
+    const ExprId narrower = f.function.cast(
+        ExprOp::Trunc, t16, f.function.cast(ExprOp::SExt, t64, x32));
+    const il::Expr& narrowOut =
+        f.function.expr(xdec::passes::simplifyAlgebra(f.function, narrower));
+    CHECK(narrowOut.op == ExprOp::Trunc);
+    CHECK(narrowOut.type == t16);
+
+    // sext:i64(sext:i32(x16)) -> sext:i64(x16)
+    const ExprId doubleSext = f.function.cast(
+        ExprOp::SExt, t64, f.function.cast(ExprOp::SExt, t32, x16));
+    const il::Expr& sextOut =
+        f.function.expr(xdec::passes::simplifyAlgebra(f.function, doubleSext));
+    REQUIRE(sextOut.op == ExprOp::SExt);
+    CHECK(sextOut.type == t64);
+    CHECK(sextOut.operands[0] == x16);
+
+    checkEquivalent(
+        f,
+        [&](Function& fn, uint64_t xv, uint64_t) {
+          const ExprId xv32 = fn.constant(t32, xv);
+          return fn.cast(ExprOp::Trunc, t32, fn.cast(ExprOp::SExt, t64, xv32));
+        },
+        [&](Function& fn, uint64_t xv, uint64_t) { return fn.constant(t32, xv); },
+        32);
+  }
 }
 
 }  // namespace

@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <format>
+#include <iterator>
 #include <optional>
 #include <set>
 #include <unordered_set>
 
 #include "xdec/analysis/dispatcher_shape.h"
+#include "xdec/analysis/dominators.h"
 #include "xdec/analysis/live_register_frame.h"
 #include "xdec/analysis/stack_load_fold.h"
 #include "xdec/analysis/typed_variables.h"
@@ -414,7 +416,9 @@ class MergeWidth {
         continue;
       }
       const auto operands = function.operands(op);
-      if (operands.empty() || !function.expr(operands[0]).type.isScalarInteger()) {
+      if (operands.empty() ||
+          function.expr(operands[0]).op == il::ExprOp::Undef ||
+          !function.expr(operands[0]).type.isScalarInteger()) {
         continue;
       }
       found = true;
@@ -439,6 +443,336 @@ class MergeWidth {
   out.width = measured ? std::max(evidence, 8u) : declared;
   out.isSigned = isSigned;
   return out;
+}
+
+/// Sparse SSA Phi copy coalescing: merges non-interfering `phi_dst = phi(...,
+/// val(phi_src), ...)` chains that share an identical CType into a single C
+/// variable so Out-of-SSA emission elides pure relay copies (`t2 = t1;`).
+void coalescePhis(const il::Function& function, std::span<const il::OpId> phis,
+                  const std::vector<uint8_t>& pinned, std::vector<Variable>& temps,
+                  std::map<uint32_t, uint32_t>& tempByValue,
+                  std::vector<std::vector<il::ValueId>>& tempValues) {
+  const std::size_t n = phis.size();
+  if (n < 2) {
+    tempValues.resize(temps.size());
+    for (std::size_t i = 0; i < temps.size(); ++i) {
+      tempValues[i].push_back(temps[i].value);
+    }
+    return;
+  }
+
+  std::vector<int32_t> phiIndexByVal(function.valueCount(), -1);
+  std::vector<il::BlockId> defBlock(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    const il::Op& op = function.op(phis[i]);
+    if (op.result.valid()) {
+      phiIndexByVal[op.result.index()] = static_cast<int32_t>(i);
+      defBlock[i] = function.value(op.result).block;
+    }
+  }
+
+  // Collect non-Phi body uses and Phi incoming-edge uses for every Phi value.
+  std::vector<std::vector<il::BlockId>> bodyUses(n);
+  std::vector<std::vector<std::pair<il::BlockId, il::BlockId>>> phiEdgeUses(n);
+  std::vector<uint32_t> exprSeen(function.exprCount(), 0);
+  uint32_t exprEpoch = 0;
+  std::vector<il::ExprId> exprWork;
+
+  const auto collectOpPhiLeaves = [&](il::ExprId root, auto&& onPhiLeaf) {
+    if (++exprEpoch == 0) {
+      std::fill(exprSeen.begin(), exprSeen.end(), 0);
+      exprEpoch = 1;
+    }
+    exprWork.clear();
+    exprWork.push_back(root);
+    while (!exprWork.empty()) {
+      const il::ExprId id = exprWork.back();
+      exprWork.pop_back();
+      if (id.index() < exprSeen.size()) {
+        if (exprSeen[id.index()] == exprEpoch) {
+          continue;
+        }
+        exprSeen[id.index()] = exprEpoch;
+      }
+      const il::Expr& expr = function.expr(id);
+      if (expr.op == il::ExprOp::Value) {
+        const auto val = il::ValueId{static_cast<uint32_t>(expr.immediate)};
+        if (val.valid() && val.index() < phiIndexByVal.size() &&
+            phiIndexByVal[val.index()] >= 0) {
+          onPhiLeaf(static_cast<std::size_t>(phiIndexByVal[val.index()]));
+        }
+        continue;
+      }
+      for (unsigned k = 0; k < expr.operandCount; ++k) {
+        exprWork.push_back(expr.operands[k]);
+      }
+    }
+  };
+
+  for (const il::BlockId blockId : function.blockHandles()) {
+    const auto& preds = function.block(blockId).predecessors;
+    for (const il::OpId opId : function.block(blockId).ops) {
+      const il::Op& op = function.op(opId);
+      if (op.code == il::OpCode::Phi) {
+        const auto operands = function.operands(op);
+        for (std::size_t slot = 0; slot < operands.size() && slot < preds.size(); ++slot) {
+          collectOpPhiLeaves(operands[slot], [&](std::size_t leafIdx) {
+            phiEdgeUses[leafIdx].emplace_back(preds[slot], blockId);
+          });
+        }
+      } else {
+        for (const il::ExprId operand : function.operands(op)) {
+          collectOpPhiLeaves(operand, [&](std::size_t leafIdx) {
+            bodyUses[leafIdx].push_back(blockId);
+          });
+        }
+      }
+    }
+  }
+
+  // Sparse SSA liveness per Phi (bounded backward walk from uses to defBlock).
+  const Dominators dom = Dominators::compute(function);
+  std::vector<std::vector<uint32_t>> liveInBody(n);
+  std::vector<std::vector<uint32_t>> liveOutOf(n);
+  std::vector<uint32_t> blockSeen(function.blockCount(), 0);
+  uint32_t blockEpoch = 0;
+  std::vector<il::BlockId> cfgWork;
+
+  for (std::size_t i = 0; i < n; ++i) {
+    const il::BlockId defB = defBlock[i];
+    if (!defB.valid() || !dom.reachable(defB)) {
+      continue;
+    }
+    if (++blockEpoch == 0) {
+      std::fill(blockSeen.begin(), blockSeen.end(), 0);
+      blockEpoch = 1;
+    }
+    cfgWork.clear();
+    const auto markLiveIn = [&](il::BlockId b) {
+      if (!b.valid() || b == defB || !dom.dominates(defB, b)) {
+        return;
+      }
+      if (blockSeen[b.index()] != blockEpoch) {
+        blockSeen[b.index()] = blockEpoch;
+        liveInBody[i].push_back(b.index());
+        cfgWork.push_back(b);
+      }
+    };
+    for (const il::BlockId useB : bodyUses[i]) {
+      if (useB != defB) {
+        markLiveIn(useB);
+      }
+    }
+    for (const auto& [predB, phiBlock] : phiEdgeUses[i]) {
+      (void)phiBlock;
+      if (predB.valid() && dom.dominates(defB, predB)) {
+        liveOutOf[i].push_back(predB.index());
+        markLiveIn(predB);
+      }
+    }
+    while (!cfgWork.empty()) {
+      const il::BlockId cur = cfgWork.back();
+      cfgWork.pop_back();
+      for (const il::BlockId pred : function.block(cur).predecessors) {
+        if (pred.valid() && dom.dominates(defB, pred)) {
+          liveOutOf[i].push_back(pred.index());
+          markLiveIn(pred);
+        }
+      }
+    }
+    std::sort(liveInBody[i].begin(), liveInBody[i].end());
+    liveInBody[i].erase(std::unique(liveInBody[i].begin(), liveInBody[i].end()),
+                        liveInBody[i].end());
+    std::sort(liveOutOf[i].begin(), liveOutOf[i].end());
+    liveOutOf[i].erase(std::unique(liveOutOf[i].begin(), liveOutOf[i].end()),
+                       liveOutOf[i].end());
+  }
+
+  // Union-Find over Phi classes.
+  std::vector<std::size_t> parent(n);
+  std::vector<std::vector<std::size_t>> members(n);
+  std::vector<std::vector<uint32_t>> classDefs(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    parent[i] = i;
+    members[i].push_back(i);
+    if (defBlock[i].valid()) {
+      classDefs[i].push_back(defBlock[i].index());
+    }
+  }
+  auto findRep = [&](std::size_t x) -> std::size_t {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+
+  const auto sameCType = [](const CType& a, const CType& b) {
+    return a.width == b.width && a.pointerDepth == b.pointerDepth &&
+           a.pointeeWidth == b.pointeeWidth && a.isSigned == b.isSigned;
+  };
+
+  const auto sortedOverlaps = [](const std::vector<uint32_t>& a,
+                                 const std::vector<uint32_t>& b) {
+    std::size_t ia = 0;
+    std::size_t ib = 0;
+    while (ia < a.size() && ib < b.size()) {
+      if (a[ia] == b[ib]) {
+        return true;
+      }
+      if (a[ia] < b[ib]) {
+        ++ia;
+      } else {
+        ++ib;
+      }
+    }
+    return false;
+  };
+
+  // Avoid merging if any sibling Phi in `phiB`'s block reads `classA` on an
+  // edge where `phiB` writes a value outside `classA U classB` (keeps printEdge
+  // free of self-induced snapshots).
+  const auto hasEdgeCopyConflict = [&](std::size_t classA, std::size_t classB) {
+    for (const std::size_t m : members[classB]) {
+      const il::BlockId blk = defBlock[m];
+      if (!blk.valid()) {
+        continue;
+      }
+      const auto& preds = function.block(blk).predecessors;
+      const auto mOperands = function.operands(function.op(phis[m]));
+      for (const il::OpId otherOpId : function.block(blk).ops) {
+        const il::Op& otherOp = function.op(otherOpId);
+        if (otherOp.code != il::OpCode::Phi) {
+          break;
+        }
+        if (otherOpId == phis[m]) {
+          continue;
+        }
+        const auto otherOperands = function.operands(otherOp);
+        for (std::size_t slot = 0;
+             slot < otherOperands.size() && slot < mOperands.size() && slot < preds.size();
+             ++slot) {
+          bool readsA = false;
+          collectOpPhiLeaves(otherOperands[slot], [&](std::size_t leafIdx) {
+            const std::size_t rep = findRep(leafIdx);
+            if (rep == classA || rep == classB) {
+              readsA = true;
+            }
+          });
+          if (!readsA) {
+            continue;
+          }
+          const il::Expr& mSrc = function.expr(mOperands[slot]);
+          bool writesSame = false;
+          if (mSrc.op == il::ExprOp::Value) {
+            const auto v = il::ValueId{static_cast<uint32_t>(mSrc.immediate)};
+            if (v.valid() && v.index() < phiIndexByVal.size() &&
+                phiIndexByVal[v.index()] >= 0) {
+              const std::size_t rep = findRep(static_cast<std::size_t>(phiIndexByVal[v.index()]));
+              writesSame = (rep == classA || rep == classB);
+            }
+          }
+          if (!writesSame) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  };
+
+  const auto unionVec = [](std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) {
+    std::vector<uint32_t> merged;
+    merged.reserve(dst.size() + src.size());
+    std::merge(dst.begin(), dst.end(), src.begin(), src.end(), std::back_inserter(merged));
+    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    dst = std::move(merged);
+  };
+
+  // Cap live-set sizes for pathological functions so merging stays fast.
+  constexpr std::size_t kMaxClassMergeMembers = 64;
+
+  for (std::size_t b = 0; b < n; ++b) {
+    if (pinned[b] != 0) {
+      continue;
+    }
+    for (const il::ExprId operand : function.operands(function.op(phis[b]))) {
+      const il::Expr& expr = function.expr(operand);
+      if (expr.op != il::ExprOp::Value) {
+        continue;
+      }
+      const auto srcVal = il::ValueId{static_cast<uint32_t>(expr.immediate)};
+      if (!srcVal.valid() || srcVal.index() >= phiIndexByVal.size() ||
+          phiIndexByVal[srcVal.index()] < 0) {
+        continue;
+      }
+      const std::size_t a = static_cast<std::size_t>(phiIndexByVal[srcVal.index()]);
+      if (pinned[a] != 0) {
+        continue;
+      }
+      std::size_t ra = findRep(a);
+      std::size_t rb = findRep(b);
+      if (ra == rb) {
+        continue;
+      }
+      if (members[ra].size() + members[rb].size() > kMaxClassMergeMembers) {
+        continue;
+      }
+      if (!sameCType(temps[a].type, temps[b].type)) {
+        continue;
+      }
+      if (sortedOverlaps(classDefs[ra], classDefs[rb]) ||
+          sortedOverlaps(classDefs[ra], liveInBody[rb]) ||
+          sortedOverlaps(classDefs[ra], liveOutOf[rb]) ||
+          sortedOverlaps(classDefs[rb], liveInBody[ra]) ||
+          sortedOverlaps(classDefs[rb], liveOutOf[ra])) {
+        continue;
+      }
+      if (hasEdgeCopyConflict(ra, rb) || hasEdgeCopyConflict(rb, ra)) {
+        continue;
+      }
+      // Keep the earlier-ordered Phi representative.
+      if (ra > rb) {
+        std::swap(ra, rb);
+      }
+      parent[rb] = ra;
+      unionVec(classDefs[ra], classDefs[rb]);
+      unionVec(liveInBody[ra], liveInBody[rb]);
+      unionVec(liveOutOf[ra], liveOutOf[rb]);
+      members[ra].insert(members[ra].end(), members[rb].begin(), members[rb].end());
+      classDefs[rb].clear();
+      liveInBody[rb].clear();
+      liveOutOf[rb].clear();
+      members[rb].clear();
+    }
+  }
+
+  // Rebuild `temps`, `tempByValue`, and `tempValues` with contiguous t0..tK names.
+  std::vector<Variable> compactTemps;
+  compactTemps.reserve(temps.size());
+  tempValues.clear();
+  tempByValue.clear();
+  uint32_t ordinal = 0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (findRep(i) != i) {
+      continue;
+    }
+    Variable repVar = temps[i];
+    if (pinned[i] == 0) {
+      repVar.name = std::format("t{}", ordinal++);
+    }
+    const uint32_t newIdx = static_cast<uint32_t>(compactTemps.size());
+    std::vector<il::ValueId> groupVals;
+    groupVals.reserve(members[i].size());
+    for (const std::size_t m : members[i]) {
+      const il::ValueId mv = temps[m].value;
+      tempByValue[mv.index()] = newIdx;
+      groupVals.push_back(mv);
+    }
+    compactTemps.push_back(std::move(repVar));
+    tempValues.push_back(std::move(groupVals));
+  }
+  temps = std::move(compactTemps);
 }
 
 }  // namespace
@@ -503,6 +837,25 @@ VariableTable VariableTable::recover(const il::Function& function,
     width = std::max(width, op.type.bits());
     if (op.code == il::OpCode::Store) {
       collectSmallConstants(function, operands[1], slotConstants[info.delta]);
+    }
+  }
+  // Negative stack-slot addresses handed directly to a Call or Intrinsic as a
+  // buffer pointer (`&var_b8`) also need a local variable even when the caller
+  // itself never loaded or stored that offset directly.
+  for (const il::BlockId blockId : function.blockHandles()) {
+    for (const il::OpId opId : function.block(blockId).ops) {
+      const il::Op& op = function.op(opId);
+      if (op.code != il::OpCode::Call && op.code != il::OpCode::Intrinsic) {
+        continue;
+      }
+      const auto operands = function.operands(op);
+      const std::size_t startIdx = op.code == il::OpCode::Call ? 1 : 0;
+      for (std::size_t i = startIdx; i < operands.size(); ++i) {
+        const AddressInfo info = frame.classify(operands[i]);
+        if (info.kind == AddressKind::StackSlot && info.delta < 0) {
+          slotWidths.try_emplace(info.delta, 64u);
+        }
+      }
     }
   }
   // At most one slot per function is promoted to `state`: a second slot that
@@ -710,6 +1063,7 @@ VariableTable VariableTable::recover(const il::Function& function,
   // fresh scan rather than threaded in from structuring: this runs before
   // structureFunction does, and the shape is cheap enough to look for again
   // without waiting for it.
+  std::vector<uint8_t> pinnedPhis(scan.phis_.size(), 0);
   for (const il::BlockId blockId : function.blockHandles()) {
     const auto& ops = function.block(blockId).ops;
     if (ops.empty()) {
@@ -740,14 +1094,19 @@ VariableTable VariableTable::recover(const il::Function& function,
               table.tempByValue_.find(function.op(slot.livePhiAtHub).result.index());
           found != table.tempByValue_.end()) {
         table.temps_[found->second].name = std::format("x{}_live", index);
+        pinnedPhis[found->second] = 1;
       }
       if (const auto found =
               table.tempByValue_.find(function.op(slot.shadowPhiAtMerge).result.index());
           found != table.tempByValue_.end()) {
         table.temps_[found->second].name = std::format("x{}_exit", index);
+        pinnedPhis[found->second] = 1;
       }
     }
   }
+
+  coalescePhis(function, scan.phis_, pinnedPhis, table.temps_, table.tempByValue_,
+               table.tempValues_);
 
   return table;
 }
@@ -761,10 +1120,30 @@ void VariableTable::applyImportedTypes(const TypedVariables& typed,
       arg.importedType = *found;
     }
   }
-  for (Variable& temp : temps_) {
-    const std::optional<types::TypeId> found = typed.forValue(temp.value);
-    if (found.has_value() && binder.consistent(*found, temp.type.width, temp.type.pointerDepth)) {
-      temp.importedType = *found;
+  for (std::size_t tIdx = 0; tIdx < temps_.size(); ++tIdx) {
+    Variable& temp = temps_[tIdx];
+    std::optional<types::TypeId> agreed;
+    bool conflict = false;
+    const auto checkVal = [&](il::ValueId val) {
+      const std::optional<types::TypeId> found = typed.forValue(val);
+      if (found.has_value() &&
+          binder.consistent(*found, temp.type.width, temp.type.pointerDepth)) {
+        if (!agreed.has_value()) {
+          agreed = *found;
+        } else if (*agreed != *found) {
+          conflict = true;
+        }
+      }
+    };
+    if (tIdx < tempValues_.size() && !tempValues_[tIdx].empty()) {
+      for (const il::ValueId v : tempValues_[tIdx]) {
+        checkVal(v);
+      }
+    } else {
+      checkVal(temp.value);
+    }
+    if (!conflict && agreed.has_value()) {
+      temp.importedType = *agreed;
     }
   }
   // Locals are ordered by ascending stackDelta (see recover(), which builds

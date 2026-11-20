@@ -341,7 +341,7 @@ il::ExprId matchMbaOr(il::Function& function, const il::Expr& orExpr) {
       return function.binary(il::ExprOp::Or, andPair.lhs, andPair.rhs);
     }
   }
-  return {};
+  return matchMbaMsbSplitAdd(function, orExpr);
 }
 
 il::ExprId matchMbaXor(il::Function& function, const il::Expr& xorExpr) {
@@ -351,6 +351,83 @@ il::ExprId matchMbaXor(il::Function& function, const il::Expr& xorExpr) {
     const Pair andPair = operandsOf(function, xorExpr.operands[arm ^ 1], il::ExprOp::And);
     if (orPair && andPair && samePair(orPair.lhs, orPair.rhs, andPair.lhs, andPair.rhs)) {
       return function.binary(il::ExprOp::Xor, orPair.lhs, orPair.rhs);
+    }
+  }
+  return matchMbaMsbSplitAdd(function, xorExpr);
+}
+
+il::ExprId matchMbaMsbSplitAdd(il::Function& function, const il::Expr& expr) {
+  const unsigned width = expr.type.bits();
+  if (!expr.type.isScalarInteger() || width < 2 || width > 64 || expr.operandCount != 2) {
+    return {};
+  }
+  const uint64_t lowM = lowMask(width - 1);
+  const uint64_t msbBit = uint64_t{1} << (width - 1);
+
+  for (const int arm : {0, 1}) {
+    const Pair lowHalf = operandsOf(function, expr.operands[arm], il::ExprOp::And);
+    const Pair highHalf = operandsOf(function, expr.operands[arm ^ 1], il::ExprOp::And);
+    if (!lowHalf || !highHalf) {
+      continue;
+    }
+    const Konst lowConst = constantOf(function, lowHalf.rhs);
+    const Konst highConst = constantOf(function, highHalf.rhs);
+    if (!lowConst || lowConst.value != lowM || !highConst || highConst.value != msbBit) {
+      continue;
+    }
+    const il::ExprId sumId = lowHalf.lhs;
+    const Pair innerAdd = operandsOf(function, sumId, il::ExprOp::Add);
+    const Pair outerXor = operandsOf(function, highHalf.lhs, il::ExprOp::Xor);
+    if (!innerAdd || !outerXor) {
+      continue;
+    }
+    // outerXor must combine `sumId` with `xor(x, y)` in either order.
+    il::ExprId xyXorId;
+    if (outerXor.lhs == sumId) {
+      xyXorId = outerXor.rhs;
+    } else if (outerXor.rhs == sumId) {
+      xyXorId = outerXor.lhs;
+    } else {
+      continue;
+    }
+    const Pair xyXor = operandsOf(function, xyXorId, il::ExprOp::Xor);
+    if (!xyXor) {
+      continue;
+    }
+
+    // Case 1: both operands are non-constant: (x & lowM) + (y & lowM).
+    const Pair lhsMasked = operandsOf(function, innerAdd.lhs, il::ExprOp::And);
+    const Pair rhsMasked = operandsOf(function, innerAdd.rhs, il::ExprOp::And);
+    if (lhsMasked && rhsMasked) {
+      const Konst lk = constantOf(function, lhsMasked.rhs);
+      const Konst rk = constantOf(function, rhsMasked.rhs);
+      if (lk && lk.value == lowM && rk && rk.value == lowM &&
+          samePair(lhsMasked.lhs, rhsMasked.lhs, xyXor.lhs, xyXor.rhs)) {
+        return function.binary(il::ExprOp::Add, xyXor.lhs, xyXor.rhs);
+      }
+    }
+
+    // Case 2: constant addend C in `xyXor`: `(x & lowM) + (C & lowM)`.
+    for (const int cArm : {0, 1}) {
+      const Konst cConst = constantOf(function, cArm == 0 ? xyXor.lhs : xyXor.rhs);
+      const il::ExprId xExpr = cArm == 0 ? xyXor.rhs : xyXor.lhs;
+      if (!cConst) {
+        continue;
+      }
+      const uint64_t expectedLow = cConst.value & lowM;
+      for (const int addArm : {0, 1}) {
+        const il::ExprId maskedSide = addArm == 0 ? innerAdd.lhs : innerAdd.rhs;
+        const il::ExprId constSide = addArm == 0 ? innerAdd.rhs : innerAdd.lhs;
+        const Pair xMasked = operandsOf(function, maskedSide, il::ExprOp::And);
+        const Konst kAdded = constantOf(function, constSide);
+        if (xMasked && xMasked.lhs == xExpr && kAdded && kAdded.value == expectedLow) {
+          const Konst xmMask = constantOf(function, xMasked.rhs);
+          if (xmMask && xmMask.value == lowM) {
+            return function.binary(il::ExprOp::Add, xExpr,
+                                   function.constant(expr.type, cConst.value));
+          }
+        }
+      }
     }
   }
   return {};

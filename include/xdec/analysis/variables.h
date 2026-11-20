@@ -108,6 +108,7 @@ class VariableTable {
   std::vector<Variable> args_;
   std::vector<Variable> locals_;
   std::vector<Variable> temps_;
+  std::vector<std::vector<il::ValueId>> tempValues_;
   std::optional<CType> returnType_;
   std::map<uint32_t, uint32_t> argByRoot_;
   std::map<int64_t, uint32_t> localByDelta_;

@@ -465,3 +465,39 @@ TEST_CASE("an already-constant call target whose decoded form is not code stays 
   REQUIRE(calledAddress(b.function, target));
   CHECK(target == tagged);
 }
+
+TEST_CASE("a GOT-indirect call to a known noreturn import seals its fallthrough",
+          "[passes][resolve-call]") {
+  Space space;
+  xdec::MemoryFacts facts = Space::facts();
+  const uint64_t abortSlot = Space::kData + 0x80;
+  facts.loader = [abortSlot](uint64_t va) {
+    xdec::LoaderValue value;
+    if (va == abortSlot) {
+      value.importName = "_abort";
+    }
+    return value;
+  };
+
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId next = b.block(0x2000);
+  const il::ValueId ptr =
+      b.function.appendLoad(entry, 0x1000, Type::integer(64), b.i64(abortSlot));
+  b.function.appendCall(entry, 0x1004, b.function.valueRef(ptr), Type::integer(64));
+  b.function.appendBranch(entry, 0x1008, next);
+  b.function.appendReturn(next, 0x2000);
+  b.atCfg();
+
+  xdec::pass::Registry registry;
+  xdec::passes::registerBuiltinPasses(registry);
+  xdec::pass::Manager manager;
+  manager.setImage(space.reader());
+  manager.setMemoryFacts(facts);
+  REQUIRE(manager.runTo(b.function, registry, Maturity::Ssa));
+
+  const il::OpId termId = b.function.block(entry).terminator();
+  REQUIRE(termId.valid());
+  CHECK(b.function.op(termId).code == OpCode::Unreachable);
+  CHECK(b.function.block(next).predecessors.empty());
+}

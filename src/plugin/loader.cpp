@@ -80,8 +80,10 @@ Plugin& Plugin::operator=(Plugin&& other) noexcept {
     unload();
     handle_ = other.handle_;
     registered_ = other.registered_;
+    registeredAstTransforms_ = other.registeredAstTransforms_;
     other.handle_ = nullptr;
     other.registered_ = 0;
+    other.registeredAstTransforms_ = 0;
   }
   return *this;
 }
@@ -97,10 +99,13 @@ void Plugin::unload() noexcept {
 #endif
     handle_ = nullptr;
     registered_ = 0;
+    registeredAstTransforms_ = 0;
   }
 }
 
-Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& registry) {
+Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& registry,
+                            std::vector<emit::AstTransformFn>* astTransforms,
+                            std::vector<emit::HlAstTransformFn>* hlTransforms) {
   XDEC_TRY(Library library, openLibrary(path));
 
   // Version handshake before anything else runs: a plugin compiled against a
@@ -118,8 +123,9 @@ Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& r
                path.generic_string(), abiVersion, XDEC_PLUGIN_ABI_VERSION);
   }
 
+  void* initV2Symbol = library.symbol(XDEC_PLUGIN_INIT_V2_SYMBOL);
   void* initSymbol = library.symbol(XDEC_PLUGIN_INIT_SYMBOL);
-  if (initSymbol == nullptr) {
+  if (initV2Symbol == nullptr && initSymbol == nullptr) {
     return err(DiagCode::PluginError, "plugin '{}' exports no {}", path.generic_string(),
                XDEC_PLUGIN_INIT_SYMBOL);
   }
@@ -127,9 +133,20 @@ Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& r
   // The plugin's C++ runs here; an exception escaping the boundary is a plugin
   // bug, reported as a diagnostic rather than allowed to unwind into the host.
   const std::size_t before = registry.size();
+  const std::size_t astBefore = astTransforms != nullptr ? astTransforms->size() : 0;
   XdecPluginInitResult init{false, "init never returned"};
   try {
-    init = reinterpret_cast<XdecPluginInitFn>(initSymbol)(&registry);
+    if (initV2Symbol != nullptr) {
+      const XdecPluginHost host{
+          .structSize = sizeof(XdecPluginHost),
+          .passes = &registry,
+          .astTransforms = astTransforms,
+          .hlTransforms = hlTransforms,
+      };
+      init = reinterpret_cast<XdecPluginInitV2Fn>(initV2Symbol)(&host);
+    } else {
+      init = reinterpret_cast<XdecPluginInitFn>(initSymbol)(&registry);
+    }
   } catch (const std::exception& exception) {
     return err(DiagCode::PluginError, "plugin '{}' init threw: {}", path.generic_string(),
                exception.what());
@@ -145,6 +162,8 @@ Result<Plugin> Plugin::load(const std::filesystem::path& path, pass::Registry& r
   Plugin plugin;
   plugin.handle_ = library.handle;
   plugin.registered_ = registry.size() - before;
+  plugin.registeredAstTransforms_ =
+      astTransforms != nullptr ? astTransforms->size() - astBefore : 0;
   library.handle = nullptr;  // ownership moves to the Plugin
   return plugin;
 }

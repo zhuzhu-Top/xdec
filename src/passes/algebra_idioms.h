@@ -77,6 +77,14 @@ namespace xdec::passes {
 /// `(x | y) ^ (x & y)` is `x ^ y`. `xorExpr` is the Xor node.
 [[nodiscard]] il::ExprId matchMbaXor(il::Function& function, const il::Expr& xorExpr);
 
+/// MSB-split carry-free addition:
+/// `((x & M) + (y & M)) & M | (((x ^ y) ^ ((x & M) + (y & M))) & ~M)` is `x + y`,
+/// where `M = (1 << (w - 1)) - 1` and `~M = 1 << (w - 1)` (the outer combiner
+/// may be `Or`, `Xor`, or `Add`, and `y` may also be a constant `C` whose low
+/// bits `C & M` were pre-folded into the inner addend). Common in OLLVM/VMP
+/// and expanded vector-lane additions.
+[[nodiscard]] il::ExprId matchMbaMsbSplitAdd(il::Function& function, const il::Expr& expr);
+
 /// A comparison of two values that were both shifted up by the same amount is
 /// the comparison of the bits that survived: `(x << 32) < (y << 32)` is
 /// `(int32)x < (int32)y`, and the same with a constant on the right, whose low

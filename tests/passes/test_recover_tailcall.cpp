@@ -73,9 +73,12 @@ class Space {
 
   /// Code is executable; nothing is immutable (a slot a loader fills is not),
   /// and one slot is bound to another module the way a PLT's is.
-  [[nodiscard]] static xdec::MemoryFacts facts(bool boundSlot) {
+  [[nodiscard]] static xdec::MemoryFacts facts(bool boundSlot, bool withImmutableTest = false) {
     xdec::MemoryFacts facts;
     facts.executable = [](uint64_t va) { return va >= kCode && va < kCode + 0x100; };
+    if (withImmutableTest) {
+      facts.immutable = [](uint64_t, uint64_t) { return false; };
+    }
     if (boundSlot) {
       facts.loader = [](uint64_t va) {
         xdec::LoaderValue value;
@@ -137,7 +140,8 @@ struct Ran {
 
 /// Lifts at 0x1000 and runs the pipeline to `level`, then hands back the entry
 /// block's tail so a test can say what the exit turned into.
-[[nodiscard]] Ran run(const Space& space, Maturity level, bool boundSlot = false) {
+[[nodiscard]] Ran run(const Space& space, Maturity level, bool boundSlot = false,
+                      bool withImmutableTest = false) {
   auto lifted = xdec::spec::liftFunction(engine(), space.reader(), Space::kCode);
   const std::string liftError = lifted ? std::string{} : lifted.error().format();
   INFO(liftError);
@@ -148,7 +152,7 @@ struct Ran {
   xdec::passes::registerBuiltinPasses(registry);
   xdec::pass::Manager manager;
   manager.setImage(space.reader());
-  manager.setMemoryFacts(Space::facts(boundSlot));
+  manager.setMemoryFacts(Space::facts(boundSlot, withImmutableTest));
   auto result = manager.runTo(*function, registry, level);
   const std::string runError = result ? std::string{} : result.error().format();
   INFO(runError);
@@ -352,4 +356,17 @@ TEST_CASE("a recovered tail call carries through to Vars", "[passes][tailcall]")
   // parameters and may be forwarded; x1 was written. x3..x7 are untouched
   // entry values nothing else reads (see passes/vars.h).
   CHECK(tail.args == 3);
+}
+
+TEST_CASE("a branch through a writable global pointer slot is a tail call",
+          "[passes][tailcall]") {
+  Space space;
+  space.word(0x1000, movImm(9, Space::kSlot));
+  space.word(0x1004, ldr(8, 9));
+  space.word(0x1008, br(8));
+  space.slot(Space::kSlot, 0);
+
+  const Ran ran = run(space, Maturity::Ssa, /*boundSlot=*/false, /*withImmutableTest=*/true);
+  const TailCall tail = expectTailCall(ran);
+  CHECK(tail.note.starts_with("tail call through a writable global pointer"));
 }

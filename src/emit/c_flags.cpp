@@ -72,11 +72,25 @@ std::string flagFromNzcv(il::ConditionCode code, uint64_t nzcv) {
   return result ? "0x1" : "0x0";
 }
 
+std::string printFlagCondTarget(CContext& context, ExprPrinter& expressions,
+                                  il::ExprId flagsId, il::ConditionCode code);
+
 std::string printFlagCond(CContext& context, ExprPrinter& expressions,
                           il::ExprId id) {
   const il::Expr& e = context.function.expr(id);
   const auto code = static_cast<il::ConditionCode>(e.immediate);
-  const il::Expr& def = context.function.expr(e.operand(0));
+  return printFlagCondTarget(context, expressions, e.operand(0), code);
+}
+
+std::string printFlagCondTarget(CContext& context, ExprPrinter& expressions,
+                                  il::ExprId flagsId, il::ConditionCode code) {
+  const il::Expr& def = context.function.expr(flagsId);
+  if (def.op == il::ExprOp::Select && def.operandCount == 3) {
+    const std::string c = expressions.integerOperand(def.operand(0));
+    return std::format("({} ? {} : {})", c,
+                       printFlagCondTarget(context, expressions, def.operand(1), code),
+                       printFlagCondTarget(context, expressions, def.operand(2), code));
+  }
   if (def.op != il::ExprOp::FlagDef) {
     return "/*flagcond*/0x0";
   }

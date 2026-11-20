@@ -339,4 +339,35 @@ TEST_CASE("phis become temps in block order", "[analysis][vars]") {
   CHECK(temp->type.width == 64);
 }
 
+TEST_CASE("non-interfering phi relay chains coalesce into one variable",
+          "[analysis][vars]") {
+  Fixture f;
+  const BlockId left = f.function.createBlock(0x2000);
+  const BlockId right = f.function.createBlock(0x3000);
+  const BlockId relay = f.function.createBlock(0x4000);
+  const BlockId tail = f.function.createBlock(0x5000);
+  const ExprId cond = f.function.binary(
+      ExprOp::CmpNe, f.function.entryReg(f.reg("x0")), f.i64(0));
+  f.function.appendCondBranch(f.entry, 0x1000, cond, left, right);
+  const il::OpId phi1 = f.function.appendPhi(relay, 0x4000, Type::integer(64),
+                                             std::vector<ExprId>{f.i64(1), f.i64(2)});
+  const ExprId phi1Ref = f.function.valueRef(f.function.op(phi1).result);
+  const il::OpId phi2 = f.function.appendPhi(tail, 0x5000, Type::integer(64),
+                                             std::vector<ExprId>{phi1Ref});
+  f.function.appendBranch(left, 0x2000, relay);
+  f.function.appendBranch(right, 0x3000, relay);
+  f.function.appendBranch(relay, 0x4000, tail);
+  const il::ValueId v1 = f.function.op(phi1).result;
+  const il::ValueId v2 = f.function.op(phi2).result;
+  const il::OpId ret = f.function.appendReturn(tail, 0x5004);
+  f.function.setOperands(ret, std::vector<ExprId>{f.function.valueRef(v2)});
+  f.function.rebuildEdges();
+
+  const StackFrame frame = StackFrame::compute(f.function);
+  const VariableTable table = VariableTable::recover(f.function, frame);
+  REQUIRE(table.temps().size() == 1);
+  CHECK(table.tempFor(v1) == table.tempFor(v2));
+  CHECK(table.tempFor(v1)->name == "t0");
+}
+
 }  // namespace

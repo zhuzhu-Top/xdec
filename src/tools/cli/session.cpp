@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "xdec/analysis/plt_stub.h"
+#include "xdec/binary/macho_metadata.h"
 #include "xdec/obs/job.h"
 #include "xdec/obs/span.h"
 #include "xdec/spec/compile.h"
@@ -97,11 +98,38 @@ xdec::Result<xdec::types::TypeDatabase> loadTypes(std::span<const std::string> s
 }
 
 [[nodiscard]] xdec::emit::SymbolResolver symbolResolverOf(const BinaryImage& image) {
-  return [&image](uint64_t va) {
+  const auto* machoMeta =
+      dynamic_cast<const xdec::binary::MachOMetadata*>(image.formatMetadata());
+  return [&image, machoMeta](uint64_t va) {
     xdec::emit::SymbolRef out;
     // Containing, not exact: the offset is half the answer (see emit::SymbolRef),
     // and an exact hit is just the containing symbol with an offset of zero.
     const xdec::binary::Symbol* symbol = image.symbolContaining(va);
+    if (symbol != nullptr && symbol->va == va) {
+      out.name = symbol->name;
+      out.offset = 0;
+      out.isFunction = symbol->kind == xdec::binary::SymbolKind::Function;
+      return out;
+    }
+    if (machoMeta != nullptr) {
+      if (!image.isExecutable(va)) {
+        if (const auto dataName = machoMeta->resolveDataSymbolAt(image, va)) {
+          out.name = *dataName;
+          out.offset = 0;
+          out.isFunction = false;
+          return out;
+        }
+      } else {
+        if (const auto method = machoMeta->objcMethodAt(image, va)) {
+          out.name = method->cName;
+          out.displayName = method->displayName;
+          out.typeEncoding = method->typeEncoding;
+          out.offset = 0;
+          out.isFunction = true;
+          return out;
+        }
+      }
+    }
     if (symbol == nullptr) {
       return out;
     }
@@ -136,7 +164,9 @@ namespace {
                                                  const xdec::ByteReader& reader,
                                                  const xdec::MemoryFacts& facts,
                                                  const xdec::binary::TargetProfile& profile) {
-  return [&image, &reader, &facts, &profile](uint64_t va) {
+  const auto* machoMeta =
+      dynamic_cast<const xdec::binary::MachOMetadata*>(image.formatMetadata());
+  return [&image, machoMeta, &reader, &facts, &profile](uint64_t va) {
     xdec::pass::SymbolName out;
     const xdec::binary::Symbol* symbol = image.symbolContaining(va);
     if (symbol != nullptr && symbol->va == va) {
@@ -144,8 +174,57 @@ namespace {
       out.isFunction = symbol->kind == xdec::binary::SymbolKind::Function;
       return out;
     }
+    if (machoMeta != nullptr && image.isExecutable(va)) {
+      if (const auto method = machoMeta->objcMethodAt(image, va)) {
+        out.name = method->cName;
+        out.isFunction = true;
+        return out;
+      }
+    }
     if (const std::optional<std::string> imported = pltImportAt(reader, facts, profile, va)) {
       out.name = *imported;
+      out.isFunction = true;
+      return out;
+    }
+    // Chase pure unconditional ARM64 `B <target>` linker branch islands so
+    // calls across >128MB Mach-O segments name their destination (`j_<name>` /
+    // `j_sub_<target>`) instead of an opaque island address.
+    uint64_t cur = va;
+    bool chased = false;
+    for (unsigned hop = 0; hop < 6; ++hop) {
+      std::array<std::byte, 4> bytes{};
+      if (!reader(cur, std::span<std::byte>{bytes})) {
+        break;
+      }
+      const uint32_t w =
+          static_cast<uint32_t>(static_cast<uint8_t>(bytes[0])) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(bytes[1])) << 8) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(bytes[2])) << 16) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(bytes[3])) << 24);
+      if ((w & 0xfc000000u) != 0x14000000u) {
+        break;
+      }
+      const uint32_t imm26 = w & 0x03ffffffu;
+      const int32_t sext = static_cast<int32_t>(imm26 << 6) >> 6;
+      cur = cur + static_cast<uint64_t>(static_cast<int64_t>(sext) << 2);
+      chased = true;
+      const xdec::binary::Symbol* destSym = image.symbolContaining(cur);
+      if (destSym != nullptr && destSym->va == cur &&
+          destSym->kind == xdec::binary::SymbolKind::Function) {
+        out.name = "j_" + destSym->name;
+        out.isFunction = true;
+        return out;
+      }
+      if (machoMeta != nullptr && image.isExecutable(cur)) {
+        if (const auto method = machoMeta->objcMethodAt(image, cur)) {
+          out.name = "j_" + method->cName;
+          out.isFunction = true;
+          return out;
+        }
+      }
+    }
+    if (chased && image.isExecutable(cur)) {
+      out.name = std::format("j_sub_{:x}", cur);
       out.isFunction = true;
     }
     return out;
@@ -153,7 +232,9 @@ namespace {
 }
 
 [[nodiscard]] xdec::emit::AddressDescriber addressDescriberOf(const BinaryImage& image) {
-  return [&image](uint64_t va) {
+  const auto* machoMeta =
+      dynamic_cast<const xdec::binary::MachOMetadata*>(image.formatMetadata());
+  return [&image, machoMeta](uint64_t va) {
     xdec::emit::AddressFacts out;
     out.mapped = image.isMapped(va);
     if (!out.mapped) {
@@ -167,6 +248,13 @@ namespace {
     out.section = section->name;
     // Code is not a variable either, whatever else it is.
     out.variable = section->programData && !image.isExecutable(va);
+    out.cstringSection =
+        section->name == "__cstring" || section->name == "__oslogstring" ||
+        section->name.starts_with(".rodata.str") ||
+        (image.format() == xdec::binary::BinaryFormat::MachO && (section->rawType & 0xffu) == 2u);
+    if (machoMeta != nullptr && section->name == "__cfstring") {
+      out.cfstringLiteral = machoMeta->cfStringAt(image, va);
+    }
     if (const std::optional<std::string_view> imported = image.importNameAt(va)) {
       out.importName = *imported;
     }
@@ -291,9 +379,10 @@ void SessionContext::buildEntryRegFacts(const std::filesystem::path& binaryPath)
       }
     }
     if (companionPath.empty()) {
-      note("note: no companion image named '{}' found next to {}; entry register(s) "
-           "anchored to it stay unresolved",
-           name, binaryPath.string());
+      detail::say(obs::LogLevel::Debug,
+                  std::format("no companion image named '{}' found next to {}; entry "
+                              "register(s) anchored to it stay unresolved",
+                              name, binaryPath.string()));
       continue;
     }
     auto companionImage = xdec::binary::openBinary(companionPath);

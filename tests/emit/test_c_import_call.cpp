@@ -170,3 +170,41 @@ TEST_CASE("an errno accessor call does not fold when its result also feeds a phi
   CHECK(!contains(text, "*__errno_location() ="));
   CHECK(!contains(text, "unnamed-value"));
 }
+
+TEST_CASE("a constant inside a dedicated cstring section prints as a string literal on untyped calls",
+          "[emit][import-call]") {
+  Fixture f;
+  // Untyped variadic-style call with no header signature: a constant in a
+  // dedicated C-string literal section above the first page still recovers.
+  constexpr uint64_t kStrVa = 0x18000;
+  const il::OpId call = f.function.appendCall(f.entry, 0x1000, f.i64(0x20000), Type::integer(64));
+  f.function.setOperands(call, std::vector<ExprId>{f.i64(0x20000), f.i64(kStrVa)});
+  f.function.appendReturn(f.entry, 0x1004);
+
+  static constexpr char kText[] = "WePkg";
+  COptions options;
+  options.imageReader = [](uint64_t va, std::span<std::byte> out) -> xdec::Result<void> {
+    if (va < kStrVa || va + out.size() > kStrVa + sizeof(kText)) {
+      return xdec::err(xdec::DiagCode::UnmappedAddress, "unmapped");
+    }
+    for (std::size_t i = 0; i < out.size(); ++i) {
+      out[i] = static_cast<std::byte>(kText[va - kStrVa + i]);
+    }
+    return xdec::ok();
+  };
+  options.memory.immutable = [](uint64_t va, uint64_t size) {
+    return va >= kStrVa && va + size <= kStrVa + sizeof(kText);
+  };
+  options.addresses = [](uint64_t va) {
+    xdec::emit::AddressFacts facts;
+    if (va >= kStrVa && va < kStrVa + sizeof(kText)) {
+      facts.mapped = true;
+      facts.section = "__cstring";
+      facts.cstringSection = true;
+    }
+    return facts;
+  };
+  const std::string text = f.emit(options);
+  INFO(text);
+  CHECK(contains(text, "\"WePkg\""));
+}

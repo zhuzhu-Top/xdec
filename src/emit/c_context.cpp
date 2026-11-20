@@ -507,6 +507,26 @@ std::string CContext::argumentName(const analysis::Variable& variable) const {
 }
 
 std::string CContext::positionalArgumentName(int position) const {
+  if (options.objcSyntax) {
+    const SymbolRef entrySym = symbolAt(function.block(function.entryBlock()).va);
+    if (entrySym.exact() && entrySym.isFunction) {
+      if (entrySym.name.starts_with("objc_inst_")) {
+        if (position == 0) {
+          return "self";
+        }
+        if (position == 1) {
+          return "_cmd";
+        }
+      } else if (entrySym.name.starts_with("objc_cls_")) {
+        if (position == 0) {
+          return "cls";
+        }
+        if (position == 1) {
+          return "_cmd";
+        }
+      }
+    }
+  }
   return options.indexedArgumentNames ? std::format("arg{}", position + 1)
                                       : std::format("a{}", position);
 }

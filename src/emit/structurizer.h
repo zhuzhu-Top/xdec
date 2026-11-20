@@ -7,6 +7,7 @@
 // pattern that fails must give its blocks back.
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
@@ -20,6 +21,39 @@
 namespace xdec::emit {
 
 constexpr unsigned kMaxDepth = 32;
+
+/// Dense O(1) membership set keyed by `il::BlockId::index()`, avoiding tree
+/// node allocations on hot structuring walks over tens of thousands of blocks.
+class DenseBlockSet {
+ public:
+  explicit DenseBlockSet(std::size_t blockCount = 0) : present_(blockCount, 0) {}
+
+  [[nodiscard]] bool contains(il::BlockId id) const noexcept {
+    return id.valid() && id.index() < present_.size() && present_[id.index()] != 0;
+  }
+
+  /// Inserts `id` and returns true iff it was absent before this call.
+  bool insert(il::BlockId id) noexcept {
+    if (!id.valid() || id.index() >= present_.size()) {
+      return false;
+    }
+    uint8_t& slot = present_[id.index()];
+    if (slot != 0) {
+      return false;
+    }
+    slot = 1;
+    return true;
+  }
+
+  void erase(il::BlockId id) noexcept {
+    if (id.valid() && id.index() < present_.size()) {
+      present_[id.index()] = 0;
+    }
+  }
+
+ private:
+  std::vector<uint8_t> present_;
+};
 
 class Structurizer {
  public:
@@ -378,11 +412,13 @@ class Structurizer {
   const analysis::Dominators& dominators_;
   const analysis::PostDominators& postDominators_;
   std::map<il::BlockId, const analysis::NaturalLoop*> loopByHeader_;
-  std::set<il::BlockId> emitted_;
-  std::set<il::BlockId> gotoTargets_;
-  std::set<il::BlockId> inProgressHeaders_;
+  DenseBlockSet emitted_;
+  DenseBlockSet gotoTargets_;
+  DenseBlockSet inProgressHeaders_;
   std::vector<il::BlockId> trail_;
   std::vector<il::BlockId> gotoTrail_;
+  mutable std::vector<uint32_t> regionEpoch_;
+  mutable uint32_t currentEpoch_ = 0;
   il::BlockId regionEnd_{};
 
   /// Canonical bodies claimed by `claimOrCloneSharedCaseBody`, keyed by

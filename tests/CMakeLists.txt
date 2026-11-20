@@ -56,6 +56,7 @@ add_executable(xdec_tests
   analysis/test_typed_variables.cpp
   analysis/test_variables.cpp
   analysis/test_vtable_call.cpp
+  analysis/test_xrefs.cpp
   decompile/test_driver.cpp
   decompile/test_decompile_to_c.cpp
   decompile/test_api.cpp
@@ -83,6 +84,7 @@ add_executable(xdec_tests
     emit/test_c_types.cpp
   emit/test_c_phi_edges.cpp
   emit/test_c_typed_return.cpp
+  emit/test_hl_ast.cpp
   exec/test_exec.cpp
   exec/test_insn_semantics.cpp
   binary/test_memory_map.cpp
@@ -150,13 +152,17 @@ endforeach()
 target_compile_definitions(xdec_tests PRIVATE
   XDEC_TEST_PLUGIN_ECHO="$<TARGET_FILE:xdec_test_plugin_echo>"
   XDEC_TEST_PLUGIN_OLD_ABI="$<TARGET_FILE:xdec_test_plugin_old_abi>"
-  XDEC_TEST_PLUGIN_THROWER="$<TARGET_FILE:xdec_test_plugin_thrower>")
+  XDEC_TEST_PLUGIN_THROWER="$<TARGET_FILE:xdec_test_plugin_thrower>"
+  XDEC_PLUGIN_OLLVM="$<TARGET_FILE:xdec_plugin_ollvm_deobf>"
+  XDEC_PLUGIN_OBJC="$<TARGET_FILE:xdec_plugin_objc_libcxx>")
 
 # The loader tests need the plugin libraries built before they run.
 add_dependencies(xdec_tests
   xdec_test_plugin_echo
   xdec_test_plugin_old_abi
-  xdec_test_plugin_thrower)
+  xdec_test_plugin_thrower
+  xdec_plugin_ollvm_deobf
+  xdec_plugin_objc_libcxx)
 
 target_include_directories(xdec_tests PRIVATE
   "${PROJECT_SOURCE_DIR}/include"

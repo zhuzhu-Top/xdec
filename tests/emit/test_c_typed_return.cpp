@@ -173,3 +173,28 @@ TEST_CASE("a disagreeing width leaves the function's own return type as inferred
   INFO(text);
   CHECK(contains(text, "uint64_t sub_1000("));
 }
+
+TEST_CASE("a void typed return from TypedVariables omits return value expression",
+          "[emit][typed-variables]") {
+  Fixture f;
+  TypeDatabase database;
+  const auto report = xdec::types::parseHeader("void helper(void);", database);
+  REQUIRE(report.hasValue());
+  const NameAt names = [](uint64_t va) -> xdec::types::BoundName {
+    return va == 0x2000 ? xdec::types::BoundName{"helper", true} : xdec::types::BoundName{};
+  };
+  const il::OpId call =
+      f.function.appendCall(f.entry, 0x1000, f.function.constant(Type::integer(64), 0x2000),
+                            Type::integer(64));
+  const il::OpId ret = f.function.appendReturn(f.entry, 0x1004);
+  f.function.setOperands(
+      ret, std::vector<ExprId>{f.function.valueRef(f.function.op(call).result)});
+
+  const StackFrame frame = StackFrame::compute(f.function);
+  const TypedVariables typed = TypedVariables::recover(f.function, frame, &database, nullptr, names);
+  const std::string text = f.emit(&database, nullptr, typed);
+  INFO(text);
+  CHECK(contains(text, "void sub_1000("));
+  CHECK(contains(text, "  return;\n"));
+  CHECK_FALSE(contains(text, "return t0;"));
+}

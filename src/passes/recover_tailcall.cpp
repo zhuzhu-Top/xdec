@@ -42,6 +42,9 @@ struct Origin {
   /// The destination is read from a slot the loader binds to another module.
   bool importSlot = false;
   std::string importName;
+  /// The destination is a scalar load from a single writable global pointer
+  /// slot (no index arithmetic): a runtime hook or lazy function pointer.
+  bool writableGlobalSlot = false;
 };
 
 class RecoverTailCall final : public pass::FunctionPass {
@@ -114,6 +117,7 @@ class RecoverTailCall final : public pass::FunctionPass {
     std::set<uint32_t> visited;
     // The target starts in address position: it is where control goes.
     walk(context, function, target, 0, true, visited, origin);
+    origin.writableGlobalSlot = isWritableGlobalSlotTarget(context, function, target);
 
     if (!classify(origin)) {
       XDEC_LOG_DEBUG(tailLog(),
@@ -132,7 +136,9 @@ class RecoverTailCall final : public pass::FunctionPass {
     const std::string note =
         origin.importSlot
             ? std::format("tail call through the '{}' import slot", origin.importName)
-            : std::string("tail call through a pointer the caller passed in");
+            : origin.writableGlobalSlot
+                  ? std::string("tail call through a writable global pointer")
+                  : std::string("tail call through a pointer the caller passed in");
     XDEC_LOG_DEBUG(tailLog(), "{:#x}: {} ({} argument(s))", branchVa, note, args.size());
 
     // A tail call's result is its caller's result, so the call is typed as one
@@ -170,10 +176,57 @@ class RecoverTailCall final : public pass::FunctionPass {
   /// one -- the constant in that shape is the slot, and a slot the loader fills
   /// at run time holds no address this image chose.
   [[nodiscard]] static bool classify(const Origin& origin) {
-    if (origin.importSlot) {
+    if (origin.importSlot || origin.writableGlobalSlot) {
       return true;
     }
     return origin.callerValue && !origin.imageAddress;
+  }
+
+  /// True when `target` (through transparent casts) is a scalar `Load` from a
+  /// single fixed writable global address (no index arithmetic, no `Select`,
+  /// not loader-rebased to a static address). `resolve-indirect` cannot
+  /// enumerate mutable memory, and a switch jump table never reads a scalar
+  /// `.bss`/`.data` hook pointer directly.
+  [[nodiscard]] static bool isWritableGlobalSlotTarget(const pass::Context& context,
+                                                       const il::Function& function,
+                                                       il::ExprId target) {
+    if (!context.memoryFacts().immutable) {
+      return false;
+    }
+    il::ExprId cur = target;
+    for (unsigned depth = 0; depth < 8 && cur.valid(); ++depth) {
+      const il::Expr& expr = function.expr(cur);
+      if ((expr.op == il::ExprOp::ZExt || expr.op == il::ExprOp::SExt ||
+           expr.op == il::ExprOp::Trunc || expr.op == il::ExprOp::Bitcast) &&
+          expr.operandCount == 1) {
+        cur = expr.operands[0];
+        continue;
+      }
+      break;
+    }
+    const il::Expr& expr = function.expr(cur);
+    if (expr.op != il::ExprOp::Value) {
+      return false;
+    }
+    const il::ValueId value{static_cast<uint32_t>(expr.immediate)};
+    if (!function.hasValue(value)) {
+      return false;
+    }
+    const il::OpId defId = function.value(value).definition;
+    if (!defId.valid() || function.op(defId).code != il::OpCode::Load) {
+      return false;
+    }
+    const auto address = function.operands(function.op(defId));
+    uint64_t slot = 0;
+    if (address.empty() || !function.asConstantThroughCasts(address[0], slot) ||
+        slot < kFirstPage || !addressesImage(context, slot)) {
+      return false;
+    }
+    if (context.memoryFacts().isImmutable(slot, 8)) {
+      return false;
+    }
+    const LoaderValue bound = context.memoryFacts().loaderValueAt(slot);
+    return !bound.hasAddress && bound.importName.empty();
   }
 
   /// Follows the target expression, and a loaded value into the address it came

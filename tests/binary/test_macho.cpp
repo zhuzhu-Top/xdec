@@ -5,9 +5,12 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "xdec/binary/image.h"
+#include "xdec/binary/macho_metadata.h"
 
 using namespace xdec;
 using namespace xdec::binary;
@@ -193,4 +196,150 @@ TEST_CASE("an undecoded chained pointer format leaves its slots as raw bytes",
   REQUIRE(raw);
   CHECK(*raw == 0x1122334455667788ull);
   CHECK_FALSE((*image)->importNameAt(MachOBuilder::kDataVa + 8).has_value());
+}
+
+TEST_CASE("MachOMetadata resolves compact unwind bounds, __cfstring, and __objc_selrefs",
+          "[binary][macho]") {
+  // Minimal Mach-O with __TEXT (__text, __cstring, __unwind_info) and __DATA (__cfstring, __objc_selrefs).
+  std::vector<std::byte> bytes(0x3000, std::byte{0});
+  const auto put16 = [&](uint64_t off, uint16_t v) {
+    bytes[off] = static_cast<std::byte>(v & 0xff);
+    bytes[off + 1] = static_cast<std::byte>((v >> 8) & 0xff);
+  };
+  const auto put32 = [&](uint64_t off, uint32_t v) {
+    for (unsigned i = 0; i < 4; ++i) {
+      bytes[off + i] = static_cast<std::byte>((v >> (i * 8)) & 0xff);
+    }
+  };
+  const auto put64 = [&](uint64_t off, uint64_t v) {
+    for (unsigned i = 0; i < 8; ++i) {
+      bytes[off + i] = static_cast<std::byte>((v >> (i * 8)) & 0xff);
+    }
+  };
+  const auto putName = [&](uint64_t off, std::string_view text) {
+    std::memcpy(bytes.data() + off, text.data(), text.size());
+  };
+
+  // mach_header_64: 2 LC_SEGMENT_64 commands (__TEXT with 3 sections, __DATA with 2 sections).
+  put32(0, 0xfeedfacfu);
+  put32(4, 0x0100000cu);
+  put32(12, 6);
+  put32(16, 2);
+  put32(20, (72 + 3 * 80) + (72 + 2 * 80));
+
+  uint64_t cur = 32;
+  put32(cur, 0x19);
+  put32(cur + 4, 72 + 3 * 80);
+  putName(cur + 8, "__TEXT");
+  put64(cur + 24, 0x1000);
+  put64(cur + 32, 0x1000);
+  put64(cur + 40, 0x1000);
+  put64(cur + 48, 0x1000);
+  put32(cur + 60, 5);
+  put32(cur + 64, 3);
+  cur += 72;
+
+  const auto addSection = [&](std::string_view sect, std::string_view seg, uint64_t addr,
+                              uint64_t size, uint32_t foff, uint32_t flags) {
+    putName(cur + 0, sect);
+    putName(cur + 16, seg);
+    put64(cur + 32, addr);
+    put64(cur + 40, size);
+    put32(cur + 48, foff);
+    put32(cur + 64, flags);
+    cur += 80;
+  };
+  addSection("__text", "__TEXT", 0x1400, 0x200, 0x1400, 0x80000400u);
+  addSection("__cstring", "__TEXT", 0x1600, 0x40, 0x1600, 2);
+  addSection("__unwind_info", "__TEXT", 0x1700, 0x80, 0x1700, 0);
+
+  put32(cur, 0x19);
+  put32(cur + 4, 72 + 2 * 80);
+  putName(cur + 8, "__DATA");
+  put64(cur + 24, 0x2000);
+  put64(cur + 32, 0x1000);
+  put64(cur + 40, 0x2000);
+  put64(cur + 48, 0x1000);
+  put32(cur + 60, 3);
+  put32(cur + 64, 2);
+  cur += 72;
+  addSection("__cfstring", "__DATA", 0x2000, 32, 0x2000, 0);
+  addSection("__objc_selrefs", "__DATA", 0x2020, 8, 0x2020, 0);
+
+  // __cstring content at file offset 0x1600 (VA 0x1600): "hello" and "doWork:"
+  putName(0x1600, "hello");
+  putName(0x1610, "doWork:");
+
+  // __cfstring entry at 0x2000 pointing to "hello"
+  put64(0x2008, 0x07c8);
+  put64(0x2010, 0x1600);
+  put64(0x2018, 5);
+
+  // __objc_selrefs entry at 0x2020 pointing to "doWork:"
+  put64(0x2020, 0x1610);
+
+  // __unwind_info at file offset 0x1700:
+  // Header (28 bytes): indexOffset=28, indexCount=2; first-level entries at +28 (24 bytes);
+  // regular second-level page at +52: kind=2, entryPageOffset=8, entryCount=2.
+  put32(0x1700 + 0, 1);    // version
+  put32(0x1700 + 20, 28);  // indexSectionOffset
+  put32(0x1700 + 24, 2);   // indexCount
+  put32(0x1700 + 28, 0x400);  // funcOffset 0 (0x1400 - 0x1000)
+  put32(0x1700 + 32, 52);     // secondLevelPagesSectionOffset
+  put32(0x1700 + 40, 0x520);  // sentinel funcOffset (0x1520 - 0x1000)
+  put32(0x1700 + 44, 0);      // sentinel
+  put32(0x1700 + 52, 2);      // regular page kind
+  put16(0x1700 + 56, 8);      // entryPageOffset
+  put16(0x1700 + 58, 2);      // entryCount
+  put32(0x1700 + 60, 0x400);  // entry 0: 0x1400..0x1480
+  put32(0x1700 + 68, 0x480);  // entry 1: 0x1480..0x1520
+
+  auto image = loadMachO(FileBuffer::fromBytes(bytes), "meta.dylib");
+  REQUIRE(image);
+  const auto* meta = dynamic_cast<const MachOMetadata*>((*image)->formatMetadata());
+  REQUIRE(meta != nullptr);
+
+  const auto bounds = meta->functionBoundsAt(**image, 0x1400);
+  REQUIRE(bounds.has_value());
+  CHECK(bounds->first == 0x1400);
+  CHECK(bounds->second == 0x1480);
+
+  const auto nextFn = meta->nextUnwindFunctionAfter(**image, 0x1480);
+  REQUIRE(nextFn.has_value());
+  CHECK(*nextFn == 0x1520);
+
+  const auto cf = meta->cfStringAt(**image, 0x2000);
+  REQUIRE(cf.has_value());
+  CHECK(*cf == "hello");
+
+  const auto cfSym = meta->resolveDataSymbolAt(**image, 0x2000);
+  REQUIRE(cfSym.has_value());
+  CHECK(cfSym->starts_with("cfstr_hello_"));
+
+  const auto selSym = meta->resolveDataSymbolAt(**image, 0x2020);
+  REQUIRE(selSym.has_value());
+  CHECK(*selSym == "selRef_doWork_");
+}
+
+TEST_CASE("FileBuffer::fromFile maps a binary read-only with exact contents",
+          "[binary][backing-store]") {
+  const std::filesystem::path tmpPath =
+      std::filesystem::temp_directory_path() / "xdec_mmap_test.bin";
+  {
+    std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+    const char payload[] = "XDEC_MMAP_TEST_1234567890";
+    out.write(payload, sizeof(payload) - 1);
+  }
+  {
+    auto buf = FileBuffer::fromFile(tmpPath);
+    REQUIRE(buf);
+    CHECK(buf->size() == 25);
+    const std::string_view view(reinterpret_cast<const char*>(buf->bytes().data()), buf->size());
+    CHECK(view == "XDEC_MMAP_TEST_1234567890");
+    // Move transfers mapping cleanly without invalidating bytes().
+    FileBuffer moved = std::move(*buf);
+    CHECK(moved.size() == 25);
+  }
+  std::error_code ec;
+  std::filesystem::remove(tmpPath, ec);
 }

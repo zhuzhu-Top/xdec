@@ -409,4 +409,22 @@ TEST_CASE("a preserving register view writes through a masked insert",
   CHECK(contains(text, "t0 = ((uint64_t)((q0 >> 0x40)));"));
 }
 
+TEST_CASE("unsigned-negative 32-bit add prints as subtraction and float bitcast prints decimal",
+          "[emit][expr]") {
+  Fixture f;
+  const ExprId w0 = f.function.cast(ExprOp::Trunc, Type::integer(32), f.entryReg("x0"));
+  const ExprId sub = f.function.binary(
+      ExprOp::Add, w0, f.function.constant(Type::integer(32), 0xffffd8f0ull));
+  f.function.appendStore(f.entry, 0x1000, Type::integer(32), f.i64(0x9000), sub);
+  const ExprId fp = f.function.cast(
+      ExprOp::Bitcast, Type::floating(64), f.i64(0x4008000000000000ull));
+  const il::OpId call = f.function.appendCall(f.entry, 0x1004, f.i64(0x20000));
+  f.function.setOperands(call, std::vector<ExprId>{f.i64(0x20000), fp});
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "- 0x2710"));
+  CHECK(contains(text, "sub_20000(3.0)"));
+}
+
 }  // namespace

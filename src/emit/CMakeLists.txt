@@ -1,5 +1,10 @@
 xdec_add_library(xdec_emit
   SOURCES
+    ast_lower.cpp
+    backend_c.cpp
+    backend_objc.cpp
+    dead_ops.cpp
+    phi_lowering.cpp
     structure.cpp
     structure_dispatch.cpp
     structure_dispatch_region.cpp

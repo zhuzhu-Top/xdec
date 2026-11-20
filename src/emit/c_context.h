@@ -140,6 +140,10 @@ class CContext {
   std::map<uint64_t, std::string> callees;
   /// Entry-value externs the body referenced, with the width each carries.
   std::map<std::string, uint32_t> entryLeaves;
+  /// True when the function reads `EntryReg(x8)` (AAPCS64 indirect struct
+  /// return buffer `_sret`) so the printer emits a parameter instead of an
+  /// extern `__entry_x8` global.
+  bool hasSret = false;
   /// The subset of `entryLeaves` that `options.entryRegs` actually resolved,
   /// each with the concrete value it resolved to -- what tells the preamble
   /// to print `#define __entry_x22 0x...ULL` there instead of the bare

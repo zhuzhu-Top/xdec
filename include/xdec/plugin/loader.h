@@ -9,7 +9,10 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
+#include "xdec/emit/ast.h"
+#include "xdec/emit/structure.h"
 #include "xdec/pass/registry.h"
 #include "xdec/support/result.h"
 
@@ -25,17 +28,20 @@ class Plugin {
   ~Plugin();
 
   /// Loads the library, checks the ABI version, runs its init against
-  /// `registry`. On any failure the registry is left untouched: version and
-  /// symbol checks happen before init, and an init that reports failure is
-  /// expected to have registered nothing (a plugin that half-registers and
-  /// then fails is violating its own contract).
-  [[nodiscard]] static Result<Plugin> load(const std::filesystem::path& path,
-                                           pass::Registry& registry);
+  /// `registry` (and optional `astTransforms` when the plugin exports
+  /// `xdec_plugin_init_v2`). On any failure the registry is left untouched.
+  [[nodiscard]] static Result<Plugin> load(
+      const std::filesystem::path& path, pass::Registry& registry,
+      std::vector<emit::AstTransformFn>* astTransforms = nullptr,
+      std::vector<emit::HlAstTransformFn>* hlTransforms = nullptr);
 
   [[nodiscard]] bool loaded() const noexcept { return handle_ != nullptr; }
   /// The number of passes the plugin registered (recorded at load time, for
   /// diagnostics and tests).
   [[nodiscard]] std::size_t registeredPasses() const noexcept { return registered_; }
+  [[nodiscard]] std::size_t registeredAstTransforms() const noexcept {
+    return registeredAstTransforms_;
+  }
 
   /// Unloads explicitly. Idempotent; the destructor calls this. After unload
   /// the plugin's passes must never run again — see abi.h.
@@ -44,6 +50,7 @@ class Plugin {
  private:
   void* handle_ = nullptr;
   std::size_t registered_ = 0;
+  std::size_t registeredAstTransforms_ = 0;
 };
 
 }  // namespace xdec::plugin

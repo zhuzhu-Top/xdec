@@ -217,32 +217,91 @@ int commandSections(std::string_view path) {
   return 0;
 }
 
-int commandSymbols(std::string_view path, uint64_t limit) {
+int commandSymbols(std::string_view path, std::span<const std::string_view> options) {
+  std::string filter;
+  std::string kindFilter;
+  uint64_t limit = 40;
+  for (std::size_t i = 0; i < options.size(); ++i) {
+    const std::string_view opt = options[i];
+    const auto value = [&]() -> std::string_view {
+      return (++i < options.size()) ? options[i] : std::string_view{};
+    };
+    if (opt == "--grep" || opt == "-g") {
+      filter = std::string{value()};
+    } else if (opt == "--kind" || opt == "-k") {
+      kindFilter = std::string{value()};
+    } else if (opt == "--limit" || opt == "-n") {
+      if (!parseNumber(value(), limit)) {
+        printError("'--limit' requires an integer");
+        return 1;
+      }
+    } else if (parseNumber(opt, limit)) {
+      // Positional count for backward compatibility: `xdec symbols <bin> 100`.
+    } else {
+      printError("unknown symbols option '{}'", opt);
+      return 1;
+    }
+  }
+
   auto opened = open(path);
   if (!opened) {
     return reportError(opened.error());
   }
   const BinaryImage& image = *opened.value();
 
+  const auto containsCI = [](std::string_view hay, std::string_view needle) {
+    if (needle.empty()) {
+      return true;
+    }
+    return std::search(hay.begin(), hay.end(), needle.begin(), needle.end(),
+                       [](char a, char b) {
+                         return std::tolower(static_cast<unsigned char>(a)) ==
+                                std::tolower(static_cast<unsigned char>(b));
+                       }) != hay.end();
+  };
+
   std::vector<const xdec::binary::Symbol*> ordered;
   for (const auto& symbol : image.symbols()) {
-    if (symbol.defined && !symbol.name.empty()) {
-      ordered.push_back(&symbol);
+    if (symbol.name.empty()) {
+      continue;
     }
+    if (kindFilter == "import") {
+      if (symbol.defined) {
+        continue;
+      }
+    } else if (kindFilter == "export") {
+      if (!symbol.defined || !symbol.exported) {
+        continue;
+      }
+    } else if (kindFilter == "func") {
+      if (!symbol.defined || symbol.kind != xdec::binary::SymbolKind::Function) {
+        continue;
+      }
+    } else if (kindFilter == "object" || kindFilter == "data") {
+      if (!symbol.defined || symbol.kind != xdec::binary::SymbolKind::Object) {
+        continue;
+      }
+    } else if (!symbol.defined) {
+      continue;
+    }
+    if (!containsCI(symbol.name, filter)) {
+      continue;
+    }
+    ordered.push_back(&symbol);
   }
   std::sort(ordered.begin(), ordered.end(),
             [](const auto* a, const auto* b) { return a->va < b->va; });
 
-  print("{} defined named symbols", ordered.size());
+  print("{} matching symbol(s)", ordered.size());
   uint64_t shown = 0;
   for (const auto* symbol : ordered) {
-    if (shown++ >= limit) {
+    if (limit != 0 && shown++ >= limit) {
       print("... {} more", ordered.size() - limit);
       break;
     }
     print("  0x{:08x} size={:<8} {:<8} {:<7} {}{}", symbol->va, symbol->size,
           toString(symbol->kind), toString(symbol->binding), symbol->name,
-          symbol->exported ? " [exported]" : "");
+          symbol->exported ? " [exported]" : symbol->defined ? "" : " [import]");
   }
   return 0;
 }

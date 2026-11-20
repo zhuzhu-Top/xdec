@@ -533,6 +533,38 @@ std::string_view Function::noteOn(OpId opId) const {
   return it == notes_.end() ? std::string_view{} : std::string_view{it->second};
 }
 
+void Function::setCallSpDelta(OpId opId, int64_t delta) {
+  XDEC_ASSERT(ops_.contains(opId), "op handle out of range");
+  callSpDeltas_[opId.index()] = delta;
+}
+
+std::optional<int64_t> Function::callSpDelta(OpId opId) const {
+  const auto it = callSpDeltas_.find(opId.index());
+  if (it == callSpDeltas_.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+void Function::setCallFpArg(OpId opId, unsigned slot, ExprId value, unsigned bits) {
+  XDEC_ASSERT(ops_.contains(opId), "op handle out of range");
+  if (slot >= 8) {
+    return;
+  }
+  callFpArgs_[opId.index()][slot] = CallFpArg{value, bits};
+}
+
+std::optional<Function::CallFpArg> Function::callFpArg(OpId opId, unsigned slot) const {
+  if (slot >= 8) {
+    return std::nullopt;
+  }
+  const auto it = callFpArgs_.find(opId.index());
+  if (it == callFpArgs_.end() || !it->second[slot].value.valid()) {
+    return std::nullopt;
+  }
+  return it->second[slot];
+}
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------

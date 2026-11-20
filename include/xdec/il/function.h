@@ -257,6 +257,21 @@ class Function {
     return notes_;
   }
 
+  /// Stack pointer offset relative to `entry(sp)` at a Call site, recorded by
+  /// SSA construction so `vars` can distinguish `[sp+0], [sp+8], ...` outgoing
+  /// stack arguments from unrelated stack locals.
+  void setCallSpDelta(OpId op, int64_t delta);
+  [[nodiscard]] std::optional<int64_t> callSpDelta(OpId op) const;
+
+  struct CallFpArg {
+    ExprId value;
+    unsigned bits = 64;
+  };
+  /// Snapshot of scalar FP argument register (`d0..d7` / `s0..s7`) written
+  /// in the same basic block immediately prior to a Call.
+  void setCallFpArg(OpId op, unsigned slot, ExprId value, unsigned bits);
+  [[nodiscard]] std::optional<CallFpArg> callFpArg(OpId op, unsigned slot) const;
+
   // -- CFG ------------------------------------------------------------------
 
   /// Recomputes successor and predecessor lists from block terminators. Cheap
@@ -298,6 +313,8 @@ class Function {
 
   std::unordered_map<uint64_t, BlockId> blocksByAddress_;
   std::unordered_map<OpId, std::string> notes_;
+  std::unordered_map<uint32_t, int64_t> callSpDeltas_;
+  std::unordered_map<uint32_t, std::array<CallFpArg, 8>> callFpArgs_;
 };
 
 }  // namespace xdec::il

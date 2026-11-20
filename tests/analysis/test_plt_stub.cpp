@@ -70,6 +70,17 @@ void putStub(Bytes& image, uint64_t stubVa, uint64_t gotVa, unsigned reg = 17) {
   image.word(stubVa + 4, ldr(reg, reg, gotVa - gotPage));
 }
 
+/// Unconditional `b <targetVa>` instruction.
+[[nodiscard]] constexpr uint32_t branch(uint64_t pc, uint64_t targetVa) {
+  const int64_t delta = static_cast<int64_t>(targetVa - pc) >> 2;
+  return 0x14000000U | (static_cast<uint32_t>(delta) & 0x03ffffffU);
+}
+
+/// `add x<rd>, x<rn>, #imm12` (64-bit, unshifted).
+[[nodiscard]] constexpr uint32_t addImm64(unsigned rd, unsigned rn, uint32_t imm12) {
+  return 0x91000000U | ((imm12 & 0xfffU) << 10U) | (rn << 5U) | rd;
+}
+
 }  // namespace
 
 TEST_CASE("adrp+ldr decodes to the GOT slot it addresses", "[analysis][plt-stub]") {
@@ -130,4 +141,57 @@ TEST_CASE("importNameForPltStub is nothing when the slot is not loader-bound",
   Bytes image;
   putStub(image, 0x1d28a0, 0x1f9b78);
   CHECK_FALSE(importNameForPltStub(0x1d28a0, image.reader(), MemoryFacts{}).has_value());
+}
+
+TEST_CASE("pltGotSlot chases multi-hop unconditional branch islands", "[analysis][plt-stub]") {
+  Bytes image;
+  image.word(0x100000, branch(0x100000, 0x200000));
+  image.word(0x200000, branch(0x200000, 0x300000));
+  putStub(image, 0x300000, 0x401080, 16);
+
+  const std::optional<uint64_t> slot = pltGotSlot(image.reader(), 0x100000);
+  REQUIRE(slot.has_value());
+  CHECK(*slot == 0x401080);
+}
+
+TEST_CASE("pltGotSlot terminates cleanly on a branch-island cycle", "[analysis][plt-stub]") {
+  Bytes image;
+  image.word(0x1000, branch(0x1000, 0x2000));
+  image.word(0x2000, branch(0x2000, 0x1000));
+  CHECK_FALSE(pltGotSlot(image.reader(), 0x1000).has_value());
+}
+
+TEST_CASE("Apple __objc_stubs selector trampoline resolves both GOT slot and selector slot",
+          "[analysis][plt-stub]") {
+  Bytes image;
+  // Branch island -> __objc_stubs (`adrp x1; ldr x1, [x1, #off]; b _objc_msgSend`) -> __stubs.
+  image.word(0x100000, branch(0x100000, 0x200000));
+  putStub(image, 0x200000, 0x500c88, /*reg=*/1);
+  image.word(0x200008, branch(0x200008, 0x300000));
+  putStub(image, 0x300000, 0x4019b8, /*reg=*/16);
+  image.word(0x300008, 0xd61f0200U);  // br x16
+
+  const std::optional<uint64_t> got = pltGotSlot(image.reader(), 0x100000);
+  REQUIRE(got.has_value());
+  CHECK(*got == 0x4019b8);
+
+  const std::optional<uint64_t> sel =
+      xdec::analysis::objcStubSelectorSlot(image.reader(), 0x100000);
+  REQUIRE(sel.has_value());
+  CHECK(*sel == 0x500c88);
+}
+
+TEST_CASE("arm64e adrp+add+ldr stub decodes to the GOT slot", "[analysis][plt-stub]") {
+  Bytes image;
+  const uint64_t stubVa = 0x10000;
+  const uint64_t gotVa = 0x20abc;
+  const uint64_t stubPage = stubVa & ~uint64_t{0xfff};
+  const uint64_t gotPage = gotVa & ~uint64_t{0xfff};
+  image.word(stubVa, adrp(17, static_cast<int64_t>(gotPage - stubPage)));
+  image.word(stubVa + 4, addImm64(17, 17, static_cast<uint32_t>(gotVa - gotPage)));
+  image.word(stubVa + 8, ldr(16, 17, 0));
+
+  const std::optional<uint64_t> got = pltGotSlot(image.reader(), stubVa);
+  REQUIRE(got.has_value());
+  CHECK(*got == gotVa);
 }

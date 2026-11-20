@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "xdec/binary/image.h"
+#include "xdec/binary/macho_metadata.h"
 #include "xdec/obs/log.h"
 
 #include "field_reader.h"
@@ -942,6 +943,49 @@ class MachOLoader {
       section.permissions = raw.permissions;
       contents.sections.push_back(std::move(section));
     }
+
+    MachOMetadata::Sections meta;
+    for (const Segment& segment : segments_) {
+      if (segment.filesize != 0) {
+        meta.imageBase = segment.vmaddr;
+        break;
+      }
+    }
+    for (const Section& sec : contents.sections) {
+      const MachORange range{sec.va, sec.size};
+      if (sec.name == "__text") {
+        meta.text = range;
+      } else if (sec.name == "__unwind_info") {
+        meta.unwindInfo = range;
+      } else if (sec.name == "__cfstring") {
+        meta.cfstring = range;
+      } else if (sec.name == "__cstring") {
+        meta.cstring = range;
+      } else if (sec.name == "__ustring") {
+        meta.ustring = range;
+      } else if (sec.name == "__objc_methname") {
+        meta.objcMethname = range;
+      } else if (sec.name == "__objc_classname") {
+        meta.objcClassname = range;
+      } else if (sec.name == "__objc_methtype") {
+        meta.objcMethtype = range;
+      } else if (sec.name == "__objc_selrefs") {
+        meta.objcSelrefs = range;
+      } else if (sec.name == "__objc_classrefs") {
+        meta.objcClassrefs = range;
+      } else if (sec.name == "__objc_superrefs") {
+        meta.objcSuperrefs = range;
+      } else if (sec.name == "__objc_protorefs") {
+        meta.objcProtorefs = range;
+      } else if (sec.name == "__objc_ivar") {
+        meta.objcIvar = range;
+      } else if (sec.name == "__objc_classlist") {
+        meta.objcClasslist = range;
+      } else if (sec.name == "__objc_catlist") {
+        meta.objcCatlist = range;
+      }
+    }
+    contents.formatMetadata = std::make_unique<MachOMetadata>(meta);
 
     contents.memory = std::move(memory_);
     contents.store.addPart(path_, std::move(file_));

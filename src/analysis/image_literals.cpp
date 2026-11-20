@@ -3,7 +3,7 @@
 
 namespace xdec::analysis {
 
-std::optional<ImageLiteral> ImageLiteralRecovery::at(uint64_t va) const {
+std::optional<ImageLiteral> ImageLiteralRecovery::at(uint64_t va, bool allowEmpty) const {
   if (!reader_) {
     return std::nullopt;
   }
@@ -20,11 +20,12 @@ std::optional<ImageLiteral> ImageLiteralRecovery::at(uint64_t va) const {
     }
     const auto value = std::to_integer<uint8_t>(byte);
     if (value == 0) {
-      // An empty string is not worth naming: every zero byte the image
-      // happens to be immutable at would otherwise recover as `""`, which
-      // says nothing a reader could not already see in the fallback hex.
-      return offset == 0 ? std::nullopt
-                         : std::make_optional(ImageLiteral{ImageLiteralKind::CString, std::move(text)});
+      // An empty string is not worth naming in general .rodata, where every
+      // zero byte would look like `""`; dedicated string sections opt in via
+      // `allowEmpty = true`.
+      return (offset == 0 && !allowEmpty)
+                 ? std::nullopt
+                 : std::make_optional(ImageLiteral{ImageLiteralKind::CString, std::move(text)});
     }
     if (value < 0x20 || value > 0x7e) {
       return std::nullopt;  // not printable ASCII; do not guess the encoding

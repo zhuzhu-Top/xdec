@@ -275,3 +275,39 @@ TEST_CASE("a call with no attached arguments is left alone", "[passes][vars]") {
   CHECK(b.function.op(call).code == OpCode::Call);
   CHECK(b.function.noteOn(call).empty());
 }
+
+TEST_CASE("outgoing stack arguments past the 8 register slots attach to the call",
+          "[passes][vars]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const ExprId readSp0 =
+      b.function.valueRef(b.function.appendReadReg(entry, 0x1000, b.reg("sp")));
+  const ExprId newSp = b.function.binary(ExprOp::Sub, readSp0, b.i64(0x40));
+  b.function.appendWriteReg(entry, 0x1000, b.reg("sp"), newSp);
+  for (unsigned idx = 0; idx < 8; ++idx) {
+    const std::string regName = "x" + std::to_string(idx);
+    b.set(entry, 0x1004 + idx * 4, regName.c_str(), idx + 10);
+  }
+  const ExprId spNow =
+      b.function.valueRef(b.function.appendReadReg(entry, 0x1024, b.reg("sp")));
+  b.function.appendStore(entry, 0x1024, Type::integer(64), spNow, b.i64(0xaaa));
+  const ExprId spNext =
+      b.function.valueRef(b.function.appendReadReg(entry, 0x1028, b.reg("sp")));
+  b.function.appendStore(entry, 0x1028, Type::integer(64),
+                         b.function.binary(ExprOp::Add, spNext, b.i64(8)),
+                         b.i64(0xbbb));
+  const OpId call = b.function.appendCall(entry, 0x102c, b.i64(0x9000));
+  b.function.appendReturn(entry, 0x1030);
+  b.atCfg();
+
+  runToVars(b.function);
+
+  const auto ops = b.function.operands(b.function.op(call));
+  REQUIRE(ops.size() == 11);  // target + x0..x7 + [sp+0] + [sp+8]
+  uint64_t stack0 = 0;
+  uint64_t stack1 = 0;
+  REQUIRE(b.function.asConstant(ops[9], stack0));
+  REQUIRE(b.function.asConstant(ops[10], stack1));
+  CHECK(stack0 == 0xaaa);
+  CHECK(stack1 == 0xbbb);
+}

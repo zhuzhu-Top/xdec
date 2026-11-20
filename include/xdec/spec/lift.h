@@ -61,6 +61,19 @@ struct LiftCoverage {
   }
 };
 
+/// Optional hard address fence for lifting. When active (`end > start`),
+/// sequential scanning stops at `end` and direct branch targets outside
+/// `[start, end)` become external boundary stubs instead of new blocks.
+struct LiftRange {
+  uint64_t start = 0;
+  uint64_t end = 0;
+
+  [[nodiscard]] bool active() const noexcept { return end > start; }
+  [[nodiscard]] bool contains(uint64_t va) const noexcept {
+    return !active() || (va >= start && va < end);
+  }
+};
+
 struct LiftedFunction {
   std::unique_ptr<il::Function> function;
   il::BlockId entry;
@@ -95,11 +108,18 @@ struct LiftedFunction {
 /// more of this function. Default-constructed facts answer "don't know" for
 /// everything, which keeps every caller that has no image to ask exactly
 /// today's behaviour.
+/// Optional predicate answering whether an unconditional direct `b <target>`
+/// from `branchVa` leaves the function (a direct sibling tail call) rather than
+/// jumping to another basic block inside the same function.
+using TailCallTargetTest = std::function<bool(uint64_t branchVa, uint64_t targetVa)>;
+
 [[nodiscard]] Result<LiftedFunction> liftFunction(const SpecEngine& engine,
                                                   const ByteReader& reader,
                                                   uint64_t entry,
                                                   const MemoryFacts& facts = {},
-                                                  const LiftCoverage* coverage = nullptr);
+                                                  const LiftCoverage* coverage = nullptr,
+                                                  LiftRange fence = {},
+                                                  const TailCallTargetTest& isTailCall = {});
 
 /// Incremental discovery into an existing function: scans and elaborates
 /// basic blocks starting at `entries`, splicing them into `function` next to
@@ -123,6 +143,8 @@ struct LiftBlocksResult {
                                                       const ByteReader& reader,
                                                       std::span<const uint64_t> entries,
                                                       const MemoryFacts& facts = {},
-                                                      const LiftCoverage* coverage = nullptr);
+                                                      const LiftCoverage* coverage = nullptr,
+                                                      LiftRange fence = {},
+                                                      const TailCallTargetTest& isTailCall = {});
 
 }  // namespace xdec::spec

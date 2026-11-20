@@ -1,6 +1,8 @@
 // ExprPrinter (see the header for the two rules it enforces).
 #include "c_expr.h"
 
+#include <bit>
+#include <cmath>
 #include <format>
 #include <vector>
 
@@ -190,6 +192,12 @@ ExprPrinter::Text ExprPrinter::value(il::ExprId id) {
       return {ctx_.argumentName(*arg), ctx_.argumentIsPointer(*arg)};
     }
   }
+  if ((expr.op == il::ExprOp::Add || expr.op == il::ExprOp::Sub) &&
+      expr.type.bits() == 64) {
+    if (std::string localAddr = ctx_.addressOfLocal(id); !localAddr.empty()) {
+      return {std::move(localAddr), true};
+    }
+  }
   return materialized(id);
 }
 
@@ -301,6 +309,25 @@ std::optional<std::string> ExprPrinter::materializeAs(il::ExprId id,
 /// The operand of a signed operation, in the signed type of `width`. C would
 /// otherwise convert the whole operation to unsigned as soon as one side is.
 std::string ExprPrinter::signedOperand(il::ExprId id, uint32_t width) {
+  uint64_t constant = 0;
+  if (width <= 32 && ctx_.function.asConstant(id, constant)) {
+    const uint64_t signBit = uint64_t{1} << (width - 1);
+    // A non-negative 32-bit-range constant (`<= 0x7fffffff`) is already signed
+    // `int` in C, matching `(int32_t)(0x1f)` without the redundant cast.
+    if (constant < signBit) {
+      return std::format("0x{:x}", constant);
+    }
+  }
+  const il::Expr& expr = ctx_.function.expr(id);
+  if (expr.op == il::ExprOp::Value) {
+    const il::ValueId valueId{static_cast<uint32_t>(expr.immediate)};
+    if (const analysis::Variable* temp = ctx_.variables.tempFor(valueId);
+        temp != nullptr && temp->type.pointerDepth == 0 &&
+        temp->type.isSigned && temp->type.width == width &&
+        !ctx_.typeOfValue(valueId).valid()) {
+      return temp->name;
+    }
+  }
   return std::format("({})({})", intType(width, true), integerOperand(id));
 }
 
@@ -308,6 +335,22 @@ std::string ExprPrinter::inner(il::ExprId id) {
   const il::Expr& e = ctx_.function.expr(id);
   switch (e.op) {
     case il::ExprOp::Const:
+      if (e.type.bits() == 64 && e.immediate >= 0x10000 && ctx_.options.addresses) {
+        const AddressFacts facts = ctx_.options.addresses(e.immediate);
+        if (facts.cstringSection) {
+          if (const std::optional<analysis::ImageLiteral> literal =
+                  ctx_.literals.at(e.immediate, /*allowEmpty=*/true)) {
+            return analysis::quoteCString(literal->text);
+          }
+        }
+        if (facts.cfstringLiteral.has_value()) {
+          const std::string* global = ctx_.globalName(e.immediate);
+          const std::string base =
+              global != nullptr ? *global : std::format("0x{:x}", e.immediate);
+          return std::format("{} /* @{} */", base,
+                             analysis::quoteCString(*facts.cfstringLiteral));
+        }
+      }
       return std::format("0x{:x}", e.immediate);
     case il::ExprOp::Value: {
       // Values with no temporary are the ones no stage claimed: a bug in the
@@ -330,6 +373,10 @@ std::string ExprPrinter::inner(il::ExprId id) {
         return ctx_.argumentName(*arg);
       }
       const il::RegisterInfo& info = ctx_.function.registers()[root];
+      if (info.name == "x8") {
+        ctx_.hasSret = true;
+        return "_sret";
+      }
       const std::string name = std::format("__entry_{}", info.name);
       ctx_.entryLeaves.emplace(name, info.bits == 0 ? 64 : info.bits);
       if (ctx_.options.entryRegs != nullptr) {
@@ -399,13 +446,42 @@ std::string ExprPrinter::inner(il::ExprId id) {
       ctx_.helpers.insert(std::format("ctz{}", e.type.bits()));
       return std::format("xdec_ctz{}({})", e.type.bits(),
                          integerOperand(e.operand(0)));
-    case il::ExprOp::Bitcast:
+    case il::ExprOp::Bitcast: {
+      if (e.type.isFloat()) {
+        uint64_t bits = 0;
+        if (ctx_.function.asConstant(e.operand(0), bits)) {
+          if (e.type.bits() == 64) {
+            const double d = std::bit_cast<double>(bits);
+            if (std::isfinite(d)) {
+              std::string s = std::format("{}", d);
+              if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+                  s.find('E') == std::string::npos) {
+                s += ".0";
+              }
+              return s;
+            }
+          } else if (e.type.bits() == 32) {
+            const float f = std::bit_cast<float>(static_cast<uint32_t>(bits));
+            if (std::isfinite(f)) {
+              std::string s = std::format("{}", f);
+              if (s.find('.') == std::string::npos && s.find('e') == std::string::npos &&
+                  s.find('E') == std::string::npos) {
+                s += ".0";
+              }
+              return s + "f";
+            }
+          }
+        }
+        return std::format("(({})({}))", e.type.bits() == 32 ? "float" : "double",
+                           integerOperand(e.operand(0)));
+      }
       // Reinterpreting the same bits at a possibly different type: this IL
       // already treats every scalar as a raw bit pattern, so the only work is
       // the width cast (a genuine type change, e.g. int <-> float, still goes
       // through the Fp* conversions below, which is where semantics live).
       return std::format("(({})({}))", intType(e.type.bits()),
                          integerOperand(e.operand(0)));
+    }
     case il::ExprOp::Concat: {
       // operand(0) is the high half, operand(1) the low half (see ceval's
       // Concat case): result = hi << lowWidth | lo.
@@ -530,6 +606,20 @@ std::string ExprPrinter::infix(il::ExprId id, std::string_view op, bool sign) {
   const uint32_t width = e.type.bits();
   const std::string left =
       sign ? signedOperand(e.operand(0), width) : integerOperand(e.operand(0));
+  if (op == "+" && !sign) {
+    uint64_t rhsConst = 0;
+    if (ctx_.function.asConstant(e.operand(1), rhsConst)) {
+      if (width == 32 && rhsConst >= 0x80000000ull && rhsConst <= 0xffffffffull) {
+        const uint64_t neg = 0x100000000ull - rhsConst;
+        return widthWrap(e, std::format("({} - 0x{:x})", left, neg), sign);
+      }
+      if (width == 64 && static_cast<int64_t>(rhsConst) < 0 &&
+          static_cast<int64_t>(rhsConst) >= -0x10000000LL) {
+        const uint64_t neg = static_cast<uint64_t>(-static_cast<int64_t>(rhsConst));
+        return widthWrap(e, std::format("({} - 0x{:x})", left, neg), sign);
+      }
+    }
+  }
   const std::string right =
       sign ? signedOperand(e.operand(1), width) : integerOperand(e.operand(1));
   return widthWrap(e, std::format("({} {} {})", left, op, right), sign);
@@ -612,6 +702,29 @@ std::string ExprPrinter::signExtend(il::ExprId id) {
     return std::format("(-(({})({})))", destination, text(e.operand(0)));
   }
   if (sourceWidth >= e.type.bits()) {
+    return std::format("(({})({}))", destination, integerOperand(e.operand(0)));
+  }
+  // If the inner operand is already a signed variable of `sourceWidth`, C
+  // casts it straight to `destination` without a redundant `(int32_t)` step.
+  bool alreadySigned = false;
+  if (source.op == il::ExprOp::Value) {
+    const il::ValueId valueId{static_cast<uint32_t>(source.immediate)};
+    if (const analysis::Variable* temp = ctx_.variables.tempFor(valueId);
+        temp != nullptr && temp->type.pointerDepth == 0 &&
+        temp->type.isSigned && temp->type.width == sourceWidth &&
+        !ctx_.typeOfValue(valueId).valid()) {
+      alreadySigned = true;
+    }
+  } else if (source.op == il::ExprOp::EntryReg) {
+    const il::RegId root{static_cast<uint32_t>(source.immediate)};
+    if (const analysis::Variable* arg = ctx_.variables.argumentFor(root);
+        arg != nullptr && arg->type.pointerDepth == 0 &&
+        arg->type.isSigned && arg->type.width == sourceWidth &&
+        !ctx_.argumentType(*arg).valid()) {
+      alreadySigned = true;
+    }
+  }
+  if (alreadySigned) {
     return std::format("(({})({}))", destination, integerOperand(e.operand(0)));
   }
   return std::format("(({})({})({}))", destination, intType(sourceWidth, true),

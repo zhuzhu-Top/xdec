@@ -46,11 +46,26 @@ std::optional<VtableCallSite> matchVtableCallTarget(const il::Function& function
   if (addrExpr.op != il::ExprOp::Add) {
     return VtableCallSite{call, address, 0};  // load(obj): a slot at offset 0
   }
+  const auto isStackBase = [&](il::ExprId baseExpr) {
+    const il::Expr& b = function.expr(stripCasts(function, baseExpr));
+    if (b.op != il::ExprOp::EntryReg) {
+      return false;
+    }
+    const il::RegId reg{static_cast<uint32_t>(b.immediate)};
+    return function.registers().contains(reg) &&
+           function.registers()[reg].regClass == il::RegClass::StackPointer;
+  };
   uint64_t offset = 0;
   if (function.asConstant(addrExpr.operand(1), offset)) {
+    if (isStackBase(addrExpr.operand(0)) || offset >= 0x100000) {
+      return std::nullopt;
+    }
     return VtableCallSite{call, addrExpr.operand(0), offset};
   }
   if (function.asConstant(addrExpr.operand(0), offset)) {
+    if (isStackBase(addrExpr.operand(1)) || offset >= 0x100000) {
+      return std::nullopt;
+    }
     return VtableCallSite{call, addrExpr.operand(1), offset};
   }
   return std::nullopt;  // neither side of the address is a constant offset

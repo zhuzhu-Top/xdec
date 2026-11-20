@@ -432,4 +432,134 @@ TEST_CASE("a loop-carried flags phi's back edge reaches ssa without growing fore
   CHECK(b.function.blockCount() == 4);
 }
 
+TEST_CASE("64-bit register phis with 32-bit inputs and truncated uses narrow to 32-bit",
+          "[passes][ssaopt]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId left = b.block(0x2000);
+  const BlockId right = b.block(0x3000);
+  const BlockId join = b.block(0x4000);
+
+  const ExprId cond =
+      b.function.binary(ExprOp::CmpNe, b.read(entry, b.reg("x0"), 0x1000), b.i64(0));
+  b.function.appendCondBranch(entry, 0x1004, cond, left, right);
+  b.function.appendWriteReg(left, 0x2000, b.reg("w1"),
+                            b.function.constant(Type::integer(32), 0x10));
+  b.function.appendBranch(left, 0x2004, join);
+  const il::ValueId loaded32 =
+      b.function.appendLoad(right, 0x3000, Type::integer(32), b.i64(0x9000));
+  b.function.appendWriteReg(right, 0x3004, b.reg("w1"),
+                            b.function.valueRef(loaded32));
+  b.function.appendBranch(right, 0x3008, join);
+
+  const ExprId w1AtJoin = b.read(join, b.reg("w1"), 0x4000);
+  const ExprId sum32 =
+      b.function.binary(ExprOp::Add, w1AtJoin, b.function.constant(Type::integer(32), 4));
+  b.function.appendStore(join, 0x4004, Type::integer(32), b.i64(0x9004), sum32);
+  b.function.appendReturn(join, 0x4008);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  REQUIRE(phiCount(b.function, join) == 1);
+  const il::OpId phiId = b.function.block(join).ops.front();
+  CHECK(b.function.op(phiId).type == Type::integer(32));
+}
+
+TEST_CASE("pure phi-only relay trampolines elide cleanly across predecessors",
+          "[passes][ssaopt]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  const BlockId left = b.block(0x2000);
+  const BlockId right = b.block(0x3000);
+  const BlockId relay = b.block(0x4000);
+  const BlockId alt = b.block(0x5000);
+  const BlockId join = b.block(0x6000);
+
+  const ExprId cond0 =
+      b.function.binary(ExprOp::CmpNe, b.read(entry, b.reg("x0"), 0x1000), b.i64(0));
+  b.function.appendCondBranch(entry, 0x1004, cond0, left, alt);
+
+  const ExprId cond1 =
+      b.function.binary(ExprOp::CmpNe, b.read(left, b.reg("x1"), 0x2000), b.i64(0));
+  b.function.appendWriteReg(left, 0x2004, b.reg("x2"),
+                            b.read(left, b.reg("x3"), 0x2008));
+  b.function.appendCondBranch(left, 0x200c, cond1, right, relay);
+
+  b.function.appendWriteReg(right, 0x3000, b.reg("x2"),
+                            b.read(right, b.reg("x4"), 0x3004));
+  b.function.appendBranch(right, 0x3008, relay);
+  b.function.appendWriteReg(relay, 0x4000, b.reg("x6"), b.i64(0x60));
+  b.function.appendBranch(relay, 0x4004, join);
+
+  b.function.appendWriteReg(alt, 0x5000, b.reg("x2"),
+                            b.read(alt, b.reg("x5"), 0x5004));
+  b.function.appendWriteReg(alt, 0x5004, b.reg("x6"), b.i64(0x70));
+  b.function.appendBranch(alt, 0x5008, join);
+
+  b.function.appendStore(join, 0x6000, Type::integer(64), b.i64(0x9000),
+                         b.read(join, b.reg("x2"), 0x6004));
+  b.function.appendStore(join, 0x6008, Type::integer(64), b.i64(0x9008),
+                         b.read(join, b.reg("x6"), 0x600c));
+  b.function.appendReturn(join, 0x6010);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+
+  INFO(il::print(b.function));
+  // `relay` should have been bypassed so `join` receives directly from
+  // `left`, `right`, and `alt`.
+  CHECK(b.function.block(relay).predecessors.empty());
+  CHECK(b.function.block(join).predecessors.size() == 3);
+}
+
+TEST_CASE("dead WriteReg on caller-saved vector register before a Call is eliminated",
+          "[passes][ssaopt]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  // Write q0 with no ReadReg before a Call that clobbers q0.
+  const il::OpId deadWrite = b.function.appendWriteReg(
+      entry, 0x1000, b.reg("q0"), b.function.constant(Type::integer(128), 0x1234));
+  b.function.appendCall(entry, 0x1004, b.i64(0x9000));
+  b.function.appendReturn(entry, 0x1008);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+  const auto& ops = b.function.block(entry).ops;
+  CHECK(std::find(ops.begin(), ops.end(), deadWrite) == ops.end());
+}
+
+TEST_CASE("FlagCond over Select from ccmp/ccmn folds without leaving flagcond stubs",
+          "[passes][ssaopt]") {
+  Builder b;
+  const BlockId entry = b.block(0x1000);
+  // Mirrors ARM64 `cmp w0, #0xe3c; ccmp w0, #0xecd, #4, ne; cset w1, eq`.
+  const ExprId x0 = b.read(entry, b.reg("x0"), 0x1000);
+  const ExprId w0 = b.function.cast(ExprOp::Trunc, Type::integer(32), x0);
+  const std::array<ExprId, 2> firstOps{w0, b.function.constant(Type::integer(32), 0xe3c)};
+  const ExprId firstFlags = b.function.flagDef(il::FlagOp::Sub, 32, firstOps);
+  const ExprId neCond = b.function.flagCondition(firstFlags, il::ConditionCode::NotEqual);
+  const std::array<ExprId, 2> secondOps{w0, b.function.constant(Type::integer(32), 0xecd)};
+  const ExprId secondFlags = b.function.flagDef(il::FlagOp::Sub, 32, secondOps);
+  const std::array<ExprId, 1> constOps{b.function.constant(Type::integer(32), 4)};
+  const ExprId constFlags = b.function.flagDef(il::FlagOp::Const, 32, constOps);
+  const ExprId selectedFlags = b.function.select(neCond, secondFlags, constFlags);
+  const ExprId eqCond = b.function.flagCondition(selectedFlags, il::ConditionCode::Equal);
+  const ExprId cset = b.function.select(eqCond, b.i64(1), b.i64(0));
+  b.function.appendStore(entry, 0x1004, Type::integer(64), b.i64(0x9000), cset);
+  b.function.appendReturn(entry, 0x1008);
+
+  b.atCfg();
+  runToSsa(b.function);
+  REQUIRE(verifiesCleanAt(b.function, Maturity::Ssa));
+  const std::string printed = il::print(b.function);
+  INFO(printed);
+  CHECK(printed.find("flagcond") == std::string::npos);
+  CHECK(printed.find("0xe3c") != std::string::npos);
+  CHECK(printed.find("0xecd") != std::string::npos);
+}
+
 }  // namespace

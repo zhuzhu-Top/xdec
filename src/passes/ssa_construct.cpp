@@ -3,8 +3,10 @@
 #include "xdec/passes/ssa_construct.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <map>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -61,6 +63,12 @@ class SsaBuilder {
     }
     if (const il::RegId x0 = function_.registers().find("x0"); x0.valid()) {
       resultRoots_.push_back(function_.registers().rootOf(x0));
+    }
+    for (const il::RegId root : roots_) {
+      if (function_.registers()[root].regClass == il::RegClass::StackPointer) {
+        spRoot_ = root;
+        break;
+      }
     }
   }
 
@@ -214,6 +222,7 @@ class SsaBuilder {
       pushVersion(site.root, function_.valueRef(phiValues_[{blockId, site.root}]));
     }
 
+    std::array<std::optional<il::Function::CallFpArg>, 8> recentFpArgs;
     for (const il::OpId opId : function_.block(blockId).ops) {
       const il::Op& op = function_.op(opId);
       switch (op.code) {
@@ -226,8 +235,21 @@ class SsaBuilder {
           break;
         }
         case il::OpCode::WriteReg: {
-          const il::RegId root = function_.registers().rootOf(op.reg());
+          const il::RegId reg = op.reg();
+          const il::RegId root = function_.registers().rootOf(reg);
           if (!versions_.contains(root)) {
+            if (const auto slot = fpArgSlot(reg); slot.has_value()) {
+              const auto operands = function_.operands(op);
+              const il::RegisterInfo& regInfo = function_.registers()[reg];
+              if (!operands.empty() &&
+                  (!regInfo.isSubRegister() || regInfo.zeroExtendsParent) &&
+                  (regInfo.bits == 32 || regInfo.bits == 64)) {
+                recentFpArgs[*slot] =
+                    il::Function::CallFpArg{subst_.apply(function_, operands[0]), regInfo.bits};
+              } else {
+                recentFpArgs[*slot].reset();
+              }
+            }
             break;
           }
           // The written expression becomes the register's new version, merged
@@ -253,6 +275,20 @@ class SsaBuilder {
             }
           }
           callArgs_[opId] = std::move(args);
+          if (!preserving) {
+            for (unsigned slot = 0; slot < 8; ++slot) {
+              if (recentFpArgs[slot].has_value()) {
+                function_.setCallFpArg(opId, slot, recentFpArgs[slot]->value,
+                                        recentFpArgs[slot]->bits);
+              }
+            }
+            recentFpArgs = {};
+          }
+          if (spRoot_.valid() && versions_.contains(spRoot_)) {
+            if (const auto delta = evalSpDelta(current(spRoot_))) {
+              function_.setCallSpDelta(opId, *delta);
+            }
+          }
           for (const il::RegId root : roots_) {
             if (!clobbers(root)) {
               continue;
@@ -452,9 +488,81 @@ class SsaBuilder {
     }
   }
 
+  [[nodiscard]] std::optional<unsigned> fpArgSlot(il::RegId reg) const {
+    const il::RegId root = function_.registers().rootOf(reg);
+    const il::RegisterInfo& rootInfo = function_.registers()[root];
+    if (rootInfo.regClass != il::RegClass::Vector &&
+        rootInfo.regClass != il::RegClass::Float) {
+      return std::nullopt;
+    }
+    const std::string_view rootName = function_.registers().nameOf(root);
+    if (rootName.size() == 2 &&
+        (rootName[0] == 'q' || rootName[0] == 'v' || rootName[0] == 'd') &&
+        rootName[1] >= '0' && rootName[1] <= '7') {
+      return static_cast<unsigned>(rootName[1] - '0');
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] std::optional<int64_t> evalSpDelta(il::ExprId exprId, unsigned depth = 0) const {
+    if (!exprId.valid() || depth > 16) {
+      return std::nullopt;
+    }
+    const il::Expr& expr = function_.expr(exprId);
+    if (expr.op == il::ExprOp::EntryReg &&
+        il::RegId{static_cast<uint32_t>(expr.immediate)} == spRoot_) {
+      return 0;
+    }
+    if (expr.op == il::ExprOp::Value) {
+      const il::ValueId val{static_cast<uint32_t>(expr.immediate)};
+      if (!function_.hasValue(val)) {
+        return std::nullopt;
+      }
+      const il::OpId defId = function_.value(val).definition;
+      if (defId.valid() && function_.hasOp(defId) &&
+          function_.op(defId).code == il::OpCode::Phi) {
+        std::optional<int64_t> agreed;
+        for (const il::ExprId in : function_.operands(function_.op(defId))) {
+          if (function_.expr(in).op == il::ExprOp::Value &&
+              il::ValueId{static_cast<uint32_t>(function_.expr(in).immediate)} == val) {
+            continue;
+          }
+          const auto d = evalSpDelta(in, depth + 1);
+          if (!d.has_value()) {
+            return std::nullopt;
+          }
+          if (!agreed.has_value()) {
+            agreed = d;
+          } else if (*agreed != *d) {
+            return std::nullopt;
+          }
+        }
+        return agreed;
+      }
+      return std::nullopt;
+    }
+    if ((expr.op == il::ExprOp::Add || expr.op == il::ExprOp::Sub) &&
+        expr.operandCount == 2) {
+      uint64_t c = 0;
+      if (function_.asConstant(expr.operands[1], c)) {
+        if (const auto base = evalSpDelta(expr.operands[0], depth + 1)) {
+          const int64_t signedC = static_cast<int64_t>(c);
+          return expr.op == il::ExprOp::Add ? (*base + signedC) : (*base - signedC);
+        }
+      }
+      if (expr.op == il::ExprOp::Add && function_.asConstant(expr.operands[0], c)) {
+        if (const auto base = evalSpDelta(expr.operands[1], depth + 1)) {
+          return *base + static_cast<int64_t>(c);
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   il::Function& function_;
   const analysis::Dominators& dominators_;
   analysis::CallNameSources callNames_;
+  il::RegId spRoot_;
   std::vector<il::RegId> roots_;
   /// Calling-convention registers, looked up by the usual names; an exotic
   /// register file simply records no arguments (emission degrades, never

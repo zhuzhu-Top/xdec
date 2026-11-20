@@ -56,7 +56,7 @@ class ImageLiteralRecovery {
   /// printable, NUL-terminated run of bytes -- including when this recovery
   /// was built with no reader at all (a pipeline with no image), which is
   /// the default and changes nothing for a caller that never had one.
-  [[nodiscard]] std::optional<ImageLiteral> at(uint64_t va) const;
+  [[nodiscard]] std::optional<ImageLiteral> at(uint64_t va, bool allowEmpty = false) const;
 
   static constexpr std::size_t kMaxLength = 4096;
 

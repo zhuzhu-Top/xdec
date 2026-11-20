@@ -44,7 +44,8 @@ struct Pred {
 /// their parent sees them, local rules per node applied to a fixpoint.
 class Algebra {
  public:
-  explicit Algebra(il::Function& function) : function_(function), pred_{function} {}
+  explicit Algebra(il::Function& function)
+      : function_(function), pred_{function}, memo_(function.exprCount()) {}
 
   struct Stats {
     std::size_t entries = 0;
@@ -56,9 +57,9 @@ class Algebra {
 
   [[nodiscard]] il::ExprId simplify(il::ExprId id, unsigned depth = 0) {
     ++stats_.entries;
-    if (const auto found = memo_.find(id); found != memo_.end()) {
+    if (id.valid() && id.index() < memo_.size() && memo_[id.index()].valid()) {
       ++stats_.memoHits;
-      return found->second;
+      return memo_[id.index()];
     }
     // Deep substituted chains outgrow any call stack: past the bound, leave
     // the node alone rather than overflow. Simplification skipped is IL kept.
@@ -84,7 +85,12 @@ class Algebra {
       // (an MBA match leaves an add; the add may reassociate).
       result = rewriteToFixpoint(result);
     }
-    memo_.emplace(id, result);
+    if (id.valid()) {
+      if (id.index() >= memo_.size()) {
+        memo_.resize(function_.exprCount());
+      }
+      memo_[id.index()] = result;
+    }
     return result;
   }
 
@@ -176,6 +182,9 @@ class Algebra {
 
     if (const il::ExprId mba = matchMbaAdd(function_, expr); mba.valid()) {
       return mba;
+    }
+    if (const il::ExprId msbMba = matchMbaMsbSplitAdd(function_, expr); msbMba.valid()) {
+      return msbMba;
     }
     // MBA inverted: ~x + 1 → -x.
     if (pred_.isConst(y, 1) && function_.expr(x).op == il::ExprOp::Not) {
@@ -518,25 +527,71 @@ class Algebra {
     const il::ExprId source = expr.operands[0];
     const il::Type sourceType = function_.expr(source).type;
     switch (expr.op) {
-      case il::ExprOp::ZExt:
-      case il::ExprOp::SExt:
+      case il::ExprOp::ZExt: {
         // Widening from the same width is no cast at all.
         if (sourceType == expr.type) {
           return source;
         }
-        break;
-      case il::ExprOp::Trunc:
-        if (sourceType == expr.type) {
-          return source;
-        }
-        // trunc(zext(x)) → x when the round trip is width-exact.
+        // zext(zext(x)) → zext(x): widening twice is one widen.
         if (function_.expr(source).op == il::ExprOp::ZExt) {
           const il::ExprId inner = function_.expr(source).operands[0];
-          if (function_.expr(inner).type == expr.type) {
-            return inner;
+          const il::Type innerType = function_.expr(inner).type;
+          if (innerType.isScalarInteger() && innerType.bits() <= sourceType.bits() &&
+              sourceType.bits() <= expr.type.bits()) {
+            return function_.cast(il::ExprOp::ZExt, expr.type, inner);
           }
         }
         break;
+      }
+      case il::ExprOp::SExt: {
+        if (sourceType == expr.type) {
+          return source;
+        }
+        // sext(sext(x)) → sext(x): repeated sign extension is one sign extend.
+        if (function_.expr(source).op == il::ExprOp::SExt) {
+          const il::ExprId inner = function_.expr(source).operands[0];
+          const il::Type innerType = function_.expr(inner).type;
+          if (innerType.isScalarInteger() && innerType.bits() <= sourceType.bits() &&
+              sourceType.bits() <= expr.type.bits()) {
+            return function_.cast(il::ExprOp::SExt, expr.type, inner);
+          }
+        }
+        break;
+      }
+      case il::ExprOp::Trunc: {
+        if (sourceType == expr.type) {
+          return source;
+        }
+        const il::Expr& srcExpr = function_.expr(source);
+        // trunc(zext(x)) / trunc(sext(x)): both extensions preserve bits
+        // 0..N-1 unchanged, so truncating back to W <= N drops the extension
+        // outright (returning x directly when W == N).
+        if (srcExpr.op == il::ExprOp::ZExt || srcExpr.op == il::ExprOp::SExt) {
+          const il::ExprId inner = srcExpr.operands[0];
+          const il::Type innerType = function_.expr(inner).type;
+          if (innerType.isScalarInteger() && sourceType.isScalarInteger() &&
+              sourceType.bits() >= innerType.bits() && expr.type.isScalarInteger()) {
+            if (expr.type == innerType) {
+              return inner;
+            }
+            if (expr.type.bits() < innerType.bits()) {
+              return function_.cast(il::ExprOp::Trunc, expr.type, inner);
+            }
+            return function_.cast(srcExpr.op, expr.type, inner);
+          }
+        }
+        // trunc(trunc(x)) → trunc(x) when narrowing monotonically.
+        if (srcExpr.op == il::ExprOp::Trunc) {
+          const il::ExprId inner = srcExpr.operands[0];
+          const il::Type innerType = function_.expr(inner).type;
+          if (innerType.isScalarInteger() && expr.type.isScalarInteger() &&
+              expr.type.bits() <= sourceType.bits() &&
+              sourceType.bits() <= innerType.bits()) {
+            return function_.cast(il::ExprOp::Trunc, expr.type, inner);
+          }
+        }
+        break;
+      }
       case il::ExprOp::Extract:
         // extract(x, 0) at a narrower width is a trunc by another name, and
         // naming it so lets the trunc rules above see it.
@@ -557,7 +612,7 @@ class Algebra {
   il::Function& function_;
   Pred pred_;
   Stats stats_;
-  std::unordered_map<il::ExprId, il::ExprId> memo_;
+  std::vector<il::ExprId> memo_;
 };
 
 }  // namespace

@@ -27,6 +27,10 @@ include(XdecWarnings)
 
 add_subdirectory(src)
 
+if(XDEC_BUILD_DECOMPILE)
+  add_subdirectory(plugins)
+endif()
+
 if(XDEC_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)

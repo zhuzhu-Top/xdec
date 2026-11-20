@@ -362,4 +362,17 @@ TEST_CASE("a select nested in a larger value stays a ternary", "[emit][print]") 
   CHECK(contains(text, "var_10 = (arg2 ^ ((arg1 == 0x0) ? arg3 : 0x0));"));
 }
 
+TEST_CASE("a void function with an undef return operand prints bare return", "[emit][print]") {
+  Fixture f;
+  f.function.appendCall(f.entry, 0x1000, f.i64(0x9000), Type::integer(64));
+  const il::OpId ret = f.function.appendReturn(f.entry, 0x1004);
+  f.function.setOperands(ret, std::vector<ExprId>{f.function.undefined(Type::integer(64))});
+
+  const std::string text = f.emit();
+  INFO(text);
+  CHECK(contains(text, "void sub_1000("));
+  CHECK(contains(text, "  return;\n"));
+  CHECK_FALSE(contains(text, "return /*undef*/"));
+}
+
 }  // namespace

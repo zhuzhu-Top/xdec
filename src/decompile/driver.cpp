@@ -364,15 +364,21 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
       };
       liftCoverage = &dynamicCoverage;
     }
+    const spec::LiftRange liftFence =
+        (options.fence.active() && options.fence.enforce)
+            ? spec::LiftRange{options.fence.start, options.fence.end}
+            : spec::LiftRange{};
     auto lifted =
-        spec::liftFunction(engine, reader, entry, options.memory, liftCoverage);
+        spec::liftFunction(engine, reader, entry, options.memory, liftCoverage, liftFence,
+                           options.isTailCall);
     if (!lifted) {
       return std::move(lifted).takeUnexpected();
     }
     if (entries.size() > 1) {
       const std::vector<uint64_t> extra(entries.begin() + 1, entries.end());
       auto more = spec::liftBlocksInto(*lifted->function, engine, reader, extra,
-                                       options.memory, liftCoverage);
+                                       options.memory, liftCoverage, liftFence,
+                                       options.isTailCall);
       if (!more) {
         return std::move(more).takeUnexpected();
       }

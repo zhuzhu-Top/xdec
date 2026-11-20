@@ -207,13 +207,89 @@ struct timeval {
 };
 
 void *_malloc(size_t size);
+void *_calloc(size_t count, size_t size);
+void *_realloc(void *ptr, size_t size);
 void _free(void *ptr);
+void _bzero(void *s, size_t n);
+void *_memset(void *b, int c, size_t len);
+void *_memcpy(void *dst, const void *src, size_t n);
+void *_memmove(void *dst, const void *src, size_t len);
 void *___memcpy_chk(void *dst, const void *src, size_t len, size_t dstlen);
+size_t _strlen(const char *s);
+int _strcmp(const char *s1, const char *s2);
+int _strncmp(const char *s1, const char *s2, size_t n);
+char *_strcpy(char *dst, const char *src);
+char *_strncpy(char *dst, const char *src, size_t len);
+char *_strchr(const char *s, int c);
+char *_strstr(const char *haystack, const char *needle);
+char *_strdup(const char *s1);
+int _snprintf(char *str, size_t size, const char *format, ...);
 int _sscanf(const char *str, const char *format, ...);
 int _gettimeofday(struct timeval *tv, void *tz);
 time_t _time(time_t *out);
 unsigned int _arc4random(void);
 void *_signal(int sig, void *handler);
+
+int _sysctl(int *name, unsigned int namelen, void *oldp, size_t *oldlenp, void *newp,
+            size_t newlen);
+int _sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+int _uname(void *name);
+int _getifaddrs(void **ifap);
+void _freeifaddrs(void *ifa);
+int _getattrlist(const char *path, void *attrList, void *attrBuf, size_t attrBufSize,
+                 unsigned int options);
+uint32_t _inet_addr(const char *cp);
+const char *_inet_ntop(int af, const void *src, char *dst, uint32_t size);
+
+void _dispatch_once(void *predicate, void *block);
+void _dispatch_sync(void *queue, void *block);
+void _dispatch_async(void *queue, void *block);
+
+mach_port_t _mig_get_reply_port(void);
+void _mig_put_reply_port(mach_port_t port);
+void _mig_dealloc_reply_port(mach_port_t port);
+kern_return_t _vm_read_overwrite(mach_port_t target_task, vm_address_t address,
+                                 vm_size_t size, vm_address_t data, vm_size_t *outsize);
+
+void *_objc_alloc(void *cls);
+void *_objc_alloc_init(void *cls);
+void *_objc_getClass(const char *name);
+void *_objc_lookUpClass(const char *name);
+void *_objc_getMetaClass(const char *name);
+void *_objc_msgSendSuper2(void *super, void *op, ...);
+void *_objc_retain(void *obj);
+void _objc_release(void *obj);
+void *_objc_autorelease(void *obj);
+void *_objc_retainAutorelease(void *obj);
+void *_objc_retainAutoreleasedReturnValue(void *obj);
+void *_objc_autoreleaseReturnValue(void *obj);
+void *_objc_unsafeClaimAutoreleasedReturnValue(void *obj);
+void *_objc_retainBlock(void *block);
+void _objc_storeStrong(void **location, void *obj);
+void *_objc_loadWeakRetained(void **location);
+void _objc_destroyWeak(void **location);
+void *_objc_initWeak(void **location, void *val);
+void *_objc_copyWeak(void **to, void **from);
+void *_objc_moveWeak(void **to, void **from);
+void _objc_enumerationMutation(void *obj);
+void _objc_exception_throw(void *exception);
+void *_objc_begin_catch(void *exc_buf);
+void _objc_end_catch(void);
+void _objc_sync_enter(void *obj);
+void _objc_sync_exit(void *obj);
+
+void __ZdlPv(void *ptr);
+void __ZdlPvm(void *ptr, size_t size);
+void *__Znwm(size_t size);
+int ___cxa_guard_acquire(void *guard);
+void ___cxa_guard_release(void *guard);
+void __Block_object_assign(void *dst, const void *src, int flags);
+void __Block_object_dispose(const void *object, int flags);
+
+CFDictionaryRef _CFNetworkCopySystemProxySettings(void);
+const void *_CFDictionaryGetValue(CFDictionaryRef theDict, const void *key);
+void *_CNCopySupportedInterfaces(void);
+CFDictionaryRef _CNCopyCurrentNetworkInfo(CFStringRef interfaceName);
 
 int _audit_token_to_au32(const void *atoken, uid_t *auidp, uid_t *euidp, gid_t *egidp,
                          uid_t *ruidp, gid_t *rgidp, pid_t *pidp, int *asidp, void *tidp);

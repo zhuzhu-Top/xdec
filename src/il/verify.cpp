@@ -447,11 +447,13 @@ class Verifier {
         break;
       case OpCode::Call:
         // Below Ssa a call carries only its target; SSA construction appends
-        // the calling-convention argument values (target plus up to eight).
+        // the calling-convention argument values (target plus up to eight), and
+        // `vars` may append outgoing stack-passed arguments past those eight.
         if (atLeast(Maturity::Ssa)) {
-          if (operands.empty() || operands.size() > 9) {
-            error(std::format("op #{} call has {} operands, want 1..9", opId.index(),
-                              operands.size()),
+          const std::size_t maxOperands = atLeast(Maturity::Vars) ? 64 : 9;
+          if (operands.empty() || operands.size() > maxOperands) {
+            error(std::format("op #{} call has {} operands, want 1..{}", opId.index(),
+                              operands.size(), maxOperands),
                   op.va);
           }
         } else {

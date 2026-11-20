@@ -16,6 +16,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -209,6 +210,11 @@ struct StructuredFunction {
   std::vector<std::string_view> matchedPatterns;
 };
 
+/// Post-structuring AST transformation hook (run at the end of
+/// `structureFunction`, before final label collection). Plugins can register
+/// specialized statement-level rewrites here without modifying core `structure.cpp`.
+using AstTransformFn = std::function<void(const il::Function&, StructuredFunction&)>;
+
 /// Track B / J1 (docs/18-architecture-optimization-plan.md §5.2): `switchFor`'s
 /// two-live-target table dispatch normally collapses straight to `if (cond)
 /// A else B` (see analysis::matchDispatchValues) -- the right call for an
@@ -250,6 +256,7 @@ struct StructureOptions {
   /// without a unit test standing in; the recovery itself is unconditional
   /// now, so that field is gone and `minRegionSites`'s defer only ever
   /// protects a region that actually has a `sharedTail` to protect.
+  std::vector<AstTransformFn> astTransforms;
 };
 
 /// Structures the whole function. The analyses must be computed from the

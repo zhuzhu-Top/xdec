@@ -13,6 +13,7 @@
 #include "il/il_test_support.h"
 #include "xdec/analysis/dominators.h"
 #include "xdec/analysis/loops.h"
+#include "xdec/analysis/noreturn.h"
 #include "xdec/analysis/scc.h"
 #include "xdec/il/function.h"
 
@@ -269,6 +270,20 @@ TEST_CASE("unreachable blocks are outside every judgement", "[analysis][dom]") {
   CHECK(dom.dominates(dead, dead));       // only itself
   CHECK_FALSE(dom.dominates(dead, a));    // and nothing else
   CHECK(dom.depth(dead) == -1);
+}
+
+TEST_CASE("noreturn symbol matching handles both ELF and Mach-O underscore mangling",
+          "[analysis][noreturn]") {
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("__stack_chk_fail"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("___stack_chk_fail"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("abort"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("_abort"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("_exit"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("__assert_rtn"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("___assert_rtn"));
+  CHECK(xdec::analysis::isKnownNoreturnSymbol("_objc_exception_throw"));
+  CHECK_FALSE(xdec::analysis::isKnownNoreturnSymbol("_malloc"));
+  CHECK_FALSE(xdec::analysis::isKnownNoreturnSymbol("memcpy"));
 }
 
 }  // namespace

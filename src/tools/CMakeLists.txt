@@ -2,10 +2,12 @@ xdec_add_executable(xdec
   SOURCES
     main.cpp
     cli/cmd_exec.cpp
+    cli/cmd_explore.cpp
     cli/cmd_image.cpp
     cli/cmd_lift.cpp
     cli/cmd_misc.cpp
     cli/cmd_pipeline.cpp
+    cli/cmd_serve.cpp
     cli/cmd_spec.cpp
     cli/cmd_types.cpp
     cli/common.cpp

@@ -27,6 +27,11 @@ namespace xdec::binary {
 class FileBuffer {
  public:
   FileBuffer() = default;
+  ~FileBuffer();
+  FileBuffer(FileBuffer&&) noexcept;
+  FileBuffer& operator=(FileBuffer&&) noexcept;
+  FileBuffer(const FileBuffer&) = delete;
+  FileBuffer& operator=(const FileBuffer&) = delete;
 
   static Result<FileBuffer> fromFile(const std::filesystem::path& path);
 
@@ -35,13 +40,15 @@ class FileBuffer {
   static FileBuffer fromBytes(std::span<const std::byte> bytes);
 
   [[nodiscard]] std::span<const std::byte> bytes() const noexcept {
-    return std::span<const std::byte>{data_.get(), size_};
+    return std::span<const std::byte>{view_, size_};
   }
   [[nodiscard]] std::size_t size() const noexcept { return size_; }
   [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
 
  private:
-  std::unique_ptr<std::byte[]> data_;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+  const std::byte* view_ = nullptr;
   std::size_t size_ = 0;
 };
 

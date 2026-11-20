@@ -24,15 +24,15 @@ namespace {
 /// now"; a nested walk that reaches it still emits it plainly and moves on.
 class ScopedHeader {
  public:
-  ScopedHeader(std::set<il::BlockId>& set, il::BlockId block) : set_(set), block_(block) {
-    set_.insert(block_);
+  ScopedHeader(DenseBlockSet& set, il::BlockId block) : set_(set), block_(block) {
+    (void)set_.insert(block_);
   }
   ~ScopedHeader() { set_.erase(block_); }
   ScopedHeader(const ScopedHeader&) = delete;
   ScopedHeader& operator=(const ScopedHeader&) = delete;
 
  private:
-  std::set<il::BlockId>& set_;
+  DenseBlockSet& set_;
   il::BlockId block_;
 };
 
@@ -43,6 +43,7 @@ namespace {
 // visits each of its blocks once), but bounded so a function whose branches
 // mostly fail to structure cannot cascade into unbounded backtracking.
 constexpr std::size_t kBudgetPerBlock = 200;
+constexpr std::size_t kMaxSpeculationBudget = 1'000'000;
 }  // namespace
 
 namespace {
@@ -567,8 +568,14 @@ Structurizer::Structurizer(const il::Function& function,
     : function_(function),
       dominators_(dominators),
       postDominators_(postDominators),
+      emitted_(function.blockCount()),
+      gotoTargets_(function.blockCount()),
+      inProgressHeaders_(function.blockCount()),
+      regionEpoch_(function.blockCount(), 0),
       options_(options),
-      budget_(static_cast<std::size_t>(function.blockCount()) * kBudgetPerBlock) {
+      budget_(std::min<std::size_t>(
+          static_cast<std::size_t>(function.blockCount()) * kBudgetPerBlock,
+          kMaxSpeculationBudget)) {
   for (const analysis::NaturalLoop& loop : loops) {
     loopByHeader_[loop.header] = &loop;
   }
@@ -691,10 +698,25 @@ StructuredFunction Structurizer::run() {
   // that turned out to just restate the fallthrough.
   elideFallthroughGotos(result.root, il::BlockId{});
 
-  std::set<il::BlockId> labeled;
-  collectReferences(result.root.get(), labeled);
-  result.labeled.assign(labeled.begin(), labeled.end());
+  // Collect labels before running optional AST hooks, then refresh them if any
+  // hook rewrote statements or eliminated goto targets.
+  {
+    std::set<il::BlockId> labeled;
+    collectReferences(result.root.get(), labeled);
+    result.labeled.assign(labeled.begin(), labeled.end());
+  }
   result.matchedPatterns = std::move(matchedPatterns_);
+
+  for (const AstTransformFn& transform : options_.astTransforms) {
+    if (transform) {
+      transform(function_, result);
+    }
+  }
+  if (!options_.astTransforms.empty()) {
+    std::set<il::BlockId> labeled;
+    collectReferences(result.root.get(), labeled);
+    result.labeled.assign(labeled.begin(), labeled.end());
+  }
   return result;
 }
 
@@ -2433,12 +2455,12 @@ bool Structurizer::hasPhis(il::BlockId blockId) const {
 }
 
 void Structurizer::mark(il::BlockId blockId) {
-  emitted_.insert(blockId);
+  (void)emitted_.insert(blockId);
   trail_.push_back(blockId);
 }
 
 void Structurizer::addGotoTarget(il::BlockId block) {
-  if (gotoTargets_.insert(block).second) {
+  if (gotoTargets_.insert(block)) {
     gotoTrail_.push_back(block);
   }
 }
@@ -2468,17 +2490,25 @@ void Structurizer::rollback(std::size_t trailSnapshot, std::size_t gotoSnapshot)
 }
 
 bool Structurizer::regionClosed(std::size_t snapshot, il::BlockId head) const {
+  if (++currentEpoch_ == 0) {
+    std::fill(regionEpoch_.begin(), regionEpoch_.end(), 0);
+    currentEpoch_ = 1;
+  }
+  const uint32_t epoch = currentEpoch_;
+  for (std::size_t index = snapshot; index < trail_.size(); ++index) {
+    const il::BlockId member = trail_[index];
+    if (member.valid() && member.index() < regionEpoch_.size()) {
+      regionEpoch_[member.index()] = epoch;
+    }
+  }
   for (std::size_t index = snapshot; index < trail_.size(); ++index) {
     const il::BlockId member = trail_[index];
     if (member == head) {
       continue;
     }
     for (const il::BlockId pred : function_.block(member).predecessors) {
-      bool inside = pred == head;
-      for (std::size_t other = snapshot; other < trail_.size() && !inside; ++other) {
-        inside = trail_[other] == pred;
-      }
-      if (!inside) {
+      if (pred != head && (!pred.valid() || pred.index() >= regionEpoch_.size() ||
+                           regionEpoch_[pred.index()] != epoch)) {
         return false;
       }
     }

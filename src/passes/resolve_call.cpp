@@ -2,15 +2,18 @@
 // (see the header for why those are the only two outcomes).
 #include "xdec/passes/resolve_call.h"
 
+#include <algorithm>
 #include <format>
 
 #include <optional>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xdec/analysis/call_target.h"
 #include "xdec/analysis/image_eval.h"
+#include "xdec/analysis/noreturn.h"
 #include "xdec/binary/cache_pointer.h"
 #include "xdec/il/function.h"
 
@@ -69,10 +72,11 @@ class ResolveCall final : public pass::FunctionPass {
           pass::PassInfo info;
           info.name = "resolve-call";
           info.level = il::Maturity::Ssa;
-          // Ssa, not Resolved: this pass says nothing about the CFG, and
-          // resolve-indirect is what earns the level crossing.
+          // Ssa, not Resolved: this pass says nothing about indirect branches,
+          // though sealing a fall-through after a known-noreturn call alters CFG edges.
           info.produces = il::Maturity::Ssa;
           info.requirements = {"ssa-construct"};
+          info.invalidates = {"dominators", "scc"};
           return info;
         }()) {}
 
@@ -97,8 +101,16 @@ class ResolveCall final : public pass::FunctionPass {
     }
 
     bool changed = false;
+    struct NoreturnSeal {
+      il::BlockId block;
+      uint64_t callVa = 0;
+    };
+    std::vector<NoreturnSeal> toSeal;
+
     for (const il::BlockId blockId : function.blockHandles()) {
-      for (const il::OpId opId : function.block(blockId).ops) {
+      const auto& ops = function.block(blockId).ops;
+      for (std::size_t pos = 0; pos < ops.size(); ++pos) {
+        const il::OpId opId = ops[pos];
         const il::Op& op = function.op(opId);
         if (op.code != il::OpCode::Call) {
           continue;
@@ -107,6 +119,7 @@ class ResolveCall final : public pass::FunctionPass {
         if (operands.empty()) {
           continue;
         }
+        bool isNoreturn = false;
         uint64_t direct = 0;
         if (function.asConstant(operands[0], direct)) {
           // Already a constant -- but not necessarily one this pass (or
@@ -121,22 +134,45 @@ class ResolveCall final : public pass::FunctionPass {
             std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
             rewritten[0] = function.constant(function.expr(operands[0]).type, decoded);
             function.setOperands(opId, rewritten);
+            direct = decoded;
             changed = true;
           }
-          continue;  // already a direct call; nothing further to prove
+          if (image != nullptr && analysis::isNoreturnCallTarget(direct, *image, facts)) {
+            isNoreturn = true;
+          } else {
+            const pass::SymbolName sym = context.nameAt(direct);
+            isNoreturn = !sym.name.empty() && analysis::isKnownNoreturnSymbol(sym.name);
+          }
+        } else {
+          const auto result = handle(function, eval, facts, opId);
+          changed |= result.changed;
+          isNoreturn = result.isNoreturn;
         }
-        changed |= handle(function, eval, facts, opId);
+        if (isNoreturn && canSealFallthrough(function, blockId, pos)) {
+          toSeal.push_back(NoreturnSeal{blockId, function.op(opId).va});
+          break;
+        }
       }
+    }
+    if (!toSeal.empty()) {
+      sealNoreturnBlocks(function, toSeal);
+      changed = true;
     }
     return changed;
   }
 
  private:
+  struct HandleResult {
+    bool changed = false;
+    bool isNoreturn = false;
+  };
+
   /// One call: prove it, or describe it. Returns whether the IL changed, which
   /// a note does not count as — notes carry no meaning for any other pass, so
   /// reporting one as a change would spin a fixpoint loop over nothing.
-  static bool handle(il::Function& function, std::optional<analysis::ImageEval>& eval,
-                     const MemoryFacts& facts, il::OpId opId) {
+  static HandleResult handle(il::Function& function,
+                             std::optional<analysis::ImageEval>& eval,
+                             const MemoryFacts& facts, il::OpId opId) {
     const auto operands = function.operands(function.op(opId));
     const std::vector<il::ExprId> arguments(operands.begin(), operands.end());
     const il::ExprId target = arguments[0];
@@ -151,12 +187,76 @@ class ResolveCall final : public pass::FunctionPass {
       // hand-written code from an obfuscator's dispatch, that is the
       // interesting part.
       describe(function, opId, "call target proved constant from read-only memory");
-      return true;
+      const auto slot = slotFacts(facts, analysis::describeCallTarget(function, target));
+      const bool noreturn = !slot.loader.importName.empty() &&
+                            analysis::isKnownNoreturnSymbol(slot.loader.importName);
+      return {true, noreturn};
     }
 
     const analysis::CallTargetShape shape = analysis::describeCallTarget(function, target);
-    describe(function, opId, analysis::describeShape(shape, slotFacts(facts, shape)));
-    return false;
+    const analysis::TargetSlotFacts slot = slotFacts(facts, shape);
+    describe(function, opId, analysis::describeShape(shape, slot));
+    const bool noreturn = !slot.loader.importName.empty() &&
+                          analysis::isKnownNoreturnSymbol(slot.loader.importName);
+    return {false, noreturn};
+  }
+
+  [[nodiscard]] static bool canSealFallthrough(const il::Function& function,
+                                               il::BlockId blockId,
+                                               std::size_t callPos) {
+    const auto& ops = function.block(blockId).ops;
+    if (ops.empty() || callPos + 1 >= ops.size()) {
+      return false;
+    }
+    const il::Op& term = function.op(ops.back());
+    if (term.code != il::OpCode::Branch && term.code != il::OpCode::CondBranch) {
+      return false;
+    }
+    for (std::size_t idx = callPos + 1; idx + 1 < ops.size(); ++idx) {
+      if (il::hasSideEffects(function.op(ops[idx]).code)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  template <class SealList>
+  static void sealNoreturnBlocks(il::Function& function, const SealList& toSeal) {
+    std::unordered_map<il::BlockId, std::vector<std::size_t>> prunedSlots;
+    for (const auto& item : toSeal) {
+      const il::OpId termId = function.block(item.block).terminator();
+      if (!termId.valid()) {
+        continue;
+      }
+      for (const il::BlockId target : function.targets(function.op(termId))) {
+        const auto& predecessors = function.block(target).predecessors;
+        for (std::size_t slot = 0; slot < predecessors.size(); ++slot) {
+          if (predecessors[slot] == item.block) {
+            prunedSlots[target].push_back(slot);
+          }
+        }
+      }
+      function.dropTerminator(item.block);
+      (void)function.appendUnreachable(item.block, item.callVa);
+    }
+    for (auto& [target, slots] : prunedSlots) {
+      std::sort(slots.begin(), slots.end(), std::greater<std::size_t>{});
+      slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+      for (const il::OpId opId : function.block(target).ops) {
+        if (function.op(opId).code != il::OpCode::Phi) {
+          break;
+        }
+        const auto operands = function.operands(function.op(opId));
+        std::vector<il::ExprId> pruned(operands.begin(), operands.end());
+        for (const std::size_t slot : slots) {
+          if (slot < pruned.size()) {
+            pruned.erase(pruned.begin() + static_cast<std::ptrdiff_t>(slot));
+          }
+        }
+        function.setOperands(opId, pruned);
+      }
+    }
+    function.rebuildEdges();
   }
 
   /// Adds this pass's account of the target to whatever an earlier pass already

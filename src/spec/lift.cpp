@@ -126,12 +126,15 @@ namespace {
 class Discovery {
  public:
   Discovery(const SpecEngine& engine, const ByteReader& reader, il::Function& function,
-            const MemoryFacts& facts, const LiftCoverage* coverage)
+            const MemoryFacts& facts, const LiftCoverage* coverage, LiftRange fence,
+            const TailCallTargetTest& isTailCall)
       : engine_(engine),
         reader_(reader),
         function_(function),
         facts_(facts),
-        coverage_(coverage != nullptr && coverage->active() ? coverage : nullptr) {
+        coverage_(coverage != nullptr && coverage->active() ? coverage : nullptr),
+        fence_(fence),
+        isTailCall_(isTailCall) {
     const SpecProgram& program = engine_.program();
     width_ = program.insnWidth / 8;
 
@@ -156,7 +159,7 @@ class Discovery {
   void scan(std::span<const uint64_t> entries) {
     std::deque<uint64_t> worklist;
     for (const uint64_t entry : entries) {
-      if (!extents_.contains(entry) && readable(entry) &&
+      if (!extents_.contains(entry) && fence_.contains(entry) && readable(entry) &&
           (coverage_ == nullptr || coverage_->contains(entry))) {
         leaders_.insert(entry);
         worklist.push_back(entry);
@@ -166,15 +169,20 @@ class Discovery {
     while (!worklist.empty()) {
       const uint64_t start = worklist.front();
       worklist.pop_front();
-      if (extents_.contains(start)) {
+      if (extents_.contains(start) || !fence_.contains(start)) {
         continue;
       }
+      tailCalls_.erase(start);
 
       uint64_t at = start;
       while (true) {
         // Ran into a leader discovered by an earlier scan: this block ends
         // just short of it, with a fall-through edge spelled out in phase two.
         if (at != start && leaders_.contains(at)) {
+          break;
+        }
+        if (fence_.active() && at >= fence_.end) {
+          external_.insert(at);
           break;
         }
         if (coverage_ != nullptr && !coverage_->contains(at)) {
@@ -215,6 +223,12 @@ class Discovery {
             }
           }
         } else {
+          if (flow.kind == FlowKind::Branch && flow.target != 0 &&
+              isTailCall_ && !extents_.contains(flow.target) &&
+              isTailCall_(at - width_, flow.target)) {
+            tailCalls_[start] = flow.target;
+            break;
+          }
           if (flow.kind == FlowKind::IndirectBranch || flow.kind == FlowKind::Unknown) {
             unresolved_.push_back(start);
           }
@@ -224,9 +238,9 @@ class Discovery {
           if (target == 0) {
             continue;
           }
-          // Only mapped targets become real blocks; the rest get a stub so
-          // the branch still resolves to a BlockId.
-          if (!readable(target)) {
+          // Only mapped targets inside the active fence become real blocks;
+          // the rest get a stub so the branch still resolves to a BlockId.
+          if (!fence_.contains(target) || !readable(target)) {
             external_.insert(target);
             continue;
           }
@@ -284,8 +298,11 @@ class Discovery {
     for (const uint64_t start : lifted) {
       const uint64_t end = extents_.at(start);
       const il::BlockId block = blocks_.at(start);
+      const auto tailIt = tailCalls_.find(start);
+      const uint64_t liftEnd =
+          (tailIt != tailCalls_.end() && end >= start + width_) ? end - width_ : end;
       site.block = block;
-      for (uint64_t at = start; at < end; at += width_) {
+      for (uint64_t at = start; at < liftEnd; at += width_) {
         std::array<std::byte, 16> storage{};
         if (!readWord(at, storage)) {
           break;  // mapped in phase one; if it vanished, end the block here
@@ -295,6 +312,13 @@ class Discovery {
             engine_.decode(std::span<const std::byte>{storage}.first(width_), at), site));
       }
       function_.block(block).endVa = end;
+      if (tailIt != tailCalls_.end()) {
+        const uint64_t tailVa = end >= width_ ? end - width_ : end;
+        (void)function_.appendCall(
+            block, tailVa, function_.constant(il::Type::integer(64), tailIt->second),
+            il::Type::integer(64));
+        (void)function_.appendReturn(block, tailVa);
+      }
       const il::Block& built = function_.block(block);
       if (built.ops.empty() || !function_.op(built.ops.back()).isTerminator()) {
         const il::BlockId next = site.blockAt(end);
@@ -368,10 +392,13 @@ class Discovery {
   il::Function& function_;
   const MemoryFacts& facts_;
   const LiftCoverage* coverage_ = nullptr;
+  LiftRange fence_{};
+  const TailCallTargetTest& isTailCall_;
   unsigned width_ = 0;
 
   std::set<uint64_t> leaders_;
   std::set<uint64_t> external_;
+  std::map<uint64_t, uint64_t> tailCalls_;
   std::map<uint64_t, uint64_t> extents_;  // block start -> just past its end
   std::map<uint64_t, il::BlockId> blocks_;
   std::set<uint64_t> existing_;           // starts that already have content
@@ -382,12 +409,13 @@ class Discovery {
 
 Result<LiftedFunction> liftFunction(const SpecEngine& engine, const ByteReader& reader,
                                     uint64_t entry, const MemoryFacts& facts,
-                                    const LiftCoverage* coverage) {
+                                    const LiftCoverage* coverage, LiftRange fence,
+                                    const TailCallTargetTest& isTailCall) {
   auto function =
       std::make_unique<il::Function>(engine.program().arch, engine.program().registers, entry);
   function->setMaturity(il::Maturity::Lifted);
 
-  Discovery discovery(engine, reader, *function, facts, coverage);
+  Discovery discovery(engine, reader, *function, facts, coverage, fence, isTailCall);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }
@@ -413,8 +441,9 @@ Result<LiftBlocksResult> liftBlocksInto(il::Function& function, const SpecEngine
                                         const ByteReader& reader,
                                         std::span<const uint64_t> entries,
                                         const MemoryFacts& facts,
-                                        const LiftCoverage* coverage) {
-  Discovery discovery(engine, reader, function, facts, coverage);
+                                        const LiftCoverage* coverage, LiftRange fence,
+                                        const TailCallTargetTest& isTailCall) {
+  Discovery discovery(engine, reader, function, facts, coverage, fence, isTailCall);
   if (!discovery.valid()) {
     return err(DiagCode::Internal, "unsupported instruction width");
   }
