@@ -97,7 +97,14 @@ class Sccp {
     for (const il::BlockId blockId : function_.blockHandles()) {
       for (const il::OpId opId : function_.block(blockId).ops) {
         opBlocks_[opId.index()] = blockId;
-        for (const il::ExprId operand : function_.operands(function_.op(opId))) {
+        // Only Phi and CondBranch re-read cells_ when revisited from ssaWork_;
+        // indexing Store/Load/Call/WriteReg/Return only bloats uses_ and
+        // ssaWork_ with guaranteed no-op visits.
+        const il::Op& op = function_.op(opId);
+        if (op.code != il::OpCode::Phi && op.code != il::OpCode::CondBranch) {
+          continue;
+        }
+        for (const il::ExprId operand : function_.operands(op)) {
           collectValueLeaves(operand, opId);
         }
       }
@@ -430,7 +437,7 @@ class Sccp {
   /// Constant cells become Const expressions at every use. Only values the
   /// analysis visited carry a cell, so unreachable regions are untouched.
   bool rewriteConstants() {
-    ValueSubst subst;
+    std::vector<il::ExprId> replacements(cells_.size());
     std::size_t count = 0;
     for (uint32_t valueIndex = 0; valueIndex < cells_.size(); ++valueIndex) {
       const Cell cell = cells_[valueIndex];
@@ -444,25 +451,64 @@ class Sccp {
       if (!valueType.isScalarInteger() && !valueType.isFloat()) {
         continue;
       }
-      subst.set(value, function_.constant(valueType, cell.value));
+      replacements[valueIndex] = function_.constant(valueType, cell.value);
       ++count;
     }
     if (count == 0) {
       return false;
     }
+    // Flat vector memoization avoids millions of unordered_map node allocations
+    // on large functions (exprs are dense uint32_t indices).
+    std::vector<il::ExprId> memo(function_.exprCount());
+    auto substExpr = [&](auto&& self, il::ExprId id) -> il::ExprId {
+      if (id.index() < memo.size() && memo[id.index()].valid()) {
+        return memo[id.index()];
+      }
+      const il::Expr expr = function_.expr(id);
+      il::ExprId result = id;
+      if (expr.op == il::ExprOp::Value) {
+        const uint32_t valIdx = static_cast<uint32_t>(expr.immediate);
+        if (valIdx < replacements.size() && replacements[valIdx].valid()) {
+          result = replacements[valIdx];
+        }
+      } else if (expr.operandCount > 0) {
+        il::Expr rebuilt = expr;
+        bool exprChanged = false;
+        for (unsigned index = 0; index < expr.operandCount; ++index) {
+          const il::ExprId next = self(self, expr.operands[index]);
+          exprChanged |= next != expr.operands[index];
+          rebuilt.operands[index] = next;
+        }
+        if (exprChanged) {
+          result = function_.intern(rebuilt);
+        }
+      }
+      if (id.index() >= memo.size()) {
+        memo.resize(std::max<std::size_t>(function_.exprCount(), id.index() + 1));
+      }
+      memo[id.index()] = result;
+      return result;
+    };
+
     bool changed = false;
+    std::vector<il::ExprId> rewritten;
     for (const il::BlockId blockId : function_.blockHandles()) {
       for (const il::OpId opId : function_.block(blockId).ops) {
         const auto operands = function_.operands(function_.op(opId));
         if (operands.empty()) {
           continue;
         }
-        std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
         bool touched = false;
-        for (il::ExprId& operand : rewritten) {
-          const il::ExprId next = subst.apply(function_, operand);
-          touched |= next != operand;
-          operand = next;
+        for (std::size_t i = 0; i < operands.size(); ++i) {
+          const il::ExprId orig = operands[i];
+          const il::ExprId next = substExpr(substExpr, orig);
+          if (next != orig) {
+            if (!touched) {
+              rewritten.assign(operands.begin(), operands.end());
+              touched = true;
+            }
+            rewritten[i] = next;
+          }
         }
         if (touched) {
           function_.setOperands(opId, rewritten);
@@ -534,19 +580,19 @@ class Sccp {
   void applyPrunedPhiSlots() {
     for (auto& [blockId, slots] : prunedSlots_) {
       std::sort(slots.begin(), slots.end(), std::greater<std::size_t>{});
-      for (const il::OpId opId : function_.block(blockId).ops) {
-        if (function_.op(opId).code != il::OpCode::Phi) {
-          break;
-        }
-        const auto operands = function_.operands(function_.op(opId));
-        std::vector<il::ExprId> pruned(operands.begin(), operands.end());
+    for (const il::OpId opId : function_.block(blockId).ops) {
+      if (function_.op(opId).code != il::OpCode::Phi) {
+        break;
+      }
+      const auto operands = function_.operands(function_.op(opId));
+      std::vector<il::ExprId> pruned(operands.begin(), operands.end());
         for (const std::size_t slot : slots) {
           if (slot < pruned.size()) {
-            pruned.erase(pruned.begin() + static_cast<std::ptrdiff_t>(slot));
+      pruned.erase(pruned.begin() + static_cast<std::ptrdiff_t>(slot));
           }
         }
-        function_.setOperands(opId, pruned);
-      }
+      function_.setOperands(opId, pruned);
+    }
     }
     prunedSlots_.clear();
   }
@@ -719,25 +765,25 @@ bool simplifyPhis(il::Function& function) {
       }
     }
 
-    il::ExprId distinct;
-    bool collapsed = true;
+      il::ExprId distinct;
+      bool collapsed = true;
     for (const il::ExprId operand : function.operands(function.op(phi.op))) {
-      const il::Expr& expr = function.expr(operand);
-      if (expr.op == il::ExprOp::Value &&
+        const il::Expr& expr = function.expr(operand);
+        if (expr.op == il::ExprOp::Value &&
           il::ValueId{static_cast<uint32_t>(expr.immediate)} == phi.result) {
-        continue;  // a self loop carries no information
+          continue;  // a self loop carries no information
+        }
+        if (!distinct.valid()) {
+          distinct = operand;
+        } else if (distinct != operand) {
+          collapsed = false;
+          break;
+        }
+      }
+      if (!collapsed) {
+        continue;
       }
       if (!distinct.valid()) {
-        distinct = operand;
-      } else if (distinct != operand) {
-        collapsed = false;
-        break;
-      }
-    }
-    if (!collapsed) {
-      continue;
-    }
-    if (!distinct.valid()) {
       distinct = function.undefined(phi.type);
     }
 
@@ -831,63 +877,63 @@ bool dce(il::Function& function) {
         continue;
       }
       visitedExprs[idx] = 1;
-      const il::Expr& expr = function.expr(id);
-      if (expr.op == il::ExprOp::Value) {
-        const auto value = il::ValueId{static_cast<uint32_t>(expr.immediate)};
+  const il::Expr& expr = function.expr(id);
+  if (expr.op == il::ExprOp::Value) {
+    const auto value = il::ValueId{static_cast<uint32_t>(expr.immediate)};
         if (value.valid() && value.index() < needed.size() && needed[value.index()] == 0) {
           needed[value.index()] = 1;
-          work.push_back(value);
-        }
+      work.push_back(value);
+    }
         continue;
-      }
-      for (unsigned index = 0; index < expr.operandCount; ++index) {
+  }
+  for (unsigned index = 0; index < expr.operandCount; ++index) {
         exprWork.push_back(expr.operands[index]);
       }
     }
   };
 
-  // Roots: whatever the program observes — memory writes, calls, intrinsics,
-  // and the conditions that steer control flow.
-  for (const il::BlockId blockId : function.blockHandles()) {
-    for (const il::OpId opId : function.block(blockId).ops) {
-      const il::Op& op = function.op(opId);
-      if (!il::hasSideEffects(op.code) && !op.isTerminator()) {
+    // Roots: whatever the program observes — memory writes, calls, intrinsics,
+    // and the conditions that steer control flow.
+    for (const il::BlockId blockId : function.blockHandles()) {
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        if (!il::hasSideEffects(op.code) && !op.isTerminator()) {
+          continue;
+        }
+        for (const il::ExprId operand : function.operands(op)) {
+          mark(operand);
+        }
+      }
+    }
+    // Propagate: a needed value's definition needs its own inputs.
+    while (!work.empty()) {
+      const il::ValueId value = work.back();
+      work.pop_back();
+      const il::ValueInfo& info = function.value(value);
+      if (!info.definition.valid() || !function.hasOp(info.definition)) {
         continue;
       }
-      for (const il::ExprId operand : function.operands(op)) {
+      for (const il::ExprId operand : function.operands(function.op(info.definition))) {
         mark(operand);
       }
     }
-  }
-  // Propagate: a needed value's definition needs its own inputs.
-  while (!work.empty()) {
-    const il::ValueId value = work.back();
-    work.pop_back();
-    const il::ValueInfo& info = function.value(value);
-    if (!info.definition.valid() || !function.hasOp(info.definition)) {
-      continue;
-    }
-    for (const il::ExprId operand : function.operands(function.op(info.definition))) {
-      mark(operand);
-    }
-  }
-  std::vector<std::pair<il::BlockId, il::OpId>> dead;
-  for (const il::BlockId blockId : function.blockHandles()) {
-    for (const il::OpId opId : function.block(blockId).ops) {
-      const il::Op& op = function.op(opId);
-      if ((op.code == il::OpCode::Phi || op.code == il::OpCode::Load) &&
+    std::vector<std::pair<il::BlockId, il::OpId>> dead;
+    for (const il::BlockId blockId : function.blockHandles()) {
+      for (const il::OpId opId : function.block(blockId).ops) {
+        const il::Op& op = function.op(opId);
+        if ((op.code == il::OpCode::Phi || op.code == il::OpCode::Load) &&
           op.result.valid() && op.result.index() < needed.size() &&
           needed[op.result.index()] == 0) {
-        dead.emplace_back(blockId, opId);
+          dead.emplace_back(blockId, opId);
+        }
       }
     }
-  }
-  if (dead.empty()) {
+    if (dead.empty()) {
     return false;
-  }
-  for (const auto& [blockId, opId] : dead) {
-    function.removeOp(blockId, opId);
-  }
+    }
+    for (const auto& [blockId, opId] : dead) {
+      function.removeOp(blockId, opId);
+    }
   return true;
 }
 
@@ -1378,7 +1424,8 @@ bool elidePhiTrampolines(il::Function& function) {
 
   constexpr std::size_t kMaxExpandedPreds = 16;
   bool anyChanged = false;
-  for (unsigned pass = 0; pass < 4; ++pass) {
+  constexpr unsigned kMaxTrampolinePasses = 32;
+  for (unsigned pass = 0; pass < kMaxTrampolinePasses; ++pass) {
     struct TrampolinePlan {
       il::BlockId B;
       il::BlockId Next;
@@ -1593,7 +1640,7 @@ bool elidePhiTrampolines(il::Function& function) {
     }
     anyChanged = true;
     // Refresh useSummary only if running another batch.
-    if (pass + 1 < 4) {
+    if (pass + 1 < kMaxTrampolinePasses) {
       std::fill(useSummary.begin(), useSummary.end(), PhiUseSummary{});
       for (const il::BlockId blockId : function.blockHandles()) {
         for (const il::OpId opId : function.block(blockId).ops) {

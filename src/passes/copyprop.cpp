@@ -1,6 +1,7 @@
 // Block-local register copy propagation (see transform.h).
 #include "transform.h"
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -24,12 +25,39 @@ constexpr std::size_t kMaxTrackedExprNodes = 64;
 /// to keep chaining" vs. not, never the exact size once it is not.
 [[nodiscard]] std::size_t boundedExprNodeCount(const il::Function& function, il::ExprId id,
                                                std::size_t limit) {
-  std::unordered_set<uint32_t> visited;
-  std::vector<il::ExprId> stack{id};
-  while (!stack.empty() && visited.size() <= limit) {
+  if (function.expr(id).operandCount == 0) {
+    return 1;
+  }
+  // Small fixed buffer on the stack for the standard kMaxTrackedExprNodes cap
+  // avoids a heap unordered_set + vector allocation on every WriteReg.
+  uint32_t visitedBuf[kMaxTrackedExprNodes + 1];
+  std::size_t visitedCount = 0;
+  std::vector<uint32_t> overflowVisited;
+  std::vector<il::ExprId> stack;
+  stack.reserve(16);
+  stack.push_back(id);
+  const auto alreadySeen = [&](uint32_t idx) -> bool {
+    if (limit <= kMaxTrackedExprNodes) {
+      for (std::size_t i = 0; i < visitedCount; ++i) {
+        if (visitedBuf[i] == idx) {
+          return true;
+        }
+      }
+      visitedBuf[visitedCount++] = idx;
+      return false;
+    }
+    if (std::find(overflowVisited.begin(), overflowVisited.end(), idx) !=
+        overflowVisited.end()) {
+      return true;
+    }
+    overflowVisited.push_back(idx);
+    visitedCount = overflowVisited.size();
+    return false;
+  };
+  while (!stack.empty() && visitedCount <= limit) {
     const il::ExprId current = stack.back();
     stack.pop_back();
-    if (!visited.insert(current.index()).second) {
+    if (alreadySeen(current.index())) {
       continue;
     }
     const il::Expr& expr = function.expr(current);
@@ -37,7 +65,7 @@ constexpr std::size_t kMaxTrackedExprNodes = 64;
       stack.push_back(expr.operands[index]);
     }
   }
-  return visited.size();
+  return visitedCount;
 }
 
 /// One block's propagation state: the expression each root register currently
@@ -101,23 +129,26 @@ struct BlockProp {
 bool copyPropagateBlock(il::Function& function, il::BlockId blockId) {
   BlockProp prop(function);
   il::Block& block = function.block(blockId);
+  std::vector<il::ExprId> rewritten;
 
   for (const il::OpId opId : block.ops) {
     const il::Op& op = function.op(opId);
 
     // Operands see the substitutions recorded so far.
-    const auto operands = function.operands(op);
-    if (!operands.empty()) {
-      std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
-      bool opChanged = false;
-      for (il::ExprId& operand : rewritten) {
-        const il::ExprId next = prop.subst.apply(function, operand);
-        opChanged |= next != operand;
-        operand = next;
-      }
-      if (opChanged) {
-        function.setOperands(opId, rewritten);
-        prop.changed = true;
+    if (!prop.subst.empty()) {
+      const auto operands = function.operands(op);
+      if (!operands.empty()) {
+        rewritten.assign(operands.begin(), operands.end());
+        bool opChanged = false;
+        for (il::ExprId& operand : rewritten) {
+          const il::ExprId next = prop.subst.apply(function, operand);
+          opChanged |= next != operand;
+          operand = next;
+        }
+        if (opChanged) {
+          function.setOperands(opId, rewritten);
+          prop.changed = true;
+        }
       }
     }
 

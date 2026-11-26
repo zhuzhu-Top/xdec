@@ -46,6 +46,7 @@ inline constexpr std::size_t kMegaBlockOpThreshold = 16384;
 /// values with the expressions behind them.
 class ValueSubst {
  public:
+  [[nodiscard]] bool empty() const noexcept { return map_.empty(); }
   void set(il::ValueId value, il::ExprId replacement) { map_[value] = replacement; }
 
   [[nodiscard]] il::ExprId apply(il::Function& function, il::ExprId id) {

@@ -38,13 +38,24 @@ void collectValueUses(il::Function& function, il::ExprId id,
 bool dceBlock(il::Function& function, il::BlockId blockId) {
   const il::Block& block = function.block(blockId);
 
-  // Value uses across the whole block. Below SSA values are block-local, so a
-  // value unused inside its block is unused, period.
-  std::unordered_set<uint32_t> uses;
-  std::unordered_set<uint32_t> visitedExprs;
+  bool hasReadReg = false;
   for (const il::OpId opId : block.ops) {
-    for (const il::ExprId operand : function.operands(function.op(opId))) {
-      collectValueUses(function, operand, uses, visitedExprs);
+    if (function.op(opId).code == il::OpCode::ReadReg) {
+      hasReadReg = true;
+      break;
+    }
+  }
+
+  // Value uses across the whole block. Below SSA values are block-local, so a
+  // value unused inside its block is unused, period. Only needed if the block
+  // actually has a ReadReg candidate to check against `uses`.
+  std::unordered_set<uint32_t> uses;
+  if (hasReadReg) {
+    std::unordered_set<uint32_t> visitedExprs;
+    for (const il::OpId opId : block.ops) {
+      for (const il::ExprId operand : function.operands(function.op(opId))) {
+        collectValueUses(function, operand, uses, visitedExprs);
+      }
     }
   }
 

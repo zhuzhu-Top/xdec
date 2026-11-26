@@ -15,32 +15,42 @@ bool forwardRedundantLoads(il::Function& function, il::BlockId blockId) {
   bool changed = false;
 
   const il::Block& block = function.block(blockId);
+  std::vector<il::ExprId> rewritten;
   for (const il::OpId opId : block.ops) {
     const il::Op& op = function.op(opId);
 
     // Operands see the substitutions recorded so far, same as copyprop: a
     // forwarded load's address may itself be built from an earlier forward.
-    const auto operands = function.operands(op);
-    std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
-    if (!rewritten.empty()) {
-      bool opChanged = false;
-      for (il::ExprId& operand : rewritten) {
-        const il::ExprId next = subst.apply(function, operand);
-        opChanged |= next != operand;
-        operand = next;
+    il::ExprId firstOperand{};
+    if (!subst.empty()) {
+      const auto operands = function.operands(op);
+      if (!operands.empty()) {
+        rewritten.assign(operands.begin(), operands.end());
+        bool opChanged = false;
+        for (il::ExprId& operand : rewritten) {
+          const il::ExprId next = subst.apply(function, operand);
+          opChanged |= next != operand;
+          operand = next;
+        }
+        if (opChanged) {
+          function.setOperands(opId, rewritten);
+          changed = true;
+        }
+        firstOperand = rewritten[0];
       }
-      if (opChanged) {
-        function.setOperands(opId, rewritten);
-        changed = true;
+    } else if (op.code == il::OpCode::Load) {
+      const auto operands = function.operands(op);
+      if (!operands.empty()) {
+        firstOperand = operands[0];
       }
     }
 
     switch (op.code) {
       case il::OpCode::Load: {
-        if (rewritten.empty()) {
+        if (!firstOperand.valid()) {
           break;
         }
-        const il::ExprId address = rewritten[0];
+        const il::ExprId address = firstOperand;
         if (const auto found = lastLoadOf.find(address.index());
             found != lastLoadOf.end() && function.value(found->second).type == op.type) {
           subst.set(op.result, function.valueRef(found->second));

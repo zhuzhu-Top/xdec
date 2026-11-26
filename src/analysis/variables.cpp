@@ -75,7 +75,13 @@ struct WidthUse {
 /// variable recovery cares about and the signedness evidence.
 class Scan {
  public:
-  explicit Scan(const il::Function& function) : function_(function) {}
+  explicit Scan(const il::Function& function)
+      : seen_(function.exprCount(), 0),
+        leafUses_(function.registers().size()),
+        leafHasUse_(function.registers().size(), 0),
+        valueUses_(function.valueCount()),
+        valueHasUse_(function.valueCount(), 0),
+        function_(function) {}
 
   void run() {
     for (const il::BlockId blockId : function_.blockHandles()) {
@@ -94,13 +100,15 @@ class Scan {
     }
   }
 
-  std::unordered_set<uint32_t> seen_;
+  std::vector<uint8_t> seen_;
   std::vector<il::ExprId> entryLeaves_;      // every EntryReg leaf seen
   std::vector<il::OpId> memoryOps_;          // loads and stores
   std::vector<il::OpId> phis_;               // in block order
   std::vector<std::pair<il::ExprId, il::ExprId>> signedUses_;  // (leaf-ish, user)
-  std::map<uint32_t, WidthUse> leafUses_;    // keyed by argument RegId index
-  std::map<uint32_t, WidthUse> valueUses_;   // keyed by ValueId index
+  std::vector<WidthUse> leafUses_;           // indexed by argument RegId index
+  std::vector<uint8_t> leafHasUse_;
+  std::vector<WidthUse> valueUses_;          // indexed by ValueId index
+  std::vector<uint8_t> valueHasUse_;
 
  private:
   void walk(il::ExprId root, il::ExprId parent, const il::Op& consumer) {
@@ -113,17 +121,33 @@ class Scan {
     // of those parents are the evidence. Deduplicating interior nodes is still
     // safe, because a repeated interior node is the same parent.
     if (expr.op == il::ExprOp::EntryReg) {
-      note(leafUses_[static_cast<uint32_t>(expr.immediate)], parent, consumer);
+      const uint32_t regIdx = static_cast<uint32_t>(expr.immediate);
+      if (regIdx >= leafUses_.size()) {
+        leafUses_.resize(regIdx + 1);
+        leafHasUse_.resize(regIdx + 1, 0);
+      }
+      leafHasUse_[regIdx] = 1;
+      note(leafUses_[regIdx], parent, consumer);
       entryLeaves_.push_back(root);
       return;
     }
     if (expr.op == il::ExprOp::Value) {
-      note(valueUses_[static_cast<uint32_t>(expr.immediate)], parent, consumer);
+      const uint32_t valIdx = static_cast<uint32_t>(expr.immediate);
+      if (valIdx >= valueUses_.size()) {
+        valueUses_.resize(valIdx + 1);
+        valueHasUse_.resize(valIdx + 1, 0);
+      }
+      valueHasUse_[valIdx] = 1;
+      note(valueUses_[valIdx], parent, consumer);
       return;
     }
-    if (!seen_.insert(root.index()).second) {
+    if (root.index() >= seen_.size()) {
+      seen_.resize(root.index() + 1, 0);
+    }
+    if (seen_[root.index()] != 0) {
       return;
     }
+    seen_[root.index()] = 1;
     switch (expr.op) {
       case il::ExprOp::CmpLtS:
       case il::ExprOp::CmpLeS:
@@ -195,8 +219,8 @@ class Scan {
 /// hundreds of times. Re-walking it each time is that fan-out raised to the
 /// depth of the merge graph. Visiting once makes the walk linear in the graph.
 [[nodiscard]] std::optional<uint32_t> readWidth(
-    const std::map<uint32_t, WidthUse>& valueUses, const WidthUse& use,
-    uint32_t declared, std::unordered_set<uint32_t>& walked) {
+    const std::vector<WidthUse>& valueUses, const std::vector<uint8_t>& valueHasUse,
+    const WidthUse& use, uint32_t declared, std::unordered_set<uint32_t>& walked) {
   if (use.fullWidth) {
     return declared;
   }
@@ -212,12 +236,11 @@ class Scan {
     if (!walked.insert(merge.index()).second) {
       continue;
     }
-    const auto found = valueUses.find(merge.index());
-    if (found == valueUses.end()) {
+    if (merge.index() >= valueHasUse.size() || valueHasUse[merge.index()] == 0) {
       continue;
     }
     if (const std::optional<uint32_t> through =
-            readWidth(valueUses, found->second, declared, walked)) {
+            readWidth(valueUses, valueHasUse, valueUses[merge.index()], declared, walked)) {
       widest = std::max(widest.value_or(0), *through);
     }
   }
@@ -226,10 +249,10 @@ class Scan {
 
 /// The same, starting a fresh walk.
 [[nodiscard]] std::optional<uint32_t> readWidth(
-    const std::map<uint32_t, WidthUse>& valueUses, const WidthUse& use,
-    uint32_t declared) {
+    const std::vector<WidthUse>& valueUses, const std::vector<uint8_t>& valueHasUse,
+    const WidthUse& use, uint32_t declared) {
   std::unordered_set<uint32_t> walked;
-  return readWidth(valueUses, use, declared, walked);
+  return readWidth(valueUses, valueHasUse, use, declared, walked);
 }
 
 /// Peels address arithmetic and casts to the leaf an address is based on,
@@ -803,10 +826,10 @@ VariableTable VariableTable::recover(const il::Function& function,
     var.argRoot = root;
     const uint32_t declared = function.registers()[root].type().bits();
     var.type.width = declared;
-    if (const auto found = scan.leafUses_.find(root.index());
-        found != scan.leafUses_.end()) {
+    if (root.index() < scan.leafHasUse_.size() && scan.leafHasUse_[root.index()] != 0) {
       if (const std::optional<uint32_t> read =
-              readWidth(scan.valueUses_, found->second, declared)) {
+              readWidth(scan.valueUses_, scan.valueHasUse_, scan.leafUses_[root.index()],
+                        declared)) {
         var.type.width = *read;
       }
     }

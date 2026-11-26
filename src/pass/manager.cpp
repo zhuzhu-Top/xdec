@@ -154,9 +154,11 @@ Result<std::vector<RunStats>> Manager::run(
     slot.elapsed = ran - started;
 
     // The produced level's invariants are the pass's contract; check them
-    // before anyone else builds on the result.
+    // before anyone else builds on the result. A pass that made no changes and
+    // stayed at the already-verified maturity cannot have broken them.
     il::VerifyReport report;
-    {
+    const bool needsVerify = slot.changed || info.produces != function.maturity();
+    if (needsVerify) {
       const obs::Span verifySpan{"verify", info.name};
       report = il::verify(function, info.produces);
     }

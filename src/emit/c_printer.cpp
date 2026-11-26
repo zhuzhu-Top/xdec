@@ -10,6 +10,7 @@
 #include <format>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "ast_lower.h"
@@ -54,10 +55,13 @@ class Assembler {
     // comes before it for the same reason -- an imported parameter type is a
     // type the preamble then has to define.
     XDEC_SPAN(declSpan, "emit", "declarations");
-    const std::string locals = declarations(body);
+    const std::unordered_set<std::string_view> usedIdents =
+        filterUnusedDecls() ? collectIdentifiers(body)
+                            : std::unordered_set<std::string_view>{};
+    const std::string locals = declarations(body, usedIdents);
     const std::string head = signature();
 
-    std::string out = preamble(body);
+    std::string out = preamble(body, usedIdents);
     declSpan.end();
     out += location();
     out += head;
@@ -76,19 +80,69 @@ class Assembler {
     return ctx_.options.language == EmitLanguage::Objc || !ctx_.options.hlTransforms.empty();
   }
 
-  [[nodiscard]] static bool isIdentifierUsed(std::string_view hay, std::string_view ident) noexcept {
+  [[nodiscard]] static bool isIdentChar(unsigned char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+  }
+
+  [[nodiscard]] static bool isIdentStart(unsigned char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+  }
+
+  /// Single-pass lexical scan of `hay` into a zero-copy token set so unused
+  /// declaration pruning is O(|body| + N) rather than O(N * |body|) on
+  /// multi-megabyte decompiled functions.
+  [[nodiscard]] static std::unordered_set<std::string_view> collectIdentifiers(
+      std::string_view hay) {
+    std::unordered_set<std::string_view> out;
+    out.reserve(std::min<std::size_t>(hay.size() / 64 + 64, 262144));
+    const char* const data = hay.data();
+    const std::size_t n = hay.size();
+    std::size_t i = 0;
+    while (i < n) {
+      const unsigned char c = static_cast<unsigned char>(data[i]);
+      if (!isIdentChar(c)) {
+        ++i;
+        continue;
+      }
+      const std::size_t start = i++;
+      while (i < n && isIdentChar(static_cast<unsigned char>(data[i]))) {
+        ++i;
+      }
+      // Numeric/hex literals start with a digit and never match a C identifier;
+      // skipping them avoids inserting tens of thousands of unique constants.
+      if (isIdentStart(c)) {
+        out.emplace(data + start, i - start);
+      }
+    }
+    return out;
+  }
+
+  [[nodiscard]] static bool isIdentifierUsed(
+      const std::unordered_set<std::string_view>& usedIdents,
+      std::string_view hay, std::string_view ident) noexcept {
     if (ident.empty()) {
       return false;
+    }
+    if (isIdentStart(static_cast<unsigned char>(ident.front()))) {
+      bool allIdent = true;
+      for (const char ch : ident) {
+        if (!isIdentChar(static_cast<unsigned char>(ch))) {
+          allIdent = false;
+          break;
+        }
+      }
+      if (allIdent) {
+        return usedIdents.contains(ident);
+      }
     }
     std::size_t pos = 0;
     while ((pos = hay.find(ident, pos)) != std::string_view::npos) {
       const bool leftOk =
-          pos == 0 || (!std::isalnum(static_cast<unsigned char>(hay[pos - 1])) &&
-                       hay[pos - 1] != '_');
+          pos == 0 || !isIdentChar(static_cast<unsigned char>(hay[pos - 1]));
       const std::size_t end = pos + ident.size();
       const bool rightOk =
-          end >= hay.size() || (!std::isalnum(static_cast<unsigned char>(hay[end])) &&
-                                hay[end] != '_');
+          end >= hay.size() || !isIdentChar(static_cast<unsigned char>(hay[end]));
       if (leftOk && rightOk) {
         return true;
       }
@@ -288,7 +342,9 @@ class Assembler {
     return out + ")";
   }
 
-  [[nodiscard]] std::string declarations(std::string_view body) {
+  [[nodiscard]] std::string declarations(
+      std::string_view body,
+      const std::unordered_set<std::string_view>& usedIdents) {
     const bool pruneUnused = filterUnusedDecls();
     std::string out;
     std::vector<const analysis::Variable*> locals;
@@ -356,13 +412,13 @@ class Assembler {
       it->second.push_back(std::move(name));
     };
     for (const analysis::Variable& temp : ctx_.variables.temps()) {
-      if (pruneUnused && !isIdentifierUsed(body, temp.name)) {
+      if (pruneUnused && !isIdentifierUsed(usedIdents, body, temp.name)) {
         continue;
       }
       addPlain(temp.type.format(), temp.name);
     }
     for (const auto& [valueIndex, temp] : ctx_.tempNames) {
-      if (pruneUnused && !isIdentifierUsed(body, temp)) {
+      if (pruneUnused && !isIdentifierUsed(usedIdents, body, temp)) {
         continue;
       }
       // An imported type wins over the measured width here, and only here: the
@@ -418,11 +474,13 @@ class Assembler {
   /// decoration on a read-only section; it is the statement that every load from
   /// it yields the value in the file, which is the difference between a constant
   /// of the program and an observation of its state.
-  [[nodiscard]] std::string globalDeclarations(std::string_view body) {
+  [[nodiscard]] std::string globalDeclarations(
+      std::string_view body,
+      const std::unordered_set<std::string_view>& usedIdents) {
     const bool pruneUnused = filterUnusedDecls();
     std::string out;
     for (const auto& [address, global] : ctx_.globals) {
-      if (pruneUnused && !isIdentifierUsed(body, global.name)) {
+      if (pruneUnused && !isIdentifierUsed(usedIdents, body, global.name)) {
         continue;
       }
       const char* qualifier = global.facts.writable ? "" : "const ";
@@ -487,7 +545,9 @@ class Assembler {
     return out;
   }
 
-  [[nodiscard]] std::string preamble(std::string_view body) {
+  [[nodiscard]] std::string preamble(
+      std::string_view body,
+      const std::unordered_set<std::string_view>& usedIdents) {
     const bool pruneUnused = filterUnusedDecls();
     std::string out =
         "#include <stdint.h>\n"
@@ -505,7 +565,7 @@ class Assembler {
         "typedef __int128 int128_t;\n";
     std::string externs;
     for (const auto& [address, callee] : ctx_.callees) {
-      if (pruneUnused && !isIdentifierUsed(body, callee)) {
+      if (pruneUnused && !isIdentifierUsed(usedIdents, body, callee)) {
         continue;
       }
       // The address stays in a comment even when the name came from the symbol
@@ -534,7 +594,7 @@ class Assembler {
       externs += std::format("extern const {} {};\n", intType(width), leaf);
     }
     externs += syscallDeclarations();
-    externs += globalDeclarations(body);
+    externs += globalDeclarations(body, usedIdents);
     const std::string helpers = helperDeclarations(ctx_.helpers, ctx_.options.helpersHeader);
     // Definitions last to build and first to print: everything above may have
     // been what mentioned a type, and C needs the definition before the use.

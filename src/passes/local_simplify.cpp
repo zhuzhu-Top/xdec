@@ -72,6 +72,7 @@ class LocalSimplify final : public pass::FunctionPass {
     std::size_t megaBlocks = 0;
     obs::checkpoint("local-simplify blocks");
     const obs::Span blocksSpan{"subpass", "block-local"};
+    const bool logPerBlock = localLog().enabled(obs::LogLevel::Debug);
     for (const il::BlockId blockId : function.blockHandles()) {
       const il::Block& block = function.block(blockId);
       if (block.ops.size() >= 1024) {
@@ -89,20 +90,26 @@ class LocalSimplify final : public pass::FunctionPass {
       int64_t loadBlockMs = 0;
       if (isMegaBlock) {
         ++megaBlocks;
-        (void)clock.lap();  // exclude the skip itself from the next timed section
+        if (logPerBlock) {
+          (void)clock.lap();  // exclude the skip itself from the next timed section
+        }
       } else {
         copied = copyPropagateBlock(function, blockId);
-        copyBlockMs = clock.lap();
+        if (logPerBlock) {
+          copyBlockMs = clock.lap();
+        }
         forwarded = forwardRedundantLoads(function, blockId);
-        loadBlockMs = clock.lap();
+        if (logPerBlock) {
+          loadBlockMs = clock.lap();
+        }
       }
       copyMs += copyBlockMs;
       loadMs += loadBlockMs;
       const bool dead = dceBlock(function, blockId);
-      const int64_t dceBlockMs = clock.lap();
+      const int64_t dceBlockMs = logPerBlock ? clock.lap() : 0;
       dceMs += dceBlockMs;
       blockChanged |= copied || forwarded || dead;
-      if (block.ops.size() >= 256) {
+      if (logPerBlock && block.ops.size() >= 256) {
         XDEC_LOG_DEBUG(localLog(), "  b{} @0x{:x} {} op(s){}: copy {}ms, loads {}ms, dce {}ms",
                        blockId.index(), block.va, block.ops.size(),
                        isMegaBlock ? " [mega-block: copy/loads skipped]" : "", copyBlockMs,

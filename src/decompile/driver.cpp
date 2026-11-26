@@ -178,7 +178,7 @@ struct Probe {
   /// DriverOptions::maxDiscoveryPerBranch), counted so the round can say so.
   std::size_t declined = 0;
 
-  Result<void> run(il::Function& function, const ByteReader& reader,
+  Result<bool> run(il::Function& function, const ByteReader& reader,
                    const DriverOptions& options) {
     std::unique_ptr<pass::Pass> pass = passes::makeResolveIndirectPass();
     pass::Context context(function);
@@ -221,8 +221,7 @@ struct Probe {
       discoveries.insert(filteredMissing.begin(), filteredMissing.end());
       pending[found.branch] = std::move(filteredTargets);
     });
-    XDEC_TRY_VOID(pass->run(context));
-    return {};
+    return pass->run(context);
   }
 };
 
@@ -249,6 +248,18 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
   std::set<uint64_t> known{entry};
   // What the rounds proved about the branches leading to them.
   Resolutions resolved;
+  std::size_t resolvedEdges = 0;
+
+  // A verified Maturity::Ssa function already built from (entryCount,
+  // resolvedEdgeCount) and left untouched by Probe (zero discoveries, zero
+  // new edges). Reusing it skips redundant re-lifts when a round settles on
+  // the exact same CFG and again when finish() advances past Ssa.
+  struct CachedSsa {
+    std::unique_ptr<il::Function> function;
+    std::size_t entryCount = 0;
+    std::size_t resolvedEdgeCount = 0;
+  };
+  CachedSsa cachedSsa;
 
   // Admits a probe's discoveries into `entries`/`known` (fence and
   // total-entry cap applied exactly as a single-pass round always has),
@@ -402,9 +413,11 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
   };
 
   // The one run whose result is returned: the whole pipeline, observed so dumps
-  // land, over a fresh lift of every entry with every proved edge already in
-  // place. Both ways out of the loop end here, so a run cut short by the cap
-  // still yields the function the rounds did manage to uncover.
+  // land, over every entry with every proved edge already in place. When the
+  // last settle pass already produced an untouched Maturity::Ssa function from
+  // the exact same (entries, resolved) set and no finish-only observer needs to
+  // replay the Lifted..Ssa prefix, continue directly from Ssa to options.target
+  // instead of re-lifting and re-running Lifted..Ssa a second/third time.
   auto finish = [&](DriverStop stop) -> Result<DriverResult> {
     report.stop = stop;
     report.converged = report.traceCovered || stop == DriverStop::Converged;
@@ -413,10 +426,6 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
     obs::reportProgress("pipeline",
                         std::format("final pipeline over {} entr(ies) ({})", entries.size(),
                                     toString(stop)));
-    auto whole = liftKnown();
-    if (!whole) {
-      return std::move(whole).takeUnexpected();
-    }
     pass::Manager manager(options.observer);
     configure(manager, reader, options);
     if (stop == DriverStop::WindDown) {
@@ -424,9 +433,35 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
       // got to is a marked hole in that answer, not a reason to discard it.
       manager.setSealUnresolvedBranches(true);
     }
-    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, il::Maturity::Cfg));
-    applyResolutions(*whole->function, resolved);
-    XDEC_TRY_VOID(manager.runTo(*whole->function, registry, options.target));
+    std::unique_ptr<il::Function> finalFn;
+    if (cachedSsa.function != nullptr &&
+        cachedSsa.entryCount == entries.size() &&
+        cachedSsa.resolvedEdgeCount == resolvedEdges &&
+        options.observer == nullptr) {
+      finalFn = std::move(cachedSsa.function);
+      if (options.target > il::Maturity::Ssa) {
+        XDEC_TRY(const std::vector<pass::Pass*> tail,
+                 registry.resolve(il::Maturity::Ssa, options.target));
+        // Every level==Ssa, produces==Ssa pass already ran when cachedSsa was
+        // built; only the suffix advancing past Ssa remains.
+        auto firstPastSsa = std::find_if(tail.begin(), tail.end(), [](const pass::Pass* p) {
+          return p->info().produces > il::Maturity::Ssa;
+        });
+        const std::span<pass::Pass* const> remaining(
+            firstPastSsa == tail.end() ? nullptr : &*firstPastSsa,
+            static_cast<std::size_t>(tail.end() - firstPastSsa));
+        XDEC_TRY_VOID(manager.run(*finalFn, remaining));
+      }
+    } else {
+      auto whole = liftKnown();
+      if (!whole) {
+        return std::move(whole).takeUnexpected();
+      }
+      finalFn = std::move(whole->function);
+      XDEC_TRY_VOID(manager.runTo(*finalFn, registry, il::Maturity::Cfg));
+      applyResolutions(*finalFn, resolved);
+      XDEC_TRY_VOID(manager.runTo(*finalFn, registry, options.target));
+    }
     // The second half of the jump-table candidate defence (see
     // analysis/reachability.h): every block the candidate filtering and the
     // discovery loop above actually needed should be reachable from the
@@ -434,17 +469,17 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
     // harmless, since nothing downstream emits it, but worth surfacing rather
     // than leaving to be noticed as an unexplained unused local.
     const std::unordered_set<il::BlockId> reachable =
-        analysis::reachableBlocks(*whole->function);
+        analysis::reachableBlocks(*finalFn);
     if (!report.traceCovered &&
-        reachable.size() < whole->function->blockCount()) {
-      report.unreachableBlocks = whole->function->blockCount() - reachable.size();
+        reachable.size() < finalFn->blockCount()) {
+      report.unreachableBlocks = finalFn->blockCount() - reachable.size();
       XDEC_LOG_WARN(driverLog(),
                     "{} block(s) in the lifted function have no path from entry; nothing "
                     "emits them, but a resolve or discovery step claimed one that turns "
                     "out not to be reachable",
                     report.unreachableBlocks);
     }
-    return DriverResult{std::move(whole->function), std::move(report)};
+    return DriverResult{std::move(finalFn), std::move(report)};
   };
 
   if (options.executionCoverage != nullptr) {
@@ -481,12 +516,37 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
     XDEC_LOG_CONTEXT("round", round + 1);
     XDEC_SPAN(roundSpan, "driver", std::format("round {}", round + 1), "entries", entries.size());
     driverRounds().add();
+    ++report.rounds;
+
+    // If the previous round's final settle pass already lifted this exact
+    // (entries, resolved) set, ran Lifted..Ssa, and probed zero new addresses
+    // or edges without mutating the function, re-lifting would be an exact
+    // deterministic duplicate.
+    if (options.target > il::Maturity::Ssa && options.discoveryObserver == nullptr &&
+        cachedSsa.function != nullptr && cachedSsa.entryCount == entries.size() &&
+        cachedSsa.resolvedEdgeCount == resolvedEdges) {
+      XDEC_LOG_INFO(driverLog(),
+                    "round {}: reusing already-settled Ssa function ({} block(s), {} entr(ies))",
+                    report.rounds, cachedSsa.function->blockCount(), entries.size());
+      roundSpan.set("new_addresses", std::size_t{0});
+      roundSpan.set("new_edges", std::size_t{0});
+      if (hasStuckResolution(*cachedSsa.function)) {
+        XDEC_LOG_WARN(driverLog(),
+                      "round {}: a resolved branch's target never became a reachable "
+                      "block (likely unmapped memory); stopping here rather than "
+                      "reporting a convergence that leaves it out",
+                      report.rounds);
+        return finish(DriverStop::StuckResolution);
+      }
+      return finish(DriverStop::Converged);
+    }
+
+    cachedSsa.function.reset();
     // Fresh and consistent: the whole function at Lifted, every round.
     auto lifted = liftKnown();
     if (!lifted) {
       return std::move(lifted).takeUnexpected();
     }
-    ++report.rounds;
 
     // Targets at or below Ssa need no discovery loop: run once, observed.
     if (options.target <= il::Maturity::Ssa) {
@@ -518,6 +578,8 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
                 lifted->function->blockCount());
       driverSettles().add();
       ++report.settles;
+      const std::size_t liftedEntryCount = entries.size();
+      const std::size_t liftedResolvedEdges = resolvedEdges;
       obs::reportProgress("discover",
                           std::format("round {} settle {}: {} block(s), {} entr(ies)",
                                       report.rounds, settle + 1, lifted->function->blockCount(),
@@ -536,9 +598,11 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
       }
 
       Probe probe;
+      bool probeChanged = false;
       {
         XDEC_SPAN(probeSpan, "driver", "probe");
-        XDEC_TRY_VOID(probe.run(*lifted->function, reader, options));
+        XDEC_TRY(const bool mutated, probe.run(*lifted->function, reader, options));
+        probeChanged = mutated;
         probeSpan.set("discoveries", probe.discoveries.size());
       }
 
@@ -565,6 +629,7 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
       // also gets its incoming edge, so SSA sees a reachable block and the
       // branch *it* ends with resolves in that same pass (see the header).
       passEdges += absorb(resolved, probe.pending);
+      resolvedEdges += passEdges;
       foundEdges += passEdges;
       XDEC_LOG_INFO(driverLog(),
                     "round {} pass {}: {} block(s) from {} entr(ies), {} branch(es) "
@@ -574,6 +639,10 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
       settleSpan.set("new_addresses", passNew);
       settleSpan.set("new_edges", passEdges);
       if (passNew == 0) {
+        if (!probeChanged && passEdges == 0) {
+          cachedSsa = CachedSsa{std::move(lifted->function), liftedEntryCount,
+                                liftedResolvedEdges};
+        }
         // Nothing this pass admitted needs lifting; another pass over the
         // same blocks would just re-derive what this one already proved.
         break;
@@ -597,7 +666,9 @@ Result<DriverResult> decompileImpl(const spec::SpecEngine& engine, const ByteRea
     }
 
     if (foundNew == 0 && foundEdges == 0) {
-      if (hasStuckResolution(*lifted->function)) {
+      const il::Function& currentFn =
+          cachedSsa.function != nullptr ? *cachedSsa.function : *lifted->function;
+      if (hasStuckResolution(currentFn)) {
         // See hasStuckResolution: a real, permanent gap, not a convergence.
         // The function is still emitted as far as the rounds got it, same as
         // a round-cap stop, but report.converged stays false so the report

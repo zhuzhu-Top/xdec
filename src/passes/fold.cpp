@@ -12,9 +12,9 @@ namespace xdec::passes {
 namespace {
 
 il::ExprId foldConstantsRec(il::Function& function, il::ExprId id,
-                            std::unordered_map<il::ExprId, il::ExprId>& memo) {
-  if (const auto found = memo.find(id); found != memo.end()) {
-    return found->second;
+                            std::vector<il::ExprId>& memo) {
+  if (id.index() < memo.size() && memo[id.index()].valid()) {
+    return memo[id.index()];
   }
   // By value, not by reference: the recursion interns into the expression
   // pool, which can reallocate it — a held reference would dangle.
@@ -22,7 +22,10 @@ il::ExprId foldConstantsRec(il::Function& function, il::ExprId id,
 
   // Leaves never change.
   if (expr.operandCount == 0) {
-    memo.emplace(id, id);
+    if (id.index() >= memo.size()) {
+      memo.resize(std::max<std::size_t>(function.exprCount(), id.index() + 1));
+    }
+    memo[id.index()] = id;
     return id;
   }
 
@@ -37,7 +40,10 @@ il::ExprId foldConstantsRec(il::Function& function, il::ExprId id,
   il::ExprId result = changed ? function.intern(rebuilt) : id;
   // A flags-typed result has no Const representation; leave the bundle.
   if (rebuilt.type.isFlags()) {
-    memo.emplace(id, result);
+    if (id.index() >= memo.size()) {
+      memo.resize(std::max<std::size_t>(function.exprCount(), id.index() + 1));
+    }
+    memo[id.index()] = result;
     return result;
   }
   if (il::ConcreteValue value; il::tryEvalConst(function, result, value)) {
@@ -46,7 +52,10 @@ il::ExprId foldConstantsRec(il::Function& function, il::ExprId id,
     }
     // Widest constants the pool cannot spell yet stay as computed trees.
   }
-  memo.emplace(id, result);
+  if (id.index() >= memo.size()) {
+    memo.resize(std::max<std::size_t>(function.exprCount(), id.index() + 1));
+  }
+  memo[id.index()] = result;
   return result;
 }
 
@@ -350,10 +359,10 @@ class FlagPhiDistributor {
 
 /// Same shape as foldFlagConditionsRec, extended with the phi case above.
 il::ExprId distributeFlagCondRec(il::Function& function, il::ExprId id,
-                                 std::unordered_map<il::ExprId, il::ExprId>& memo,
+                                 std::vector<il::ExprId>& memo,
                                  FlagPhiDistributor& distributor) {
-  if (const auto found = memo.find(id); found != memo.end()) {
-    return found->second;
+  if (id.index() < memo.size() && memo[id.index()].valid()) {
+    return memo[id.index()];
   }
   const il::Expr expr = function.expr(id);
   il::Expr rebuilt = expr;
@@ -377,7 +386,10 @@ il::ExprId distributeFlagCondRec(il::Function& function, il::ExprId id,
       }
     }
   }
-  memo.emplace(id, result);
+  if (id.index() >= memo.size()) {
+    memo.resize(std::max<std::size_t>(function.exprCount(), id.index() + 1));
+  }
+  memo[id.index()] = result;
   return result;
 }
 
@@ -387,21 +399,34 @@ il::ExprId distributeFlagCondRec(il::Function& function, il::ExprId id,
 /// nowhere else, so it owns its snapshot-first traversal outright instead of
 /// making every foldOperands caller pay for a hazard only this one has.
 bool distributeFlagCondThroughPhi(il::Function& function) {
+  bool hasAnyPhi = false;
+  for (const il::BlockId blockId : function.blockHandles()) {
+    const auto& ops = function.block(blockId).ops;
+    if (!ops.empty() && function.op(ops.front()).code == il::OpCode::Phi) {
+      hasAnyPhi = true;
+      break;
+    }
+  }
+  if (!hasAnyPhi) {
+    return false;
+  }
   FlagPhiDistributor distributor(function);
-  std::unordered_map<il::ExprId, il::ExprId> memo;
+  std::vector<il::ExprId> memo(function.exprCount());
+  std::vector<il::OpId> ops;
+  std::vector<il::ExprId> rewritten;
   bool changed = false;
   for (const il::BlockId blockId : function.blockHandles()) {
     // Snapshotted: prependPhi below inserts into a block's op list, which
     // would otherwise invalidate this loop mid-walk when that block is the
     // one being visited.
-    const std::vector<il::OpId> ops(function.block(blockId).ops.begin(),
-                                    function.block(blockId).ops.end());
+    const auto& blockOps = function.block(blockId).ops;
+    ops.assign(blockOps.begin(), blockOps.end());
     for (const il::OpId opId : ops) {
       const auto operands = function.operands(function.op(opId));
       if (operands.empty()) {
         continue;
       }
-      std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
+      rewritten.assign(operands.begin(), operands.end());
       bool opChanged = false;
       for (il::ExprId& operand : rewritten) {
         const il::ExprId next = distributeFlagCondRec(function, operand, memo, distributor);
@@ -418,9 +443,9 @@ bool distributeFlagCondThroughPhi(il::Function& function) {
 }
 
 il::ExprId foldFlagConditionsRec(il::Function& function, il::ExprId id,
-                                 std::unordered_map<il::ExprId, il::ExprId>& memo) {
-  if (const auto found = memo.find(id); found != memo.end()) {
-    return found->second;
+                                 std::vector<il::ExprId>& memo) {
+  if (id.index() < memo.size() && memo[id.index()].valid()) {
+    return memo[id.index()];
   }
   // By value: interning below can grow the pool (see foldConstantsRec).
   const il::Expr expr = function.expr(id);
@@ -468,7 +493,10 @@ il::ExprId foldFlagConditionsRec(il::Function& function, il::ExprId id,
       }
     }
   }
-  memo.emplace(id, result);
+  if (id.index() >= memo.size()) {
+    memo.resize(std::max<std::size_t>(function.exprCount(), id.index() + 1));
+  }
+  memo[id.index()] = result;
   return result;
 }
 
@@ -477,18 +505,24 @@ il::ExprId foldFlagConditionsRec(il::Function& function, il::ExprId id,
 template <class Rewrite>
 bool foldOperands(il::Function& function, Rewrite&& rewrite) {
   bool changed = false;
+  std::vector<il::ExprId> rewritten;
   for (const il::BlockId blockId : function.blockHandles()) {
     for (const il::OpId opId : function.block(blockId).ops) {
       const auto operands = function.operands(function.op(opId));
       if (operands.empty()) {
         continue;
       }
-      std::vector<il::ExprId> rewritten(operands.begin(), operands.end());
       bool opChanged = false;
-      for (il::ExprId& operand : rewritten) {
-        const il::ExprId next = rewrite(function, operand);
-        opChanged |= next != operand;
-        operand = next;
+      for (std::size_t i = 0; i < operands.size(); ++i) {
+        const il::ExprId orig = operands[i];
+        const il::ExprId next = rewrite(function, orig);
+        if (next != orig) {
+          if (!opChanged) {
+            rewritten.assign(operands.begin(), operands.end());
+            opChanged = true;
+          }
+          rewritten[i] = next;
+        }
       }
       if (opChanged) {
         function.setOperands(opId, rewritten);
@@ -502,24 +536,26 @@ bool foldOperands(il::Function& function, Rewrite&& rewrite) {
 }  // namespace
 
 il::ExprId foldConstants(il::Function& function, il::ExprId id) {
-  std::unordered_map<il::ExprId, il::ExprId> memo;
+  std::vector<il::ExprId> memo(function.exprCount());
   return foldConstantsRec(function, id, memo);
 }
 
 il::ExprId foldFlagConditions(il::Function& function, il::ExprId id) {
-  std::unordered_map<il::ExprId, il::ExprId> memo;
+  std::vector<il::ExprId> memo(function.exprCount());
   return foldFlagConditionsRec(function, id, memo);
 }
 
 bool foldConstants(il::Function& function) {
-  return foldOperands(function, [](il::Function& f, il::ExprId id) {
-    return foldConstants(f, id);
+  std::vector<il::ExprId> memo(function.exprCount());
+  return foldOperands(function, [&memo](il::Function& f, il::ExprId id) {
+    return foldConstantsRec(f, id, memo);
   });
 }
 
 bool foldFlagConditions(il::Function& function) {
-  const bool direct = foldOperands(function, [](il::Function& f, il::ExprId id) {
-    return foldFlagConditions(f, id);
+  std::vector<il::ExprId> memo(function.exprCount());
+  const bool direct = foldOperands(function, [&memo](il::Function& f, il::ExprId id) {
+    return foldFlagConditionsRec(f, id, memo);
   });
   // Order does not matter for correctness -- the two patterns are disjoint,
   // matched on what the flags operand's own expression is -- but running the
