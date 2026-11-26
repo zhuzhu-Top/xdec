@@ -713,21 +713,21 @@ std::string ExprPrinter::compare(il::ExprId id, std::string_view op, bool sign) 
       uint64_t rightConstant = 0;
       const bool leftIsConstant = ctx_.function.asConstant(e.operand(0), leftConstant);
       const bool rightIsConstant = ctx_.function.asConstant(e.operand(1), rightConstant);
-      return std::format(
-          "({} {} {})",
-          equalityOperand(e.operand(0),
-                          rightIsConstant ? std::optional<uint64_t>{rightConstant}
-                                          : std::nullopt),
-          op,
-          equalityOperand(e.operand(1),
-                          leftIsConstant ? std::optional<uint64_t>{leftConstant}
-                                         : std::nullopt));
+      const std::string lhsText = equalityOperand(
+          e.operand(0),
+          rightIsConstant ? std::optional<uint64_t>{rightConstant} : std::nullopt);
+      const std::string rhsText = equalityOperand(
+          e.operand(1),
+          leftIsConstant ? std::optional<uint64_t>{leftConstant} : std::nullopt);
+      return std::format("({} {} {})", lhsText, op, rhsText);
     }
-    return std::format("({} {} {})", integerOperand(e.operand(0)), op,
-                       integerOperand(e.operand(1)));
+    const std::string lhsText = integerOperand(e.operand(0));
+    const std::string rhsText = integerOperand(e.operand(1));
+    return std::format("({} {} {})", lhsText, op, rhsText);
   }
-  return std::format("({} {} {})", signedOperand(e.operand(0), width), op,
-                     signedOperand(e.operand(1), width));
+  const std::string lhsText = signedOperand(e.operand(0), width);
+  const std::string rhsText = signedOperand(e.operand(1), width);
+  return std::format("({} {} {})", lhsText, op, rhsText);
 }
 
 /// Sign extension must go through the signed type of the SOURCE width: a cast

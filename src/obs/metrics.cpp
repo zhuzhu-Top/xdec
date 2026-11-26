@@ -96,6 +96,9 @@ MemoryUsage processMemory() noexcept {
   if (usage.currentBytes == 0) {
     usage.currentBytes = usage.peakBytes;
   }
+  if (usage.peakBytes < usage.currentBytes) {
+    usage.peakBytes = usage.currentBytes;
+  }
 #endif
   return usage;
 }

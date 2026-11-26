@@ -26,7 +26,7 @@ jobs:
             target: linux-x86_64
             archive: tar.gz
             plugin_ext: so
-          - os: macos-14
+          - os: macos-15
             target: macos-arm64
             archive: tar.gz
             plugin_ext: dylib

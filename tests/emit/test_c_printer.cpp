@@ -258,11 +258,11 @@ TEST_CASE("a returned select prints as a guard, and a nested one as a chain",
   INFO(text);
   CHECK_FALSE(contains(text, "?"));
   // Two guards, one per select, and a bare return for the value neither claims.
-  CHECK(contains(text, "if (((int32_t)(_cse1) < (int32_t)(_cse0))) {"));
-  CHECK(contains(text, "return _cse0;"));
-  CHECK(contains(text, "if (((int32_t)(_cse2) < (int32_t)(_cse1))) {"));
-  CHECK(contains(text, "return _cse2;"));
+  CHECK(contains(text, "if (((int32_t)(_cse0) < (int32_t)(_cse1))) {"));
   CHECK(contains(text, "return _cse1;"));
+  CHECK(contains(text, "if (((int32_t)(_cse2) < (int32_t)(_cse0))) {"));
+  CHECK(contains(text, "return _cse2;"));
+  CHECK(contains(text, "return _cse0;"));
   // Every shared subexpression is named before the first guard. Named inside one,
   // the arm that does not run would leave the next guard reading nothing.
   CHECK(text.find("_cse2 = ") < text.find("if ("));

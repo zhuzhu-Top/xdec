@@ -90,7 +90,7 @@ TEST_CASE("a load reads the image; an unmapped load is top, never zero",
   CHECK(eval.eval(f.function.valueRef(missing)).isTop());
 }
 
-TEST_CASE("select over an unknown condition unions its arms — the resolution case",
+TEST_CASE("select over an unknown condition unions its arms -- the resolution case",
           "[analysis][image-eval]") {
   Fixture f;
   f.image.qwords.emplace(0x6000u, 0xAAAAu);
