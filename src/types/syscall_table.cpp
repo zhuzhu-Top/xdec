@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <format>
 
+#include "xdec/support/paths.h"
 #include "xdec/types/database.h"
 
 #ifndef XDEC_TYPES_DIR
@@ -161,8 +162,10 @@ Result<std::string> SyscallTable::resolvePath(std::string_view nameOrPath) {
   if (given.has_parent_path() || given.has_extension()) {
     return err(DiagCode::IoError, std::format("no such syscall table '{}'", nameOrPath));
   }
-  const fs::path shipped =
-      fs::path{XDEC_TYPES_DIR} / "syscall" / (std::string{nameOrPath} + ".json");
+  const std::string fileName = std::string{nameOrPath} + ".json";
+  const fs::path shipped = xdec::findShippedDataFile(
+      fs::path{"types"} / "syscall" / fileName, XDEC_TYPES_DIR,
+      fs::path{"syscall"} / fileName);
   if (fs::exists(shipped)) {
     return shipped.string();
   }

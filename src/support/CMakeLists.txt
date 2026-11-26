@@ -5,6 +5,7 @@ xdec_add_library(xdec_support
     composite_reader.cpp
     diag.cpp
     json.cpp
+    paths.cpp
     target.cpp
   DEPS
     xdec_obs)

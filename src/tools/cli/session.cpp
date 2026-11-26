@@ -13,6 +13,7 @@
 #include "xdec/spec/compile.h"
 #include "xdec/spec/parse.h"
 #include "xdec/support/composite_reader.h"
+#include "xdec/support/paths.h"
 #include "xdec/types/parse.h"
 
 namespace xdec::cli {
@@ -27,7 +28,8 @@ std::filesystem::path specPath() {
   if (const char* fromEnv = std::getenv("XDEC_SPEC"); fromEnv != nullptr && *fromEnv != '\0') {
     return std::filesystem::path{fromEnv};
   }
-  return std::filesystem::path{XDEC_SPEC_DIR} / "arm64.xspec";
+  return xdec::findShippedDataFile(std::filesystem::path{"specs"} / "arm64.xspec",
+                                   XDEC_SPEC_DIR, "arm64.xspec");
 }
 
 xdec::Result<std::unique_ptr<xdec::spec::SpecEngine>> loadEngine() {

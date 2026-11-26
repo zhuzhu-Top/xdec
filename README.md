@@ -1,5 +1,8 @@
 # xdec
 
+[![CI](https://github.com/zhuzhu-Top/xdec/actions/workflows/ci.yml/badge.svg)](https://github.com/zhuzhu-Top/xdec/actions/workflows/ci.yml)
+[![Release](https://github.com/zhuzhu-Top/xdec/actions/workflows/release.yml/badge.svg)](https://github.com/zhuzhu-Top/xdec/releases)
+
 **通用、自包含、Library-First 的多级 IL 反编译器与去虚拟化（Devirtualization）基础设施** — 支持将 AArch64 机器码与自定义虚拟机字节码提升为类型化 SSA IL，化简混淆控制流（OLLVM / VMP）与 MBA 表达式，输出可读的结构化 C / Objective-C 代码，并提供 `pyxdec` Python 绑定与 Bit-Exact 执行校验闭环。
 
 当前回归状态：**889 个 Catch2 单元测试（164,554 断言）全部通过** · **`pyxdec` pytest 3/3 通过** · **自包含 128 寄存器 VM 去虚拟化示例 Bit-Exact 通过**
@@ -37,7 +40,22 @@
 
 ## 快速开始
 
-### 环境要求
+### 预编译二进制（推荐，免构建）
+
+可直接从 [GitHub Releases](https://github.com/zhuzhu-Top/xdec/releases) 下载对应平台的便携压缩包（也可在 [Actions CI](https://github.com/zhuzhu-Top/xdec/actions/workflows/ci.yml) 获取最新 `master` 构建产物），解压即用（内置 `xdec`、默认插件 `objc_libcxx` / `ollvm_deobf`、`xdec_helpers.h`、`specs/` 与 `types/`）：
+
+| 平台 | 产物 |
+|------|------|
+| **Windows (x86_64)** | `xdec-<tag>-windows-x86_64.zip`（含独立运行库，无需安装 MSYS2） |
+| **macOS (Apple Silicon)** | `xdec-<tag>-macos-arm64.tar.gz` |
+| **macOS (Intel)** | `xdec-<tag>-macos-x86_64.tar.gz` |
+| **Linux (x86_64)** | `xdec-<tag>-linux-x86_64.tar.gz` |
+
+> 发布新版本时，只需推送 `v*` 标签（如 `git tag v0.2.0 && git push origin v0.2.0`）或在 GitHub Actions 手动触发 `Release` 工作流，即可自动编译四平台产物、生成 `SHA256SUMS.txt` 并发布 Release。
+
+### 从源码构建
+
+#### 环境要求
 
 - **CMake** ≥ 3.22、**Ninja**、**C++20** 编译器（已测试 GCC 14+ / Clang 16+）
 - **Catch2** — 本地未安装时自动拉取

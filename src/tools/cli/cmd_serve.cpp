@@ -19,15 +19,9 @@
 #include <unordered_set>
 #include <vector>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
-
 #include "common.h"
 #include "session.h"
+#include "xdec/support/paths.h"
 #include "xdec/analysis/plt_stub.h"
 #include "xdec/analysis/xrefs.h"
 #include "xdec/binary/image.h"
@@ -95,30 +89,7 @@ namespace {
 }
 
 [[nodiscard]] std::string defaultObjcPluginPath() {
-  std::filesystem::path exeDir;
-#ifdef _WIN32
-  std::wstring buf(1024, L'\0');
-  const DWORD len = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
-  if (len > 0 && len < buf.size()) {
-    buf.resize(len);
-    exeDir = std::filesystem::path{buf}.parent_path();
-  }
-#endif
-  if (exeDir.empty()) {
-    return {};
-  }
-#ifdef _WIN32
-  const std::filesystem::path cand = exeDir / "objc_libcxx.dll";
-#elif defined(__APPLE__)
-  const std::filesystem::path cand = exeDir / "libobjc_libcxx.dylib";
-#else
-  const std::filesystem::path cand = exeDir / "libobjc_libcxx.so";
-#endif
-  std::error_code ec;
-  if (std::filesystem::is_regular_file(cand, ec) && !ec) {
-    return cand.string();
-  }
-  return {};
+  return xdec::defaultPluginPath("objc_libcxx");
 }
 
 }  // namespace

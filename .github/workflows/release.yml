@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag name (e.g. v0.2.0; defaults to v0.1.0-manual if empty)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+            archive: tar.gz
+            plugin_ext: so
+          - os: macos-14
+            target: macos-arm64
+            archive: tar.gz
+            plugin_ext: dylib
+          - os: macos-15-intel
+            target: macos-x86_64
+            archive: tar.gz
+            plugin_ext: dylib
+          - os: windows-latest
+            target: windows-x86_64
+            archive: zip
+            plugin_ext: dll
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve Release Version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="v0.1.0-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Setup MSYS2 UCRT64 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Build & Package (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DXDEC_BUILD_TESTS=OFF \
+            -DXDEC_BUILD_PYTHON=OFF
+          cmake --build build --parallel
+
+          PKG_NAME="xdec-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          STAGE="dist/${PKG_NAME}"
+          mkdir -p "${STAGE}"
+          cp build/bin/xdec "${STAGE}/"
+          cp build/bin/objc_libcxx.${{ matrix.plugin_ext }} "${STAGE}/"
+          cp build/bin/ollvm_deobf.${{ matrix.plugin_ext }} "${STAGE}/"
+          cp build/bin/xdec_helpers.h "${STAGE}/"
+          cp -r specs types "${STAGE}/"
+          cp README.md "${STAGE}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE}/" || true
+
+          # Standalone smoke test outside the repo
+          TMP_RUN="$(mktemp -d)"
+          cp -r "${STAGE}" "${TMP_RUN}/xdec-pkg"
+          (
+            cd "${TMP_RUN}"
+            echo "0xd65f03c0" | ./xdec-pkg/xdec decode
+            ./xdec-pkg/xdec types parse ios-sdk
+          )
+          rm -rf "${TMP_RUN}"
+
+          tar -C dist -czf "dist/${PKG_NAME}.tar.gz" "${PKG_NAME}"
+
+      - name: Build & Stage (Windows UCRT64)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DXDEC_BUILD_TESTS=OFF \
+            -DXDEC_BUILD_PYTHON=OFF
+          cmake --build build --parallel
+
+          PKG_NAME="xdec-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          STAGE="dist/${PKG_NAME}"
+          mkdir -p "${STAGE}"
+          cp build/bin/xdec.exe "${STAGE}/"
+          cp build/bin/objc_libcxx.dll "${STAGE}/"
+          cp build/bin/ollvm_deobf.dll "${STAGE}/"
+          cp build/bin/xdec_helpers.h "${STAGE}/"
+          cp /ucrt64/bin/libgcc_s_seh-1.dll "${STAGE}/"
+          cp /ucrt64/bin/libstdc++-6.dll "${STAGE}/"
+          cp /ucrt64/bin/libwinpthread-1.dll "${STAGE}/"
+          cp -r specs types "${STAGE}/"
+          cp README.md "${STAGE}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE}/" || true
+
+          TMP_RUN="$(mktemp -d)"
+          cp -r "${STAGE}" "${TMP_RUN}/xdec-pkg"
+          (
+            cd "${TMP_RUN}"
+            /usr/bin/printf "0xd65f03c0\n" | /usr/bin/env PATH="/c/Windows/System32:/c/Windows" ./xdec-pkg/xdec.exe decode
+            /usr/bin/env PATH="/c/Windows/System32:/c/Windows" ./xdec-pkg/xdec.exe types parse ios-sdk
+          )
+          rm -rf "${TMP_RUN}"
+
+      - name: Zip Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "xdec-${{ steps.ver.outputs.tag }}-${{ matrix.target }}"
+          Compress-Archive -Path "dist/$pkg" -DestinationPath "dist/$pkg.zip" -Force
+
+      - name: Upload Release Asset
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/xdec-${{ steps.ver.outputs.tag }}-${{ matrix.target }}.${{ matrix.archive }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download All Assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Resolve Release Tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="v0.1.0-${GITHUB_SHA::7}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            release-assets/*

@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: linux-x86_64
+            archive: tar.gz
+            plugin_ext: so
+            python_test: true
+          - name: macos-arm64
+            os: macos-14
+            target: macos-arm64
+            archive: tar.gz
+            plugin_ext: dylib
+            python_test: false
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: macos-x86_64
+            archive: tar.gz
+            plugin_ext: dylib
+            python_test: false
+          - name: windows-x86_64
+            os: windows-latest
+            target: windows-x86_64
+            archive: zip
+            plugin_ext: dll
+            python_test: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          if [ "${{ matrix.python_test }}" = "true" ]; then
+            python3 -m pip install --break-system-packages pybind11 pytest
+          fi
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Setup MSYS2 UCRT64 (Windows)
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure and Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          PY_OPT="-DXDEC_BUILD_PYTHON=OFF"
+          if [ "${{ matrix.python_test }}" = "true" ]; then
+            PY_OPT="-DXDEC_BUILD_PYTHON=ON"
+          fi
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXDEC_BUILD_TESTS=ON \
+            ${PY_OPT}
+          cmake --build build --parallel
+
+      - name: Run Tests (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          ctest --test-dir build --output-on-failure --parallel 4
+          if [ "${{ matrix.python_test }}" = "true" ]; then
+            PYTHONPATH="${PWD}/build/bin" pytest tests/python
+            PYTHONPATH="${PWD}/build/bin" python3 samples/rqt/devirt_rqt.py
+          fi
+
+      - name: Package & Smoke-Test Portable Bundle (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          STAGE="dist/xdec-${{ matrix.target }}"
+          mkdir -p "${STAGE}"
+          cp build/bin/xdec "${STAGE}/"
+          cp build/bin/objc_libcxx.${{ matrix.plugin_ext }} "${STAGE}/"
+          cp build/bin/ollvm_deobf.${{ matrix.plugin_ext }} "${STAGE}/"
+          cp build/bin/xdec_helpers.h "${STAGE}/"
+          cp -r specs types "${STAGE}/"
+          cp README.md "${STAGE}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE}/" || true
+
+          # Verify the bundle runs completely outside the source/build tree
+          TMP_RUN="$(mktemp -d)"
+          cp -r "${STAGE}" "${TMP_RUN}/xdec-pkg"
+          (
+            cd "${TMP_RUN}"
+            echo "0xd65f03c0" | ./xdec-pkg/xdec decode
+            ./xdec-pkg/xdec types parse ios-sdk
+          )
+          rm -rf "${TMP_RUN}"
+
+          tar -C dist -czf "dist/xdec-${{ matrix.target }}.tar.gz" "xdec-${{ matrix.target }}"
+
+      - name: Configure, Build, Test & Package (Windows UCRT64)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXDEC_BUILD_TESTS=ON \
+            -DXDEC_BUILD_PYTHON=OFF
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure --parallel 4
+
+          STAGE="dist/xdec-${{ matrix.target }}"
+          mkdir -p "${STAGE}"
+          cp build/bin/xdec.exe "${STAGE}/"
+          cp build/bin/objc_libcxx.dll "${STAGE}/"
+          cp build/bin/ollvm_deobf.dll "${STAGE}/"
+          cp build/bin/xdec_helpers.h "${STAGE}/"
+          cp /ucrt64/bin/libgcc_s_seh-1.dll "${STAGE}/"
+          cp /ucrt64/bin/libstdc++-6.dll "${STAGE}/"
+          cp /ucrt64/bin/libwinpthread-1.dll "${STAGE}/"
+          cp -r specs types "${STAGE}/"
+          cp README.md "${STAGE}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE}/" || true
+
+          # Smoke-test outside source tree with a minimal PATH (no /ucrt64/bin)
+          TMP_RUN="$(mktemp -d)"
+          cp -r "${STAGE}" "${TMP_RUN}/xdec-pkg"
+          (
+            cd "${TMP_RUN}"
+            /usr/bin/printf "0xd65f03c0\n" | /usr/bin/env PATH="/c/Windows/System32:/c/Windows" ./xdec-pkg/xdec.exe decode
+            /usr/bin/env PATH="/c/Windows/System32:/c/Windows" ./xdec-pkg/xdec.exe types parse ios-sdk
+          )
+          rm -rf "${TMP_RUN}"
+
+      - name: Zip Portable Bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/xdec-${{ matrix.target }}" -DestinationPath "dist/xdec-${{ matrix.target }}.zip" -Force
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdec-${{ matrix.target }}
+          path: dist/xdec-${{ matrix.target }}.${{ matrix.archive }}
+          retention-days: 14

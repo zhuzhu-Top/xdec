@@ -9,6 +9,8 @@
 #include <optional>
 #include <sstream>
 
+#include "xdec/support/paths.h"
+
 #ifndef XDEC_TYPES_DIR
 #define XDEC_TYPES_DIR "types"
 #endif
@@ -1067,8 +1069,10 @@ Result<std::string> resolveHeaderPath(std::string_view nameOrPath) {
   if (given.has_parent_path() || given.has_extension()) {
     return err(DiagCode::IoError, std::format("no such header '{}'", nameOrPath));
   }
-  const fs::path preset =
-      fs::path{XDEC_TYPES_DIR} / "presets" / (std::string{nameOrPath} + ".hdecl");
+  const std::string fileName = std::string{nameOrPath} + ".hdecl";
+  const fs::path preset = xdec::findShippedDataFile(
+      fs::path{"types"} / "presets" / fileName, XDEC_TYPES_DIR,
+      fs::path{"presets"} / fileName);
   if (fs::exists(preset)) {
     return preset.string();
   }
